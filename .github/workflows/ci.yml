@@ -1,0 +1,64 @@
+# CI for harden-and-audit.sh
+#
+# Runs on every push / PR to the integration branch (the default branch), and
+# is reused by the release workflow on main. Each Debian release is hardened
+# inside a systemd-booted container that OpenSCAP evaluates as a real
+# machine, then gated on CIS Debian Level 2 Server >= 90%.
+name: ci
+
+on:
+  push:
+    branches: [integration]
+  pull_request:
+    branches: [integration, main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: bash syntax
+        run: |
+          for f in harden-and-audit.sh tests/*.sh; do bash -n "$f"; done
+      - name: shellcheck
+        run: |
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.11.0 \
+            -x --severity=warning harden-and-audit.sh tests/run-ci.sh tests/assertions.sh tests/container-init.sh
+
+  harden-and-scan:
+    name: debian ${{ matrix.debian }} - harden + SCAP
+    needs: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        debian: ["12", "13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: harden, assert, re-run (idempotence), scan, gate
+        env:
+          CI_PRIVILEGED: "1"
+          SCAP_MIN_SCORE: "90"
+          OUT_DIR: ${{ github.workspace }}/artifacts/debian${{ matrix.debian }}
+        run: tests/run-ci.sh "${{ matrix.debian }}"
+
+      - name: upload SCAP reports and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scap-debian${{ matrix.debian }}
+          path: artifacts/debian${{ matrix.debian }}
+          if-no-files-found: warn
+          retention-days: 90

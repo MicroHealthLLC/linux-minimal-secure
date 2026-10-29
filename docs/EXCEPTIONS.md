@@ -1,0 +1,77 @@
+# Documented deviations (POA&M input)
+
+This file lists every SCAP rule that `harden-and-audit.sh` **intentionally** leaves failing or cannot satisfy, with the reason for each. Use it as the starting point for an RMF Plan of Action & Milestones or a risk-acceptance memo. CI gates on CIS Debian Level 2 Server ≥ 90% *with all of these counted as failures*. No tailoring file hides them.
+
+## 1. Owner-mandated: never lose access because of auditing
+
+The system owner requires that audit-log pressure must never suspend logging, drop the host to single-user mode, or halt it. CIS L2 asks for exactly those actions.
+
+| Rule | CIS expects | Configured | Rationale |
+|---|---|---|---|
+| `auditd_data_retention_max_log_file_action` | `keep_logs` | `ROTATE` | `keep_logs` grows without bound until the disk fills |
+| `auditd_data_retention_space_left_action` | `email` (or `exec`/`single`/`halt`) | `SYSLOG` | No MTA relay is assumed; the syslog alert is forwarded |
+| `auditd_data_retention_admin_space_left_action` | `single` or `halt` | `SYSLOG` | `single`/`halt` remove remote access |
+| `auditd_data_disk_full_action` | `halt` or `single` | `SYSLOG` | Same |
+
+Compensating controls: `max_log_file = 20` (passes the CIS `>= 6` check), `num_logs = 10` (200 MB ceiling), the audit failure flag `-f 1` (printk, never panic), a 512 MB journald cap with 1 GB kept free, logrotate `maxsize 200M`, and syslog alerts that can be forwarded to the SIEM over TLS (`rsyslog-gnutls` is installed).
+
+## 2. Conflicts inside the profile, or with mandated components
+
+| Rule | Why it fails |
+|---|---|
+| `package_ufw_removed`, `package_iptables-persistent_installed` (Debian 12) | SSG's CIS Debian profile chooses **nftables** as the firewall. The owner requires **UFW**, so these "nftables path" checks fail by design. UFW rules, default deny inbound, and loopback rules are all in place. |
+| `ufw_default_outgoing_rule` (Debian 13) | Requires outbound DROP. Real-time media and TURN relays send UDP to arbitrary peer ports, and DHCP lease renewal needs egress, so default-deny egress would break the server's purpose and risk a delayed lockout. Opt in with `UFW_OUTBOUND_POLICY=deny` (adds a DNS/DHCP/NTP/HTTP(S) allow-list plus `UFW_EXTRA_OUT`). |
+| `package_chrony_installed` | The same profile sets `var_timesync_service = systemd-timesyncd`, and the two packages conflict. timesyncd is used; if chrony is already installed, the script keeps and configures chrony instead. |
+| `journald_disable_forward_to_syslog` | Mutually exclusive with `journald_forward_to_syslog`. The rsyslog path is used (needed for the auditd `SYSLOG` alerts). |
+
+## 3. Site-specific values the script cannot invent
+
+| Rule | What is needed |
+|---|---|
+| `package_systemd-journal-remote_installed`, `systemd_journal_upload_url`, `systemd_journal_upload_server_tls`, `rsyslog_remote_tls` (Debian 13) | The address and CA of your enclave's log collector. Configure rsyslog (TLS via `rsyslog-gnutls`) or systemd-journal-upload once a collector is assigned. |
+| `grub2_password` *(real hosts pass)* | A password is generated automatically, or you can supply `GRUB_PASSWORD_PBKDF2`. Only fails where GRUB cannot be regenerated (see §5). |
+
+## 4. Install-time items (cannot be fixed on a running host)
+
+| Rule | Note |
+|---|---|
+| `partition_for_home`, `partition_for_var`, `partition_for_var_log`, `partition_for_var_log_audit` | Separate filesystems must be created by the installer (Debian installer → "Separate /home, /var, and /tmp partitions" plus manual `/var/log` and `/var/log/audit`). |
+| `/var/tmp` | Bind-mounted onto itself with `nodev,nosuid,noexec`, so the mount-option controls are genuinely enforced and `partition_for_var_tmp` passes. A bind mount does **not** provide space isolation. Create a real partition at install time to fully meet the intent. |
+
+## 5. CI-environment limitations (pass on real hardware/VMs)
+
+GitHub runners have no KVM, so CI hardens a systemd-booted container. These rules depend on a real kernel or bootloader and fail **only in CI**:
+
+| Rule(s) | Reason in a container |
+|---|---|
+| `grub2_audit_argument`, `grub2_audit_backlog_limit_argument`, `grub2_enable_apparmor`, `grub2_password` | `update-grub` cannot probe an overlay root filesystem, so `/boot/grub/grub.cfg` is never generated. `/etc/default/grub` *is* correct, and the assertions verify it. |
+| `service_auditd_enabled` | The kernel accepts only one audit daemon, in the initial PID namespace. |
+| `all_apparmor_profiles_in_enforce_complain_mode` | AppArmor profiles cannot be loaded from inside a container. |
+| `audit_rules_privileged_commands` | SSG enumerates setuid/setgid binaries only on "exec mount points" from the mount table. A container's overlay root `/` is not among them, so the scanner counts 0 binaries against the 18–19 generated rules. The rules exist and are compiled; the assertions verify sudo/su/passwd are covered. |
+| `aide_*` (unprivileged local runs only) | AIDE ≥ 0.19 drops privileges with `capsh` and needs `CAP_SETPCAP`. |
+| `sysctl_*` runtime values (unprivileged local runs only) | `/proc/sys` is read-only without `--privileged`. GitHub CI runs privileged. |
+
+## 6. Hardening choices that are stricter than, or different from, a rule
+
+| Topic | Choice |
+|---|---|
+| SSH key exchange | FIPS-approved only (ECDH NIST curves, DH group-exchange/14/16/18 SHA-2). The post-quantum hybrids `mlkem768x25519` and `sntrup761x25519` are excluded because they are not FIPS 140-3 approved. Revisit when CNSA 2.0 ML-KEM is validated. |
+| SSH `LogLevel` | `INFO` (the value SSG checks). Set `SSH_LOGLEVEL=VERBOSE` to also log key fingerprints. |
+| SSH passwords | Not disabled by default, because a host whose admins only have passwords would be locked out. `SSH_DISABLE_PASSWORD=1` verifies every sudo admin has a key first. |
+| sudo `NOPASSWD` / `!authenticate` | Reported as warnings, never removed automatically, because on cloud images they are often the only sudo path. `sudo_require_authentication` fails until you remove them. |
+| faillock | `deny=4`, `unlock_time=900`, including root. Lockouts expire; the STIG's permanent lock (`unlock_time=0`) is not used, because of the no-lockout policy. |
+| OpenSSL | FIPS provider active **alongside** the default provider, as requested. Non-FIPS algorithms are still available to applications that ask for them. Set `FIPS_STRICT=1` for `default_properties = fips=yes`. System TLS is restricted to TLS ≥ 1.2 and NIST/FFDHE groups. |
+| Kernel FIPS mode | `fips=1` enables the Debian kernel's FIPS self-tests and restrictions. Debian's kernel crypto API is **not** CMVP-validated; only the user-space OpenSSL 3.1.2 module (cert #4985) is. |
+| `kernel.modules_disabled`, `lockdown=` | Not set: they would block DKMS/NVIDIA driver loading (requirement 6). Unneeded filesystems/protocols are blacklisted instead. |
+| overlayfs | Disabled (CIS). Set `ALLOW_CONTAINERS=1` on Docker/Podman hosts. |
+| IPv6 RA | Disabled unless the host relies on SLAAC/RA (auto-detected), in which case the `accept_ra` sysctls fail rather than cutting connectivity. |
+
+## 7. ANSSI BP-028 High (informational profile)
+
+ANSSI High is scanned and reported but **not gated**. Large parts of it assume a different platform:
+
+* **SELinux** (Debian uses AppArmor), and **custom kernel build options** (`kernel_config_*`: GCC plugins, `MODULE_SIG_FORCE`, …) that only a self-built kernel can meet.
+* **SSSD/LDAP** centralized identity, which is site-specific.
+* Separate `/boot`, `/opt`, `/srv`, `/usr` partitions (install-time).
+* `kernel.modules_disabled=1`, `mce=0`, `l1tf=full,force`, `mds=full,nosmt`. These are incompatible with NVIDIA/DKMS, or halve CPU capacity, or panic on machine checks (against the no-halt policy).
+* `sudo` `noexec`/`requiretty`, which break package management and automation.
