@@ -70,8 +70,15 @@ See [EXCEPTIONS.md](EXCEPTIONS.md): owner-mandated auditd actions, UFW-vs-nftabl
 
 ## 5. Results
 
+GitHub Actions, privileged systemd container (authoritative), after the second (idempotence) run:
+
 | Profile | Debian 12 | Debian 13 |
 |---|---|---|
-| CIS Level 2 Server, local restricted container | 91.61% | 91.93% |
-| CIS Level 2 Server, GitHub privileged CI | see the CI job summary / release notes | see the CI job summary / release notes |
-| ANSSI BP-028 High (informational) | ~66% | ~66% |
+| **CIS Level 2 Server: pass rate (gate ≥ 90%)** | **94.46%** (426 pass / 25 fail) | **95.22%** (458 pass / 23 fail) |
+| CIS Level 2 Server: XCCDF default score | 75.36 | 76.25 |
+| ANSSI BP-028 High (informational) | 74.03% | 74.03% |
+| Functional assertions | 120 / 120 | 120 / 120 |
+
+Every remaining failure is listed with its reason in [EXCEPTIONS.md](EXCEPTIONS.md): 4 owner-mandated auditd actions, 4 install-time partitions, 3–5 profile-internal conflicts, 3–4 site-specific remote-logging settings, 2 SSG content defects, and the CI-container-only items, which pass on real hosts. On a physical or virtual host the container-only items (GRUB arguments, auditd, timesyncd, AppArmor, privileged-command count) also pass, so the expected host score is about 97–98%.
+
+The XCCDF *default* score is lower than the pass rate because it is weighted hierarchically by rule groups. The pass rate (pass ÷ (pass + fail + error + unknown)) is the conventional "compliance percentage" and is what the gate enforces. Both are reported in `/var/log/scap-summary.txt` and the HTML report.

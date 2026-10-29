@@ -108,6 +108,9 @@ check "fail2ban sshd jail active" bash -c "fail2ban-client status sshd"
 
 check "AIDE watches the audit tools in aide.conf" grep -q '^/usr/sbin/auditctl p+i+n+u+g+s+b+acl+selinux+xattrs+sha512$' /etc/aide/aide.conf
 check "AIDE configuration valid" aide --config-check --config /etc/aide/aide.conf
+if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
+    check "AIDE baseline database built" test -s /var/lib/aide/aide.db
+fi
 check "aidecheck.service and timer enabled" bash -c "systemctl is-enabled aidecheck.service && systemctl is-enabled aidecheck.timer"
 
 echo "== 6. CUDA prerequisites and media/coturn libraries"

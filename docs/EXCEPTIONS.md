@@ -30,6 +30,7 @@ Compensating controls: `max_log_file = 20` (passes the CIS `>= 6` check), `num_l
 |---|---|
 | `package_systemd-journal-remote_installed`, `systemd_journal_upload_url`, `systemd_journal_upload_server_tls`, `rsyslog_remote_tls` (Debian 13) | The address and CA of your enclave's log collector. Configure rsyslog (TLS via `rsyslog-gnutls`) or systemd-journal-upload once a collector is assigned. |
 | `grub2_uefi_password` (UEFI hosts) | **SSG content defect for Debian:** the check reads `/boot/grub2/grub.cfg`, a RHEL path that never exists on Debian. The password *is* set (`/etc/grub.d/01_harden_password` → `/boot/grub/grub.cfg`, which the UEFI stub loads). This fails on every Debian UEFI host. |
+| `aide_build_database` (Debian 12) | **SSG content defect for Debian 12:** the check parses the pre-0.17 key `database=` in `aide.conf`, while Debian 12's AIDE 0.18 uses `database_in=`. Rewriting the config to the deprecated key would add a deprecation warning to every AIDE run, so it is not done. The baseline database **is** built (`/var/lib/aide/aide.db`, asserted in CI), and Debian 13 passes. |
 | `grub2_password` *(real hosts pass)* | A password is generated automatically, or you can supply `GRUB_PASSWORD_PBKDF2`. Only fails where GRUB cannot be regenerated (see §5). |
 
 ## 4. Install-time items (cannot be fixed on a running host)
@@ -47,6 +48,7 @@ GitHub runners have no KVM, so CI hardens a systemd-booted container. These rule
 |---|---|
 | `grub2_audit_argument`, `grub2_audit_backlog_limit_argument`, `grub2_enable_apparmor`, `grub2_password` | `update-grub` cannot probe an overlay root filesystem, so `/boot/grub/grub.cfg` is never generated. `/etc/default/grub` *is* correct, and the assertions verify it. |
 | `service_auditd_enabled` | The kernel accepts only one audit daemon, in the initial PID namespace. |
+| `service_timesyncd_enabled`, `ntp_single_service_active` | `systemd-timesyncd.service` has `ConditionVirtualization=!container`, so systemd skips it in any container. It is enabled and configured. |
 | `all_apparmor_profiles_in_enforce_complain_mode` | AppArmor profiles cannot be loaded from inside a container. |
 | `audit_rules_privileged_commands` | SSG enumerates setuid/setgid binaries only on "exec mount points" from the mount table. A container's overlay root `/` is not among them, so the scanner counts 0 binaries against the 18–19 generated rules. The rules exist and are compiled; the assertions verify sudo/su/passwd are covered. |
 | `aide_*` (unprivileged local runs only) | AIDE ≥ 0.19 drops privileges with `capsh` and needs `CAP_SETPCAP`. |

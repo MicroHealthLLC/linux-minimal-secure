@@ -5,6 +5,7 @@
 | | |
 |---|---|
 | Gate profile | **CIS Debian Level 2 – Server** (ComplianceAsCode/SSG 0.1.82). Target pass rate ≥ 90%, enforced in CI on Debian 12 and 13 |
+| Measured in CI | Debian 12: **94.46%** · Debian 13: **95.22%** (every remaining failure is explained in [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md)) |
 | Also reported | ANSSI BP-028 High (informational; see [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md)) |
 | FIPS | Kernel `fips=1` plus the **NIST CMVP validated OpenSSL 3.1.2 FIPS provider (FIPS 140-3, cert #4985)**, active alongside the default provider |
 | Reports | `/var/log/scap-results.xml`, `/var/log/scap-report.html`, `/var/log/scap-summary.txt` |
