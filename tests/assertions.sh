@@ -106,6 +106,10 @@ check "no nullok"               bash -c "! grep -Eq '^[^#].*nullok' /etc/pam.d/c
 check "DoD banner on /etc/issue.net" grep -q 'U.S. Government (USG) Information System' /etc/issue.net
 check "fail2ban sshd jail active" bash -c "fail2ban-client status sshd"
 
+check "AIDE watches the audit tools in aide.conf" grep -q '^/usr/sbin/auditctl p+i+n+u+g+s+b+acl+selinux+xattrs+sha512$' /etc/aide/aide.conf
+check "AIDE configuration valid" aide --config-check --config /etc/aide/aide.conf
+check "aidecheck.service and timer enabled" bash -c "systemctl is-enabled aidecheck.service && systemctl is-enabled aidecheck.timer"
+
 echo "== 6. CUDA prerequisites and media/coturn libraries"
 for p in libc6 libc6-dev gcc make dkms linux-headers-amd64 build-essential; do check "package ${p} installed" installed "$p"; done
 check "nouveau blacklisted" grep -q '^blacklist nouveau' /etc/modprobe.d/60-harden-nouveau.conf

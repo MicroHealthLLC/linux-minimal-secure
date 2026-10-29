@@ -1889,15 +1889,19 @@ EOF
 configure_aide_config() {
     step "5.18 AIDE configuration (database is built at the end)"
     apt_install aide aide-common
-    write_file 0644 /etc/aide/aide.conf.d/99_harden_audit_tools <<'EOF'
-# Managed by harden-and-audit.sh - protect the audit toolchain (CIS / STIG).
-/usr/sbin/auditctl p+i+n+u+g+s+b+acl+xattrs+sha512
-/usr/sbin/auditd p+i+n+u+g+s+b+acl+xattrs+sha512
-/usr/sbin/ausearch p+i+n+u+g+s+b+acl+xattrs+sha512
-/usr/sbin/aureport p+i+n+u+g+s+b+acl+xattrs+sha512
-/usr/sbin/autrace p+i+n+u+g+s+b+acl+xattrs+sha512
-/usr/sbin/augenrules p+i+n+u+g+s+b+acl+xattrs+sha512
-EOF
+    # Protect the audit toolchain (CIS / STIG). Scanners read these lines
+    # from aide.conf itself, with exactly this attribute set.
+    local aconf=/etc/aide/aide.conf t
+    backup_file "$aconf"
+    rm -f /etc/aide/aide.conf.d/99_harden_audit_tools
+    sed -i -E "/^# ${MARK}: audit tools$/d; \#^(/usr)?/sbin/(auditctl|auditd|ausearch|aureport|autrace|augenrules)[[:space:]]#d" "$aconf"
+    {
+        echo "# ${MARK}: audit tools"
+        for t in auditctl auditd ausearch aureport autrace augenrules; do
+            echo "/usr/sbin/${t} p+i+n+u+g+s+b+acl+selinux+xattrs+sha512"
+        done
+    } >>"$aconf"
+    aide --config-check --config "$aconf" >/dev/null 2>&1 || die "AIDE configuration check failed"
     write_file 0644 /etc/systemd/system/aidecheck.service <<'EOF'
 # Managed by harden-and-audit.sh
 [Unit]
@@ -1909,6 +1913,9 @@ Type=oneshot
 ExecStart=/usr/bin/aide --config /etc/aide/aide.conf --check
 Nice=19
 IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
 EOF
     write_file 0644 /etc/systemd/system/aidecheck.timer <<'EOF'
 # Managed by harden-and-audit.sh
@@ -1925,7 +1932,7 @@ Unit=aidecheck.service
 WantedBy=timers.target
 EOF
     systemctl daemon-reload
-    systemctl enable aidecheck.timer >/dev/null 2>&1 || true
+    systemctl enable aidecheck.service aidecheck.timer >/dev/null 2>&1 || true
     systemctl start aidecheck.timer >/dev/null 2>&1 || true
 }
 

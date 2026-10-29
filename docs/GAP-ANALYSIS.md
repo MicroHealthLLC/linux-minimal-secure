@@ -61,6 +61,7 @@ Compared against [PLAN.md](PLAN.md) and the original requirement text. Each delt
 | Δ12 | `ufw.service` unit stayed inactive after `ufw --force enable` | `ufw enable` loads rules without starting the oneshot unit | `systemctl start ufw.service`, plus an assertion |
 | Δ13 | `FAIL_DELAY` made every shadow tool print "configuration error" | Not a Debian `login.defs` key (Debian uses `pam_faildelay`) | Key removed, plus an assertion that `login.defs` has no unknown items |
 | Δ14 | CI scored runner-owned files as "unowned" | Repo was bind-mounted with the runner's UID | Sources are copied into the test host as root |
+| Δ15 | AIDE audit-tool rules were in `aide.conf.d`, and `aidecheck.service` was "static" | Scanner reads only `aide.conf`; the unit had no `[Install]` | Lines in `aide.conf` with the exact attribute set (validated with `aide --config-check`); the unit is enabled |
 | Δ10 | SCAP format mismatches (faillock order, `declare -xr TMOUT`, bashrc umask, journald main file, rsyslog FileCreateMode, audit rule shapes, Debian 13 extras) | Exact OVAL expectations | Each aligned to the OVAL definition. CIS L2 went from 86.5% to ≥ 91% |
 
 ## 4. Remaining known gaps (accepted, documented)
