@@ -29,6 +29,7 @@ Compensating controls: `max_log_file = 20` (passes the CIS `>= 6` check), `num_l
 | Rule | What is needed |
 |---|---|
 | `package_systemd-journal-remote_installed`, `systemd_journal_upload_url`, `systemd_journal_upload_server_tls`, `rsyslog_remote_tls` (Debian 13) | The address and CA of your enclave's log collector. Configure rsyslog (TLS via `rsyslog-gnutls`) or systemd-journal-upload once a collector is assigned. |
+| `grub2_uefi_password` (UEFI hosts) | **SSG content defect for Debian:** the check reads `/boot/grub2/grub.cfg`, a RHEL path that never exists on Debian. The password *is* set (`/etc/grub.d/01_harden_password` → `/boot/grub/grub.cfg`, which the UEFI stub loads). This fails on every Debian UEFI host. |
 | `grub2_password` *(real hosts pass)* | A password is generated automatically, or you can supply `GRUB_PASSWORD_PBKDF2`. Only fails where GRUB cannot be regenerated (see §5). |
 
 ## 4. Install-time items (cannot be fixed on a running host)

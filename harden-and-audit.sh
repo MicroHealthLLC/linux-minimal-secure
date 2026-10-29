@@ -765,12 +765,14 @@ EOF
 # ============================================================================
 # 4. FIPS cryptography
 # ============================================================================
-# grub_set_args ARG... - set key[=value] words in GRUB_CMDLINE_LINUX, replacing
-# any existing word with the same key.
+# grub_set_args VAR ARG... - set key[=value] words in the GRUB variable VAR
+# (GRUB_CMDLINE_LINUX or GRUB_CMDLINE_LINUX_DEFAULT), replacing any existing
+# word with the same key.
 grub_set_args() {
-    local file=/etc/default/grub cur arg w key
-    grep -q '^GRUB_CMDLINE_LINUX=' "$file" || echo 'GRUB_CMDLINE_LINUX=""' >>"$file"
-    cur=$(sed -n 's/^GRUB_CMDLINE_LINUX="\(.*\)"[[:space:]]*$/\1/p' "$file" | tail -n1)
+    local var=$1 file=/etc/default/grub cur arg w key
+    shift
+    grep -q "^${var}=" "$file" || echo "${var}=\"\"" >>"$file"
+    cur=$(sed -n "s/^${var}=\"\\(.*\\)\"[[:space:]]*\$/\\1/p" "$file" | tail -n1)
     local -a words
     read -r -a words <<<"$cur"
     for arg in "$@"; do
@@ -782,7 +784,7 @@ grub_set_args() {
         words=("${kept[@]}" "$arg")
     done
     local new="${words[*]}"
-    sed -i -E "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"${new}\"|" "$file"
+    sed -i -E "s|^${var}=.*|${var}=\"${new}\"|" "$file"
 }
 
 configure_grub() {
@@ -792,11 +794,14 @@ configure_grub() {
         return 0
     fi
     backup_file /etc/default/grub
-    # GRUB_CMDLINE_LINUX applies to every boot entry, including recovery.
-    grub_set_args fips=1 audit=1 audit_backlog_limit=8192 apparmor=1 security=apparmor \
+    # GRUB_CMDLINE_LINUX applies to every boot entry, including recovery;
+    # fips=1 is also put in the default (non-recovery) string, as required.
+    grub_set_args GRUB_CMDLINE_LINUX_DEFAULT fips=1
+    grub_set_args GRUB_CMDLINE_LINUX fips=1 audit=1 audit_backlog_limit=8192 apparmor=1 security=apparmor \
         slab_nomerge=yes pti=on page_alloc.shuffle=1 vsyscall=none init_on_alloc=1 \
         spectre_v2=on spec_store_bypass_disable=seccomp rng_core.default_quality=500
-    grep -E '^GRUB_CMDLINE_LINUX=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to /etc/default/grub"
+    grep -E '^GRUB_CMDLINE_LINUX=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to GRUB_CMDLINE_LINUX"
+    grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to GRUB_CMDLINE_LINUX_DEFAULT"
     local d
     for d in /etc/default/grub.d/*.cfg; do
         if grep -Eq '^[[:space:]]*GRUB_CMDLINE_LINUX=' "$d" && ! grep -Eq 'GRUB_CMDLINE_LINUX=.*\$\{?GRUB_CMDLINE_LINUX' "$d"; then
@@ -1360,8 +1365,14 @@ configure_ufw() {
         ufw default allow outgoing >/dev/null
     fi
     ufw logging low >/dev/null
+    # UFW re-applies /etc/ufw/sysctl.conf whenever it starts; its stock file
+    # turns martian logging OFF, silently undoing the CIS setting each boot.
+    backup_file /etc/ufw/sysctl.conf
+    sed -i -E 's|^(net/ipv4/conf/(all\|default)/log_martians)=.*|\1=1|' /etc/ufw/sysctl.conf
     systemctl enable ufw.service >/dev/null 2>&1 || true
     host_only "enable UFW" ufw --force enable
+    # 'ufw enable' loads the rules but leaves the oneshot unit inactive.
+    host_only "start ufw.service" systemctl start ufw.service
     ufw status verbose || true
 }
 
@@ -1500,7 +1511,6 @@ configure_login_defs() {
     set_kv "$f" ENCRYPT_METHOD YESCRYPT ' '
     set_kv "$f" LOGIN_RETRIES 3 $'\t\t'
     set_kv "$f" LOGIN_TIMEOUT 60 $'\t\t'
-    set_kv "$f" FAIL_DELAY 4 $'\t\t'
     set_kv "$f" HOME_MODE 0750 $'\t\t'
     useradd -D -f "$ACCOUNT_INACTIVE_DAYS"
     # Apply aging to existing accounts that have a usable password - except

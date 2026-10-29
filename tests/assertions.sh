@@ -51,6 +51,7 @@ check "auditd enabled at boot" systemctl is-enabled auditd
 
 echo "== 4. FIPS"
 check "fips=1 on the GRUB command line" grep -Eq '^GRUB_CMDLINE_LINUX=".*\bfips=1\b' /etc/default/grub
+check "fips=1 on the default GRUB command line string" grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=".*\bfips=1\b' /etc/default/grub
 check "audit=1 on the GRUB command line" grep -Eq '^GRUB_CMDLINE_LINUX=".*\baudit=1\b' /etc/default/grub
 check "GRUB entries remain bootable without password (--unrestricted)" grep -q -- '--unrestricted' /etc/grub.d/10_linux
 check "OpenSSL FIPS provider active"    bash -c "openssl list -providers | grep -A3 -E '^[[:space:]]*fips' | grep -q 'status: active'"
@@ -91,8 +92,12 @@ check "root SSH login is rejected" \
 check "UFW enabled at boot" bash -c "grep -q '^ENABLED=yes' /etc/ufw/ufw.conf"
 check "UFW default deny incoming" bash -c "grep -q '^DEFAULT_INPUT_POLICY=\"DROP\"' /etc/default/ufw"
 check "UFW SSH allowed" bash -c "grep -Eq -- '--dport 22 -j ACCEPT' /etc/ufw/user.rules"
+check "UFW does not re-disable martian logging" bash -c "grep -q '^net/ipv4/conf/all/log_martians=1' /etc/ufw/sysctl.conf"
+check "login.defs has no unknown items" bash -c "! chage -l root 2>&1 | grep -q 'configuration error'"
 if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
     check "UFW active" bash -c "ufw status | grep -q 'Status: active'"
+    check "ufw.service unit active" systemctl is-active ufw.service
+    check "runtime log_martians = 1 after UFW start" bash -c "[[ \$(sysctl -n net.ipv4.conf.all.log_martians) == 1 ]]"
 fi
 check "pam_faillock enabled"    grep -q 'pam_faillock.so preauth' /etc/pam.d/common-auth
 check "pam_pwquality enabled"   grep -q 'pam_pwquality.so' /etc/pam.d/common-password

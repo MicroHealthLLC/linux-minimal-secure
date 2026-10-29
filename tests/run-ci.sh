@@ -41,7 +41,7 @@ docker build --build-arg "DEBIAN_VERSION=${VER}" -t "$IMG" "${REPO}/tests"
 
 cleanup
 run_flags=(--detach --name "$NAME" --hostname "ci-debian${VER}" --tmpfs /run --tmpfs /run/lock
-           --cgroupns=private -v "${REPO}:/src:ro")
+           --cgroupns=private)
 if [[ $CI_PRIVILEGED == 1 ]]; then
     run_flags+=(--privileged)
 else
@@ -56,6 +56,13 @@ for _ in $(seq 1 60); do
     sleep 2
 done
 log "systemd state: ${state:-unknown}"
+
+# Copy (not bind-mount) the sources so every file on the "host" is owned by a
+# local account, exactly as on a real server.
+docker exec "$NAME" install -d -m 0755 /src
+docker cp "${REPO}/harden-and-audit.sh" "${NAME}:/src/harden-and-audit.sh"
+docker cp "${REPO}/tests" "${NAME}:/src/tests"
+docker exec "$NAME" chown -R root:root /src
 
 log "seeding SSH key for the sudo administrator (anti-lockout probe)"
 docker exec "$NAME" bash -euo pipefail -c '
