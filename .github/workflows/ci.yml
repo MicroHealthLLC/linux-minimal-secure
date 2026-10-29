@@ -17,8 +17,10 @@ on:
 permissions:
   contents: read
 
+# Distinct prefix: when called from release.yml, github.workflow is the
+# caller's name, and sharing the caller's group would deadlock.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
