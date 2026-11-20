@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tests/run-ci.sh DEBIAN_VERSION
+# tests/run-ci.sh <debian|ubuntu> <version>     e.g. debian 12, ubuntu 24.04
+# tests/run-ci.sh <12|13>                         (shorthand for debian)
 #
-# End-to-end test of harden-and-audit.sh inside a systemd-booted Debian
-# container that looks like a netinst server to OpenSCAP:
+# End-to-end test of harden-and-audit.sh inside a systemd-booted Debian or
+# Ubuntu container that looks like a netinst server to OpenSCAP:
 #   1. build + boot the test image          4. functional assertions
 #   2. seed an SSH key for the admin         5. second run (idempotence)
 #   3. run the hardening script              6. SCAP score gate + artifacts
@@ -14,22 +15,36 @@
 #                   developer workstation's kernel settings are never touched.
 #   SCAP_MIN_SCORE  gate threshold for the CIS L2 Server pass rate (default 90)
 #   RUN_TWICE       1 = re-run the script to prove idempotence (default 1)
-#   OUT_DIR         artifact directory (default ./artifacts/debian<ver>)
+#   OUT_DIR         artifact directory (default ./artifacts/<distro><ver>)
+#   SCAP_EXTRA      informational profile(s) (default: anssi_bp28_high on
+#                   Debian, stig on Ubuntu)
 # =============================================================================
 set -Eeuo pipefail
 
-VER=${1:?usage: tests/run-ci.sh <12|13>}
+usage() { echo "usage: tests/run-ci.sh <debian|ubuntu> <version>   (or: tests/run-ci.sh <12|13>)" >&2; exit 64; }
+case $# in
+    1) DISTRO=debian; VER=$1 ;;
+    2) DISTRO=$1; VER=$2 ;;
+    *) usage ;;
+esac
+case $DISTRO in
+    debian) [[ $VER =~ ^[0-9]+$ ]] || usage; DEFAULT_EXTRA=anssi_bp28_high ;;
+    ubuntu) [[ $VER =~ ^[0-9]+\.[0-9]+$ ]] || usage; DEFAULT_EXTRA=stig ;;
+    *) usage ;;
+esac
+TAG="${DISTRO}${VER/./}"                # debian12, ubuntu2404
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-IMG="dms-test:debian${VER}"
-NAME="dms-ci-debian${VER}"
-OUT_DIR=${OUT_DIR:-${REPO}/artifacts/debian${VER}}
+IMG="dms-test:${TAG}"
+NAME="dms-ci-${TAG}"
+OUT_DIR=${OUT_DIR:-${REPO}/artifacts/${TAG}}
+SCAP_EXTRA=${SCAP_EXTRA-$DEFAULT_EXTRA}
 SCAP_MIN_SCORE=${SCAP_MIN_SCORE:-90}
 RUN_TWICE=${RUN_TWICE:-1}
 if [[ -z ${CI_PRIVILEGED:-} ]]; then
     if [[ ${GITHUB_ACTIONS:-} == true ]]; then CI_PRIVILEGED=1; else CI_PRIVILEGED=0; fi
 fi
 
-log() { printf '\n[run-ci debian%s] %s\n' "$VER" "$*"; }
+log() { printf '\n[run-ci %s] %s\n' "$TAG" "$*"; }
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 # KEEP_CONTAINER=1 leaves the hardened container running for inspection.
 [[ ${KEEP_CONTAINER:-0} == 1 ]] || trap cleanup EXIT
@@ -37,10 +52,10 @@ cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 mkdir -p "$OUT_DIR"
 
 log "building test image ${IMG}"
-docker build --build-arg "DEBIAN_VERSION=${VER}" -t "$IMG" "${REPO}/tests"
+docker build --build-arg "BASE_IMAGE=${DISTRO}:${VER}" -t "$IMG" "${REPO}/tests"
 
 cleanup
-run_flags=(--detach --name "$NAME" --hostname "ci-debian${VER}" --tmpfs /run --tmpfs /run/lock
+run_flags=(--detach --name "$NAME" --hostname "ci-${TAG}" --tmpfs /run --tmpfs /run/lock
            --cgroupns=private)
 if [[ $CI_PRIVILEGED == 1 ]]; then
     run_flags+=(--privileged)
@@ -81,7 +96,7 @@ run_script() {
     log "running harden-and-audit.sh (${label})"
     set +e
     docker exec \
-        -e SCAP_EXTRA_PROFILES="anssi_bp28_high" \
+        -e SCAP_EXTRA_PROFILES="${SCAP_EXTRA}" \
         -e SCAP_ENFORCE_MIN=0 \
         -e AIDE_INIT="${AIDE_INIT:-1}" \
         "$NAME" bash /src/harden-and-audit.sh 2>&1 | tee "${OUT_DIR}/harden-${label}.log"
@@ -96,8 +111,12 @@ run_script() {
 collect() {
     log "collecting artifacts into ${OUT_DIR}"
     local f
-    for f in scap-results.xml scap-report.html scap-summary.txt scap-results.log \
-             scap-results-anssi_bp28_high.xml scap-report-anssi_bp28_high.html scap-summary-anssi_bp28_high.txt; do
+    local f p
+    local -a files=(scap-results.xml scap-report.html scap-summary.txt scap-results.log harden-and-audit.log)
+    for p in $SCAP_EXTRA; do
+        files+=("scap-results-${p}.xml" "scap-report-${p}.html" "scap-summary-${p}.txt")
+    done
+    for f in "${files[@]}"; do
         docker cp "${NAME}:/var/log/${f}" "${OUT_DIR}/${f}" >/dev/null 2>&1 || true
     done
 }
@@ -124,28 +143,49 @@ fi
 # ---------------------------------------------------------------------------
 # Score gate
 # ---------------------------------------------------------------------------
-field() { awk -v k="$1:" '$1==k {print $2}' "$2" | tr -d '%'; }
-cis_rate=$(field pass_rate "${OUT_DIR}/scap-summary.txt")
-cis_score=$(field xccdf_score "${OUT_DIR}/scap-summary.txt")
-cis_pass=$(field pass "${OUT_DIR}/scap-summary.txt")
-cis_fail=$(field fail "${OUT_DIR}/scap-summary.txt")
-anssi_rate=$(field pass_rate "${OUT_DIR}/scap-summary-anssi_bp28_high.txt" 2>/dev/null || echo n/a)
-anssi_score=$(field xccdf_score "${OUT_DIR}/scap-summary-anssi_bp28_high.txt" 2>/dev/null || echo n/a)
+field() { awk -v k="$1:" '$1==k {print $2}' "$2" 2>/dev/null | tr -d '%'; }
+S="${OUT_DIR}/scap-summary.txt"
+cis_rate=$(field pass_rate "$S")
+cis_score=$(field xccdf_score "$S")
+cis_pass=$(field pass "$S")
+cis_fail=$(field fail "$S")
+case $DISTRO in
+    debian) os_label="Debian ${VER}" ;;
+    ubuntu) os_label="Ubuntu ${VER}" ;;
+esac
+profile_label() {
+    case $1 in
+        anssi_bp28_high) echo "ANSSI BP-028 High" ;;
+        stig) echo "DISA STIG" ;;
+        *) echo "$1" ;;
+    esac
+}
 
 gate=FAIL
 awk -v r="$cis_rate" -v m="$SCAP_MIN_SCORE" 'BEGIN { exit !(r+0 >= m+0) }' && gate=PASS
 
+extra_note=""
 {
-    echo "### Debian ${VER} - harden-and-audit.sh"
+    echo "### ${os_label} - harden-and-audit.sh"
     echo
+    note=$(sed -n 's/^content note:[[:space:]]*//p' "$S")
+    [[ -n $note ]] && { echo "> ${note}"; echo; }
     echo "| Profile | Pass | Fail | Pass rate | XCCDF score | Gate (≥ ${SCAP_MIN_SCORE}%) |"
     echo "|---|---|---|---|---|---|"
-    echo "| CIS Debian ${VER} Level 2 Server | ${cis_pass} | ${cis_fail} | **${cis_rate}%** | ${cis_score} | **${gate}** |"
-    echo "| ANSSI BP-028 High (informational) | $(field pass "${OUT_DIR}/scap-summary-anssi_bp28_high.txt") | $(field fail "${OUT_DIR}/scap-summary-anssi_bp28_high.txt") | ${anssi_rate}% | ${anssi_score} | n/a |"
+    echo "| CIS ${os_label} Level 2 Server | ${cis_pass} | ${cis_fail} | **${cis_rate}%** | ${cis_score} | **${gate}** |"
+    for p in $SCAP_EXTRA; do
+        E="${OUT_DIR}/scap-summary-${p}.txt"
+        if [[ -f $E ]]; then
+            echo "| $(profile_label "$p") (informational) | $(field pass "$E") | $(field fail "$E") | $(field pass_rate "$E")% | $(field xccdf_score "$E") | n/a |"
+            extra_note+="; $(profile_label "$p") $(field pass_rate "$E")%"
+        else
+            echo "| $(profile_label "$p") (informational) | - | - | not available for this release | - | n/a |"
+        fi
+    done
     echo
     echo "<details><summary>Failed CIS rules</summary>"
     echo
-    sed -n '/^Failed rules:/,$p' "${OUT_DIR}/scap-summary.txt" | tail -n +2
+    sed -n '/^Failed rules:/,$p' "$S" | tail -n +2
     echo
     echo "</details>"
 } >"${OUT_DIR}/summary.md"
@@ -156,4 +196,4 @@ if [[ $gate != PASS ]]; then
     echo "CIS Level 2 Server pass rate ${cis_rate}% is below ${SCAP_MIN_SCORE}%" >&2
     exit 1
 fi
-log "PASS: CIS L2 Server ${cis_rate}% (XCCDF ${cis_score}); ANSSI BP-028 High ${anssi_rate}%"
+log "PASS: CIS L2 Server ${cis_rate}% (XCCDF ${cis_score})${extra_note}"

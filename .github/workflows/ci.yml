@@ -1,9 +1,10 @@
 # CI for harden-and-audit.sh
 #
 # Runs on every push / PR to the integration branch (the default branch), and
-# is reused by the release workflow on main. Each Debian release is hardened
-# inside a systemd-booted container that OpenSCAP evaluates as a real
-# machine, then gated on CIS Debian Level 2 Server >= 90%.
+# is reused by the release workflow on main. Each Debian / Ubuntu release is
+# hardened inside a systemd-booted container that OpenSCAP evaluates as a real
+# machine, then gated on CIS Level 2 Server >= 90%. ANSSI BP-028 High
+# (Debian) and the DISA STIG (Ubuntu) are reported for information.
 name: ci
 
 on:
@@ -38,14 +39,19 @@ jobs:
             -x --severity=warning harden-and-audit.sh tests/run-ci.sh tests/assertions.sh tests/container-init.sh
 
   harden-and-scan:
-    name: debian ${{ matrix.debian }} - harden + SCAP
+    name: ${{ matrix.distro }} ${{ matrix.version }} - harden + SCAP
     needs: lint
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        debian: ["12", "13"]
+        include:
+          - { distro: debian, version: "12",    tag: debian12 }
+          - { distro: debian, version: "13",    tag: debian13 }
+          - { distro: ubuntu, version: "22.04", tag: ubuntu2204 }
+          - { distro: ubuntu, version: "24.04", tag: ubuntu2404 }
+          - { distro: ubuntu, version: "26.04", tag: ubuntu2604 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -53,14 +59,14 @@ jobs:
         env:
           CI_PRIVILEGED: "1"
           SCAP_MIN_SCORE: "90"
-          OUT_DIR: ${{ github.workspace }}/artifacts/debian${{ matrix.debian }}
-        run: tests/run-ci.sh "${{ matrix.debian }}"
+          OUT_DIR: ${{ github.workspace }}/artifacts/${{ matrix.tag }}
+        run: tests/run-ci.sh "${{ matrix.distro }}" "${{ matrix.version }}"
 
       - name: upload SCAP reports and logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: scap-debian${{ matrix.debian }}
-          path: artifacts/debian${{ matrix.debian }}
+          name: scap-${{ matrix.tag }}
+          path: artifacts/${{ matrix.tag }}
           if-no-files-found: warn
           retention-days: 90

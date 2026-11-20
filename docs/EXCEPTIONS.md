@@ -78,3 +78,44 @@ ANSSI High is scanned and reported but **not gated**. Large parts of it assume a
 * Separate `/boot`, `/opt`, `/srv`, `/usr` partitions (install-time).
 * `kernel.modules_disabled=1`, `mce=0`, `l1tf=full,force`, `mds=full,nosmt`. These are incompatible with NVIDIA/DKMS, or halve CPU capacity, or panic on machine checks (against the no-halt policy).
 * `sudo` `noexec`/`requiretty`, which break package management and automation.
+
+## 8. Ubuntu
+
+Everything in sections 1–6 applies to Ubuntu as well (same owner-mandated auditd policy, install-time partitions, and CI-container limits). Ubuntu adds the following.
+
+### 8.1 Content and platform decisions
+
+| Topic | Decision |
+|---|---|
+| **Ubuntu 26.04 SCAP content** | SSG 0.1.82 (the newest ComplianceAsCode release, 2026-09-01) ships `ssg-ubuntu2604-ds.xml` as an empty skeleton with **no profiles**. The script therefore evaluates the **CIS Ubuntu 24.04 LTS Level 2 Server** benchmark on 26.04: a copy of the 24.04 datastream whose platform check (`DISTRIB_CODENAME` in `/etc/lsb-release`) accepts `resolute`. The summary says so (`content note:`), and the HTML report title still reads "Ubuntu 24.04". Disable with `SSG_CONTENT_FALLBACK=0`; re-pin `SSG_VERSION` when native 26.04 content is released. |
+| **DISA STIG (Ubuntu)** | Reported for information only (`stig` profile, Canonical Ubuntu 22.04 STIG V2R7 / 24.04 STIG). It requires controls the owner rejected for availability (e.g. `admin_space_left_action = single`, permanent faillock lockout, auto-logout of every session) and site-specific items (SSSD/smart-card PKI, remote audit offload). The CIS L2 Server gate is the same on every OS. There is no 26.04 STIG. |
+| **Ubuntu 22.04 OpenSCAP** | jammy packages only `libopenscap8` (oscap 1.2.17) and no `ssg-*`. That scanner is used with the pinned SSG 0.1.82 content (verified: 0 evaluation errors). |
+| **sudo-rs (Ubuntu 25.10+)** | sudo-rs is the default `sudo` on 26.04, but it has no sudo log file and no I/O logging (`logfile`, `log_input`, `log_output` and `iolog_dir` are rejected). Classic sudo (`sudo.ws`, still installed) is selected through `update-alternatives` after the existing policy validates under it. `SUDO_PROVIDER=keep` keeps sudo-rs; then only the settings it accepts are written, and the sudo logging rules fail. |
+| **snapd** | Not removed. Cloud management agents (e.g. the AWS SSM agent on Ubuntu AMIs) ship as snaps, so removing snapd can cut the only management path. Remove it manually where it is not needed. |
+| **Ubuntu Pro FIPS** | If `pro status` shows `fips`/`fips-updates` enabled, Canonical's certified modules and kernel are kept and the OpenSSL 3.1.2 provider is not built or configured. Two FIPS providers are never stacked. |
+| **AppArmor profiles shipped disabled** | Ubuntu disables some profiles on purpose (`/etc/apparmor.d/disable`). They are loaded in **complain** mode (confined and logged) rather than enforced, which satisfies "enforce or complain" without breaking a service the vendor chose not to enforce. |
+| **apport** | Purged when no other installed package depends on it. If a metapackage depends on it, it is disabled and masked (`/etc/default/apport enabled=0`) instead; metapackages are never removed. |
+
+### 8.2 Rules that remain failing on Ubuntu (CI, privileged)
+
+All three releases fail the same core set. It falls into the categories already described for Debian:
+
+| Rule(s) | 22.04 | 24.04 | 26.04 | Category |
+|---|---|---|---|---|
+| `auditd_data_disk_full_action`, `auditd_data_retention_{admin_space_left,max_log_file,space_left}_action` | ✗ | ✗ | ✗ | Owner-mandated (§1) |
+| `partition_for_{home,var,var_log,var_log_audit}` | ✗ | ✗ | ✗ | Install-time (§4) |
+| `package_ufw_removed` | ✗ | ✗ | ✗ | Profile conflict: the nftables path of the benchmark; UFW is mandated (§2) |
+| `set_ufw_default_rule` | ✗ | ✗ | ✗ | Requires default-deny **outbound**: same decision as Debian's `ufw_default_outgoing_rule` (§2). Opt in with `UFW_OUTBOUND_POLICY=deny` |
+| `ufw_rules_for_open_ports` | ✗→✓ | ✗→✓ | ✗→✓ | Fixed, see §8.3 |
+| `aide_build_database` | ✗ | ✗ | ✗ | **SSG content defect** (as on Debian 12, §3): the check derives the database path from the pre-0.17 `database=` key; Ubuntu's AIDE uses `database_in=`. The baseline database is built (`/var/lib/aide/aide.db`) |
+| `grub2_password`, `grub2_uefi_password`, `grub2_audit_argument`, `grub2_audit_backlog_limit_argument`, `grub2_enable_apparmor` | ✗ | ✗ | ✗ | CI container only: `/boot/grub/grub.cfg` is never generated (§5). `/etc/default/grub` and the password drop-in are asserted |
+| `service_auditd_enabled`, `service_timesyncd_enabled`, `ntp_single_service_active`, `all_apparmor_profiles_in_enforce_complain_mode` | ✗ | ✗ | ✗ | CI container only (§5) |
+| `service_timesyncd_configured` | ✓ | ✗→✓ | ✗→✓ | Fixed: on Ubuntu without `NTP_SERVERS`, timesyncd uses the pool servers the 24.04 benchmark lists as approved (`NTP=0-3.pool.ntp.org`), and `FallbackNTP` starts with `time.nist.gov` (the value the 22.04 profile approves), then `ntp.ubuntu.com`. When you set `NTP_SERVERS` to your enclave's servers, this rule reports them as unapproved unless the profile value is tailored |
+| `ensure_root_access_controlled` | ✗ | ✓ | ✓ | 22.04 content requires a root **password hash**. Root stays locked and administrators use sudo, which is stricter; the 24.04 content accepts a locked root |
+| `journald_disable_forward_to_syslog` | ✗ | – | – | Profile-internal conflict (§2) |
+| `audit_rules_privileged_commands` | ✗ | ✓ | ✓ | CI container only (§5) |
+| `set_ufw_loopback_traffic`, `no_files_unowned_by_user` (+ the two UFW rules above) | error | – | – | **Scanner limit**: jammy's oscap 1.2.17 cannot run these SCE/OVAL checks and reports `error`. The loopback rules are in place and asserted |
+
+### 8.3 `ufw_rules_for_open_ports`: a real defect, fixed
+
+The check requires a UFW rule for every non-loopback listener. Inspection of a hardened 24.04 host showed **rpcbind's socket (port 111) still listening** after the script had purged rpcbind. The package's own "stop" was suppressed (a `policy-rc.d`, present in container images and some image-build pipelines), and the script only disabled units whose unit file still existed. UFW kept blocking the port inbound, but a removed service must not keep a socket open. `disable_service` now also stops a unit that is still active after its unit file is gone, the CI image no longer carries `policy-rc.d`, and an assertion verifies nothing listens on port 111. The fix applies to Debian as well.

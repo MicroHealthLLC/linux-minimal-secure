@@ -2,9 +2,10 @@
 # =============================================================================
 # harden-and-audit.sh
 #
-# Transforms a stock Debian 12 (bookworm) or Debian 13 (trixie) installation
-# into a minimal, FIPS-ready, SCAP/CIS-Level-2-hardened headless server, then
-# audits itself with OpenSCAP and writes XML + HTML compliance reports.
+# Transforms a stock Debian 12 (bookworm) / 13 (trixie) or Ubuntu 22.04
+# (jammy) / 24.04 (noble) / 26.04 (resolute) installation into a minimal,
+# FIPS-ready, SCAP/CIS-Level-2-hardened headless server, then audits itself
+# with OpenSCAP and writes XML + HTML compliance reports.
 #
 # Design rules (in priority order):
 #   1. Never lock the operator out. Anti-lockout checks run BEFORE anything
@@ -16,12 +17,12 @@
 #      once under /var/backups/harden-and-audit/<original path>.
 #
 # Usage:   sudo ./harden-and-audit.sh [--scan-only] [--help] [--version]
-# Docs:    README.md, docs/EXCEPTIONS.md
+# Docs:    README.md, docs/EXCEPTIONS.md, docs/PLAN-UBUNTU.md
 # =============================================================================
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly SCRIPT_NAME="harden-and-audit.sh"
 readonly LOG_FILE="/var/log/harden-and-audit.log"
 readonly STATE_DIR="/var/lib/harden-and-audit"
@@ -43,8 +44,12 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # ----------------------------------------------------------------------------
 : "${DEBIAN_MIRROR:=https://deb.debian.org/debian}"
 : "${DEBIAN_SECURITY_MIRROR:=https://security.debian.org/debian-security}"
-: "${NTP_SERVERS:=0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org 3.debian.pool.ntp.org}"
+: "${UBUNTU_MIRROR:=}"                # empty = keep the configured Ubuntu mirror (cloud/regional), else archive/ports
+: "${UBUNTU_SECURITY_MIRROR:=}"       # empty = keep the configured security mirror, else security/ports
+: "${NTP_SERVERS:=}"                  # empty = distribution default (Debian pool / ntp.ubuntu.com)
 : "${NTP_FALLBACK_SERVERS:=time.nist.gov}"
+: "${SUDO_PROVIDER:=classic}"         # Ubuntu 25.10+: classic = select sudo.ws (full logging); keep = leave sudo-rs
+: "${SSG_CONTENT_FALLBACK:=1}"        # 1 = scan a release without native SSG content with the newest older LTS content
 : "${PASS_MAX_DAYS:=365}"            # DoD sites commonly set 60
 : "${PASS_MIN_DAYS:=1}"
 : "${PASS_WARN_AGE:=7}"
@@ -85,8 +90,13 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Runtime state
 # ----------------------------------------------------------------------------
 CURRENT_STEP="startup"
+OS_ID=""            # debian | ubuntu
+OS_VERSION=""       # 12, 13, 22.04, 24.04, 26.04 ...
 OS_CODENAME=""
-OS_MAJOR=""
+OS_MAJOR=""         # Debian 12/13; Ubuntu 22/24/26
+OS_NUM=0            # comparable number: Debian 12 -> 12, Ubuntu 24.04 -> 2404
+OS_NAME=""          # "Debian 12", "Ubuntu 24.04"
+SSG_PRODUCT=""      # debian12, ubuntu2404 ...
 DEB_ARCH=""
 SSH_PORTS=()
 KEEP_RA=0
@@ -119,7 +129,8 @@ usage() {
     cat <<'EOF'
 Usage: harden-and-audit.sh [--scan-only] [--help] [--version]
 
-  (no option)   Harden this Debian 12/13 host, then run the OpenSCAP audit.
+  (no option)   Harden this Debian 12/13 or Ubuntu 22.04/24.04/26.04 host,
+                then run the OpenSCAP audit.
   --scan-only   Only run the OpenSCAP audit and regenerate the reports.
   --version     Print the script version.
 
@@ -195,6 +206,9 @@ set_kv() {
 # SIGPIPE the producer and, under pipefail, report a false failure.
 qgrep() { grep "$@" >/dev/null; }
 
+is_ubuntu() { [[ $OS_ID == ubuntu ]]; }
+is_debian() { [[ $OS_ID == debian ]]; }
+
 pkg_installed() { [[ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null || true)" == installed ]]; }
 
 pkg_candidate() {
@@ -204,10 +218,19 @@ pkg_candidate() {
 }
 
 # first_available PKG... - print the first package that has an apt candidate.
+# An entry "~REGEX" matches package names instead; the newest name (version
+# sort) with a candidate wins - this tracks soname bumps across releases.
 first_available() {
-    local p
+    local p m
     for p in "$@"; do
-        if pkg_candidate "$p"; then
+        if [[ $p == "~"* ]]; then
+            while read -r m; do
+                if pkg_candidate "$m"; then
+                    printf '%s\n' "$m"
+                    return 0
+                fi
+            done < <(apt-cache pkgnames 2>/dev/null | grep -E "${p#\~}" | sort -rV || true)
+        elif pkg_candidate "$p"; then
             printf '%s\n' "$p"
             return 0
         fi
@@ -268,6 +291,12 @@ disable_service() {
             systemctl disable --now "$u" >/dev/null 2>&1 || true
             systemctl mask "$u" >/dev/null 2>&1 || true
             log "disabled and masked ${u}"
+        elif systemctl is-active --quiet "$u" 2>/dev/null; then
+            # Purged package whose unit is still running (its prerm "stop"
+            # was suppressed, e.g. by a policy-rc.d): the socket stays open
+            # until reboot unless it is stopped here.
+            systemctl stop "$u" >/dev/null 2>&1 || true
+            log "stopped ${u} (left running after its package was removed)"
         fi
     done
 }
@@ -286,16 +315,39 @@ preflight_os() {
     [[ -r /etc/os-release ]] || die "/etc/os-release missing"
     # shellcheck disable=SC1091
     . /etc/os-release
-    [[ ${ID:-} == debian ]] || die "unsupported distribution '${ID:-unknown}' (Debian 12/13 required)"
-    OS_MAJOR=${VERSION_ID%%.*}
-    OS_CODENAME=${VERSION_CODENAME:-}
-    [[ -n $OS_MAJOR && $OS_MAJOR =~ ^[0-9]+$ ]] || die "cannot determine Debian release"
-    (( OS_MAJOR >= 12 )) || die "Debian ${OS_MAJOR} is not supported (Debian 12 or newer required)"
-    [[ -n $OS_CODENAME ]] || die "cannot determine Debian codename"
+    OS_ID=${ID:-unknown}
+    OS_VERSION=${VERSION_ID:-}
+    OS_MAJOR=${OS_VERSION%%.*}
+    OS_CODENAME=${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}
+    [[ -n $OS_MAJOR && $OS_MAJOR =~ ^[0-9]+$ ]] || die "cannot determine the ${OS_ID} release"
+    [[ -n $OS_CODENAME ]] || die "cannot determine the ${OS_ID} codename"
+    case $OS_ID in
+        debian)
+            (( OS_MAJOR >= 12 )) || die "Debian ${OS_MAJOR} is not supported (Debian 12 or newer required)"
+            OS_NUM=$OS_MAJOR
+            OS_NAME="Debian ${OS_MAJOR}"
+            SSG_PRODUCT="debian${OS_MAJOR}"
+            : "${NTP_SERVERS:=0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org 3.debian.pool.ntp.org}"
+            ;;
+        ubuntu)
+            [[ $OS_VERSION =~ ^[0-9]+\.[0-9]+$ ]] || die "cannot parse Ubuntu version '${OS_VERSION}'"
+            OS_NUM=$(( 10#${OS_VERSION%%.*} * 100 + 10#${OS_VERSION#*.} ))
+            (( OS_NUM >= 2204 )) || die "Ubuntu ${OS_VERSION} is not supported (Ubuntu 22.04 or newer required)"
+            OS_NAME="Ubuntu ${OS_VERSION}"
+            SSG_PRODUCT="ubuntu${OS_VERSION/./}"
+            if [[ ${VERSION:-} != *LTS* ]]; then
+                warn "Ubuntu ${OS_VERSION} is an interim (non-LTS) release: supported on a best-effort basis"
+            fi
+            # Empty NTP_SERVERS keeps the vendor chrony sources (NTS on 25.10+).
+            ;;
+        *)
+            die "unsupported distribution '${OS_ID}' (Debian 12/13 or Ubuntu 22.04/24.04/26.04 required)"
+            ;;
+    esac
     DEB_ARCH=$(dpkg --print-architecture)
     UID_MIN_VALUE=$(awk '/^[[:space:]]*UID_MIN[[:space:]]/{print $2}' /etc/login.defs 2>/dev/null || true)
     UID_MIN_VALUE=${UID_MIN_VALUE:-1000}
-    log "Debian ${OS_MAJOR} (${OS_CODENAME}) ${DEB_ARCH}; container=$(in_container && echo yes || echo no)"
+    log "${OS_NAME} (${OS_CODENAME}) ${DEB_ARCH}; container=$(in_container && echo yes || echo no)"
 }
 
 # Interactive accounts that may log in (UID >= UID_MIN, real shell, not locked).
@@ -340,6 +392,16 @@ detect_ssh_ports() {
     local p
     if command -v sshd >/dev/null 2>&1 && install -d -m 0755 /run/sshd && sshd -T >/dev/null 2>&1; then
         mapfile -t SSH_PORTS < <(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -un)
+    fi
+    # Socket activation (Ubuntu 22.10+): the listening port may come from an
+    # ssh.socket drop-in that sshd -T knows nothing about.
+    if systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; then
+        local -a sock
+        mapfile -t sock < <(systemctl show -p Listen --value ssh.socket 2>/dev/null | tr ' ' '\n' \
+            | sed -n -E 's/^.*[:]([0-9]+)$/\1/p; s/^([0-9]+)$/\1/p' | sort -un)
+        if [[ ${#sock[@]} -gt 0 ]]; then
+            mapfile -t SSH_PORTS < <(printf '%s\n' "${SSH_PORTS[@]}" "${sock[@]}" | awk 'NF' | sort -un)
+        fi
     fi
     if [[ ${#SSH_PORTS[@]} -eq 0 ]]; then
         if [[ -n ${SSH_CONNECTION:-} ]]; then
@@ -400,6 +462,7 @@ purge_graphical() {
     local re='^(xserver-.*|xorg|xorg-.*|x11-.*|xinit|xauth|xterm|xwayland|weston|xbase-clients|xfonts-.*|'
     re+='gdm3|lightdm.*|sddm.*|xdm|lxdm|slim|nodm|wdm|'
     re+='task-desktop|task-.*-desktop|gnome-.*|gnome|kde-.*|plasma-.*|xfce4.*|lxde.*|lxqt.*|cinnamon.*|mate-.*|budgie-.*|openbox.*|'
+    re+='ubuntu-desktop.*|ubuntu-session|[a-z]+ubuntu-desktop.*|ubuntu-gnome-.*|yaru-theme-.*|'
     re+='libgtk.*|libgdk.*|gir1\.2-gtk.*|libqt[56]gui.*|libqt[56]widgets.*|libqt6opengl.*|'
     re+='libx11-.*|libxcb.*|libxau6|libxdmcp6|libxext6|libxrender1|libxfixes3|libxi6|libxrandr2|libxinerama1|libxcursor1|'
     re+='libxcomposite1|libxdamage1|libxtst6|libxt6.*|libxmu.*|libxpm4|libxkbcommon.*|libxshmfence1|libxxf86vm1|libxss1|'
@@ -444,6 +507,9 @@ purge_insecure_services() {
         cups.socket rpcbind.service rpcbind.socket nfs-server.service snmpd.service
     # STIG: no Ctrl-Alt-Del reboot, no debug shell.
     systemctl mask ctrl-alt-del.target debug-shell.service >/dev/null 2>&1 || true
+    if is_ubuntu; then
+        purge_ubuntu_telemetry
+    fi
     local srv
     for srv in apache2 nginx bind9 samba dovecot-core squid vsftpd slapd; do
         if pkg_installed "$srv"; then
@@ -452,10 +518,45 @@ purge_insecure_services() {
     done
 }
 
+# Ubuntu: crash reporting and telemetry. apport also replaces the kernel's
+# core_pattern with a pipe, which defeats the "no core dumps" control.
+# snapd is deliberately kept: cloud management agents (e.g. the SSM agent
+# on Ubuntu AMIs) ship as snaps, and removing it can cut the admin path.
+purge_ubuntu_telemetry() {
+    local -a present=()
+    local p
+    for p in apport apport-symptoms python3-apport whoopsie popularity-contest ubuntu-report; do
+        pkg_installed "$p" && present+=("$p")
+    done
+    if [[ ${#present[@]} -gt 0 ]]; then
+        safe_purge "${present[@]}"
+    fi
+    # Whatever had to stay installed (dependency-protected) is switched off.
+    if pkg_installed apport; then
+        if [[ -f /etc/default/apport ]]; then
+            backup_file /etc/default/apport
+            sed -i -E 's/^enabled=.*/enabled=0/' /etc/default/apport
+        fi
+        disable_service apport.service apport-autoreport.path apport-autoreport.service apport-forward.socket
+    fi
+    disable_service whoopsie.service whoopsie.path
+    # motd-news fetches content from Canonical on logins and from a timer.
+    if [[ -f /etc/default/motd-news ]]; then
+        backup_file /etc/default/motd-news
+        sed -i -E 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
+    fi
+    disable_service motd-news.timer motd-news.service
+    return 0
+}
+
 # ============================================================================
 # 2. Repositories, base stack, unattended security updates
 # ============================================================================
 configure_repositories() {
+    if is_ubuntu; then
+        configure_repositories_ubuntu
+        return 0
+    fi
     step "2.1 official Debian repositories (stable, -updates, -security)"
     apt_update
     apt_install ca-certificates debian-archive-keyring
@@ -482,6 +583,110 @@ EOF
         sed -i -E '/^[[:space:]]*deb(-src)?[[:space:]].*(deb\.debian\.org|security\.debian\.org|ftp\.[a-z.]*debian\.org|http\.debian\.net|debian-security)/s/^/# disabled by harden-and-audit (see sources.list.d\/debian.sources): /' /etc/apt/sources.list
         sed -i -E 's/^([[:space:]]*deb(-src)?[[:space:]]+cdrom:)/# disabled by harden-and-audit: \1/' /etc/apt/sources.list
     fi
+    apt_update
+}
+
+# current_ubuntu_mirror SUITE - print the first enabled, configured Ubuntu
+# archive URI that serves SUITE (deb822 *.sources or one-line sources.list).
+current_ubuntu_mirror() {
+    local suite=$1 f uri
+    # ubuntu.sources is the official file; other *.sources files only count
+    # when signed by the Ubuntu archive key (never a PPA or third party).
+    for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/*.sources; do
+        [[ -f $f ]] || continue
+        uri=$(awk -v s="$suite" -v official="$([[ $f == */ubuntu.sources ]] && echo 1 || echo 0)" '
+            BEGIN { RS = ""; FS = "\n" }
+            {
+                uri = ""; ok = 0; en = 1; key = official
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ /^URIs:/)    { v = $i; sub(/^URIs:[[:space:]]*/, "", v); split(v, u, /[[:space:]]+/); uri = u[1] }
+                    if ($i ~ /^Suites:/)  { n = split($i, w, /[[:space:]]+/); for (j = 2; j <= n; j++) if (w[j] == s) ok = 1 }
+                    if ($i ~ /^Enabled:[[:space:]]*no/) en = 0
+                    if ($i ~ /^Signed-By:.*ubuntu-archive-keyring/) key = 1
+                }
+                if (ok && en && key && uri ~ /ubuntu/ && uri !~ /launchpad/) { print uri; exit }
+            }' "$f")
+        if [[ -n $uri ]]; then
+            printf '%s\n' "$uri"
+            return 0
+        fi
+    done
+    [[ -f /etc/apt/sources.list ]] || return 0
+    # One-line format: an archive path (.../ubuntu or .../ubuntu-ports) with
+    # the "main" component; PPAs and vendor repositories never qualify.
+    awk -v s="$suite" '
+        $1 == "deb" {
+            i = 2
+            if ($2 ~ /^\[/) { while (i <= NF && $i !~ /\]$/) i++; i++ }
+            main = 0
+            for (j = i + 2; j <= NF; j++) if ($j == "main") main = 1
+            if ($(i + 1) == s && main && $i ~ /\/ubuntu(-ports)?\/?$/ && $i !~ /launchpad/) { print $i; exit }
+        }' /etc/apt/sources.list
+}
+
+# disable_ubuntu_oneline MIRROR SECURITY - comment out one-line entries for
+# this release that point at *.ubuntu.com or at the detected mirrors.
+disable_ubuntu_oneline() {
+    local f=/etc/apt/sources.list tmp
+    [[ -f $f ]] || return 0
+    backup_file "$f"
+    tmp=$(mktemp)
+    awk -v c="$OS_CODENAME" -v m="${1%/}" -v sm="${2%/}" '
+        /^[[:space:]]*deb(-src)?[[:space:]]/ {
+            i = 2
+            if ($2 ~ /^\[/) { while (i <= NF && $i !~ /\]$/) i++; i++ }
+            uri = $i; sub(/\/$/, "", uri); suite = $(i + 1)
+            host = uri; sub(/^[a-z+]+:\/\//, "", host); sub(/\/.*/, "", host)
+            if ((suite == c || suite ~ "^" c "-(updates|security|backports|proposed)$") &&
+                (host ~ /(^|\.)ubuntu\.com$/ || uri == m || uri == sm)) {
+                print "# disabled by harden-and-audit (see sources.list.d/ubuntu.sources): " $0
+                next
+            }
+        }
+        /^[[:space:]]*deb(-src)?[[:space:]]+cdrom:/ { print "# disabled by harden-and-audit: " $0; next }
+        { print }' "$f" >"$tmp"
+    cat "$tmp" >"$f"
+    rm -f "$tmp"
+}
+
+configure_repositories_ubuntu() {
+    step "2.1 official Ubuntu repositories (release, -updates, -security; main restricted universe multiverse)"
+    local def_main def_sec mirror sec keyring
+    case $DEB_ARCH in
+        amd64|i386) def_main=http://archive.ubuntu.com/ubuntu;   def_sec=http://security.ubuntu.com/ubuntu ;;
+        *)          def_main=http://ports.ubuntu.com/ubuntu-ports; def_sec=http://ports.ubuntu.com/ubuntu-ports ;;
+    esac
+    # Keep an already-configured regional/cloud/private mirror: it is often
+    # the only archive reachable from a private subnet. apt verifies every
+    # index against the Ubuntu archive key, so http transport is safe.
+    mirror=${UBUNTU_MIRROR:-$(current_ubuntu_mirror "$OS_CODENAME")}
+    sec=${UBUNTU_SECURITY_MIRROR:-$(current_ubuntu_mirror "${OS_CODENAME}-security")}
+    mirror=${mirror:-$def_main}
+    sec=${sec:-$def_sec}
+    mirror=${mirror%/}
+    sec=${sec%/}
+    log "Ubuntu archive: ${mirror}; security archive: ${sec}"
+    apt_update
+    apt_install ca-certificates ubuntu-keyring
+    keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+    [[ -f $keyring ]] || die "${keyring} missing (package ubuntu-keyring)"
+    write_file 0644 /etc/apt/sources.list.d/ubuntu.sources <<EOF
+# Managed by ${SCRIPT_NAME} - official Ubuntu ${OS_VERSION} (${OS_CODENAME}) archives.
+Types: deb
+URIs: ${mirror}
+Suites: ${OS_CODENAME} ${OS_CODENAME}-updates
+Components: main restricted universe multiverse
+Signed-By: ${keyring}
+
+Types: deb
+URIs: ${sec}
+Suites: ${OS_CODENAME}-security
+Components: main restricted universe multiverse
+Signed-By: ${keyring}
+EOF
+    # Neutralise the official entries in the legacy one-line format (the
+    # Ubuntu 22.04 default), leaving third-party repositories untouched.
+    disable_ubuntu_oneline "$mirror" "$sec"
     apt_update
 }
 
@@ -513,13 +718,32 @@ APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-    write_file 0644 /etc/apt/apt.conf.d/52unattended-upgrades-harden <<'EOF'
-// Managed by harden-and-audit.sh - apply official Debian security updates daily.
+    # ${distro_codename} is expanded by unattended-upgrades, not by bash.
+    local origins check
+    # shellcheck disable=SC2016
+    if is_ubuntu; then
+        # Ubuntu security pocket, plus the ESM pockets (used only when the
+        # host is attached to Ubuntu Pro; harmless otherwise).
+        origins='#clear Unattended-Upgrade::Allowed-Origins;
 #clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+        "origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu";
+        "origin=UbuntuESMApps,archive=${distro_codename}-apps-security";
+        "origin=UbuntuESM,archive=${distro_codename}-infra-security";
+};'
+        check='Unattended-Upgrade::Origins-Pattern:: "origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu"'
+    else
+        origins='#clear Unattended-Upgrade::Origins-Pattern;
 Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
         "origin=Debian,codename=${distro_codename},label=Debian-Security";
-};
+};'
+        check='Unattended-Upgrade::Origins-Pattern:: "origin=Debian,codename=${distro_codename}-security,label=Debian-Security"'
+    fi
+    {
+        echo "// Managed by ${SCRIPT_NAME} - apply official ${OS_ID^} security updates daily."
+        printf '%s\n' "$origins"
+        cat <<'EOF'
 Unattended-Upgrade::Package-Blacklist {
 };
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
@@ -537,10 +761,10 @@ Dpkg::Options {
         "--force-confold";
 };
 EOF
+    } | write_file 0644 /etc/apt/apt.conf.d/52unattended-upgrades-harden
     systemctl enable apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service >/dev/null 2>&1 || true
     systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
-    apt-config dump | qgrep 'Unattended-Upgrade::Origins-Pattern:: "origin=Debian,codename=${distro_codename}-security,label=Debian-Security"' \
-        || die "unattended-upgrades origin pattern did not take effect"
+    apt-config dump | qgrep -F "$check" || die "unattended-upgrades origin pattern did not take effect"
 }
 
 # ============================================================================
@@ -712,16 +936,43 @@ EOF
 -a always,exit -F path=/usr/bin/chacl -F perm=x -F auid>=${uid} -F auid!=unset -k perm_chng
 -a always,exit -F path=/usr/sbin/usermod -F perm=x -F auid>=${uid} -F auid!=unset -k usermod
 EOF
-    # Syscalls added in Linux 6.6 (fchmodat2) / 3.15 (renameat2), known to the
-    # Debian 13 audit userspace.
-    if (( OS_MAJOR >= 13 )); then
-        write_file 0600 ${rules_dir}/51-harden-new-syscalls.rules <<EOF
-## Managed by ${SCRIPT_NAME}
--a always,exit -F arch=b64 -S fchmodat2 -F auid>=${uid} -F auid!=unset -k perm_mod
--a always,exit -F arch=b32 -S fchmodat2 -F auid>=${uid} -F auid!=unset -k perm_mod
--a always,exit -F arch=b64 -S renameat2 -F auid>=${uid} -F auid!=unset -k delete
--a always,exit -F arch=b32 -S renameat2 -F auid>=${uid} -F auid!=unset -k delete
-EOF
+    # Syscalls added in Linux 6.6 (fchmodat2) / 3.15 (renameat2): emitted only
+    # for the architectures whose syscall table the installed audit userspace
+    # knows (fchmodat2 is unknown before audit 4.x, e.g. Ubuntu 22.04/24.04).
+    local -a newrules=()
+    local sc key abi tbl
+    for sc in fchmodat2:perm_mod renameat2:delete; do
+        key=${sc#*:}
+        sc=${sc%%:*}
+        for abi in b64 b32; do
+            case $DEB_ARCH:$abi in
+                amd64:b64) tbl=x86_64 ;; amd64:b32) tbl=i386 ;;
+                arm64:b64) tbl=aarch64 ;; arm64:b32) tbl=arm ;;
+                *) continue ;;
+            esac
+            if ausyscall "$tbl" "$sc" >/dev/null 2>&1; then
+                newrules+=("-a always,exit -F arch=${abi} -S ${sc} -F auid>=${uid} -F auid!=unset -k ${key}")
+            fi
+        done
+    done
+    # Ubuntu CIS also audits extended-attribute changes made as root (auid=0).
+    if is_ubuntu; then
+        newrules+=("-a always,exit -F arch=b64 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid=0 -k perm_mod"
+                   "-a always,exit -F arch=b32 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid=0 -k perm_mod")
+    fi
+    if [[ ${#newrules[@]} -gt 0 ]]; then
+        { echo "## Managed by ${SCRIPT_NAME}"; printf '%s\n' "${newrules[@]}"; } | write_file 0600 ${rules_dir}/51-harden-new-syscalls.rules
+    else
+        rm -f ${rules_dir}/51-harden-new-syscalls.rules
+    fi
+    # Ubuntu network configuration lives in netplan (created if absent, so
+    # the watch is valid and catches the first configuration written).
+    if is_ubuntu; then
+        install -d -m 0755 -o root -g root /etc/netplan
+    fi
+    if [[ -d /etc/netplan ]]; then
+        printf '## Managed by %s\n-w /etc/netplan/ -p wa -k system-locale\n' "$SCRIPT_NAME" \
+            | write_file 0600 ${rules_dir}/52-harden-netplan.rules
     fi
     # Privileged (setuid/setgid) commands on every local filesystem.
     local -a mounts files
@@ -796,20 +1047,71 @@ configure_grub() {
     backup_file /etc/default/grub
     # GRUB_CMDLINE_LINUX applies to every boot entry, including recovery;
     # fips=1 is also put in the default (non-recovery) string, as required.
+    local -a kargs=(fips=1 audit=1 audit_backlog_limit=8192 apparmor=1 security=apparmor
+        slab_nomerge=yes pti=on page_alloc.shuffle=1 vsyscall=none init_on_alloc=1
+        spectre_v2=on spec_store_bypass_disable=seccomp rng_core.default_quality=500)
     grub_set_args GRUB_CMDLINE_LINUX_DEFAULT fips=1
-    grub_set_args GRUB_CMDLINE_LINUX fips=1 audit=1 audit_backlog_limit=8192 apparmor=1 security=apparmor \
-        slab_nomerge=yes pti=on page_alloc.shuffle=1 vsyscall=none init_on_alloc=1 \
-        spectre_v2=on spec_store_bypass_disable=seccomp rng_core.default_quality=500
+    grub_set_args GRUB_CMDLINE_LINUX "${kargs[@]}"
     grep -E '^GRUB_CMDLINE_LINUX=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to GRUB_CMDLINE_LINUX"
     grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to GRUB_CMDLINE_LINUX_DEFAULT"
-    local d
-    for d in /etc/default/grub.d/*.cfg; do
-        if grep -Eq '^[[:space:]]*GRUB_CMDLINE_LINUX=' "$d" && ! grep -Eq 'GRUB_CMDLINE_LINUX=.*\$\{?GRUB_CMDLINE_LINUX' "$d"; then
-            warn "${d} overrides GRUB_CMDLINE_LINUX; hardening arguments may be lost - review it"
-        fi
+    # Drop-ins are sourced after /etc/default/grub. Cloud images replace the
+    # command line there (e.g. Ubuntu's 50-cloudimg-settings.cfg sets
+    # GRUB_CMDLINE_LINUX_DEFAULT); re-append the hardening arguments last.
+    local d var dropin=/etc/default/grub.d/99-harden-and-audit.cfg
+    local -a lines=()
+    for var in GRUB_CMDLINE_LINUX_DEFAULT GRUB_CMDLINE_LINUX; do
+        for d in /etc/default/grub.d/*.cfg; do
+            [[ $d == "$dropin" ]] && continue
+            # An assignment that does not build on the previous value wins.
+            if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${var}=" "$d" \
+                && ! grep -Eq "^[[:space:]]*(export[[:space:]]+)?${var}=.*\\\$\\{?${var}([^_A-Z]|\$)" "$d"; then
+                log "${d} replaces ${var}; hardening arguments are re-applied by ${dropin}"
+                if [[ $var == GRUB_CMDLINE_LINUX_DEFAULT ]]; then
+                    lines+=("${var}=\"\${${var}} fips=1\"")
+                else
+                    lines+=("${var}=\"\${${var}} ${kargs[*]}\"")
+                fi
+                break
+            fi
+        done
     done
+    if [[ ${#lines[@]} -gt 0 ]]; then
+        {
+            echo "# Managed by ${SCRIPT_NAME}: sourced after the other drop-ins, which"
+            echo "# replace the kernel command line; re-append the hardening arguments."
+            printf '%s\n' "${lines[@]}"
+        } | write_file 0644 "$dropin"
+    else
+        rm -f "$dropin"
+    fi
 
     if [[ $ENABLE_GRUB_PASSWORD == 1 ]]; then
+        # Keep normal boots unattended: menu entries stay bootable without a
+        # password; only editing and the GRUB shell require it. Every
+        # generator that emits Linux entries (10_linux, Ubuntu's ZFS-root
+        # 10_linux_zfs) must carry --unrestricted, or no password is set.
+        local gen unrestricted_ok=1
+        for gen in /etc/grub.d/10_linux /etc/grub.d/10_linux_zfs; do
+            [[ -f $gen ]] || continue
+            grep -q -- '--unrestricted' "$gen" && continue
+            backup_file "$gen"
+            sed -i -E 's/^([[:space:]]*)CLASS="--class gnu-linux --class gnu --class os"[[:space:]]*$/\1CLASS="--class gnu-linux --class gnu --class os --unrestricted"/' "$gen"
+            if ! grep -q -- '--unrestricted' "$gen"; then
+                if [[ $gen == */10_linux ]]; then
+                    die "could not mark GRUB entries --unrestricted in ${gen} (refusing to risk an unbootable host)"
+                fi
+                if [[ -x $gen ]]; then
+                    unrestricted_ok=0
+                    warn "could not mark ${gen} entries --unrestricted: GRUB password NOT set (would block unattended boots)"
+                fi
+            fi
+        done
+        if [[ $unrestricted_ok != 1 ]]; then
+            rm -f /etc/grub.d/01_harden_password
+        fi
+    fi
+
+    if [[ $ENABLE_GRUB_PASSWORD == 1 && ${unrestricted_ok:-1} == 1 ]]; then
         local hash=$GRUB_PASSWORD_PBKDF2 pw
         if [[ -z $hash && -f ${STATE_DIR}/grub.pbkdf2 ]]; then
             hash=$(cat "${STATE_DIR}/grub.pbkdf2")
@@ -834,13 +1136,6 @@ set superusers="${GRUB_SUPERUSER}"
 password_pbkdf2 ${GRUB_SUPERUSER} ${hash}
 GRUBEOF
 EOF
-        # Keep normal boots unattended: menu entries stay bootable without a
-        # password; only editing and the GRUB shell require it.
-        if [[ -f /etc/grub.d/10_linux ]] && ! grep -q -- '--unrestricted' /etc/grub.d/10_linux; then
-            backup_file /etc/grub.d/10_linux
-            sed -i -E 's/^CLASS="--class gnu-linux --class gnu --class os"/CLASS="--class gnu-linux --class gnu --class os --unrestricted"/' /etc/grub.d/10_linux
-            grep -q -- '--unrestricted' /etc/grub.d/10_linux || die "could not mark GRUB entries --unrestricted (refusing to risk an unbootable host)"
-        fi
     fi
 
     if command -v update-grub >/dev/null 2>&1; then
@@ -849,7 +1144,7 @@ EOF
         warn "update-grub not found; regenerate the GRUB configuration manually"
     fi
     local cfg
-    for cfg in /boot/grub/grub.cfg /boot/grub/user.cfg /boot/efi/EFI/debian/grub.cfg; do
+    for cfg in /boot/grub/grub.cfg /boot/grub/user.cfg /boot/efi/EFI/debian/grub.cfg /boot/efi/EFI/ubuntu/grub.cfg; do
         if [[ -f $cfg ]]; then
             chown root:root "$cfg"
             chmod 0400 "$cfg"
@@ -881,8 +1176,36 @@ fips_selftest() {
     return "$rc"
 }
 
+# Ubuntu Pro FIPS ("pro enable fips" / "fips-updates") installs Canonical's
+# own certified OpenSSL provider and kernel. Never stack a second provider
+# on top of it.
+UBUNTU_PRO_FIPS=""
+ubuntu_pro_fips_active() {
+    if [[ -z $UBUNTU_PRO_FIPS ]]; then
+        UBUNTU_PRO_FIPS=0
+        if is_ubuntu && command -v pro >/dev/null 2>&1; then
+            if pro status --format json 2>/dev/null | python3 -I -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+ok = any(s.get("name") in ("fips", "fips-updates", "fips-preview") and s.get("status") == "enabled"
+         for s in d.get("services", []))
+sys.exit(0 if ok else 1)'; then
+                UBUNTU_PRO_FIPS=1
+            fi
+        fi
+    fi
+    [[ $UBUNTU_PRO_FIPS == 1 ]]
+}
+
 install_fips_provider() {
     step "4.2 build & install the validated OpenSSL ${FIPS_OPENSSL_VERSION} FIPS provider"
+    if ubuntu_pro_fips_active; then
+        log "Ubuntu Pro FIPS is enabled: Canonical's certified OpenSSL FIPS provider is kept; the ${FIPS_OPENSSL_VERSION} build is skipped"
+        return 0
+    fi
     local prefix=/opt/openssl-fips-${FIPS_OPENSSL_VERSION}
     local module=${prefix}/lib64/ossl-modules/fips.so
     local fipscnf=${prefix}/ssl/fipsmodule.cnf
@@ -949,6 +1272,10 @@ tls_loopback_test() {
 
 configure_openssl_fips() {
     step "4.3 OpenSSL: activate the FIPS provider alongside the default provider"
+    if ubuntu_pro_fips_active; then
+        log "Ubuntu Pro FIPS is enabled: /etc/ssl/openssl.cnf is managed by the Pro FIPS packages and left unchanged"
+        return 0
+    fi
     local prefix=/opt/openssl-fips-${FIPS_OPENSSL_VERSION}
     local module=${prefix}/lib64/ossl-modules/fips.so
     local cnf=/etc/ssl/openssl.cnf
@@ -1055,9 +1382,9 @@ harden_file_permissions() {
     done
     # Backup copies of the password databases: nobody needs to read them.
     [[ -f /etc/shadow- ]] && { chown root:shadow /etc/shadow-; chmod 0000 /etc/shadow-; }
-    # CIS Debian 12 expects group shadow here, CIS Debian 13 expects root.
+    # CIS Debian 12 and Ubuntu expect group shadow here, CIS Debian 13 root.
     if [[ -f /etc/gshadow- ]]; then
-        if (( OS_MAJOR >= 13 )); then chown root:root /etc/gshadow-; else chown root:shadow /etc/gshadow-; fi
+        if is_debian && (( OS_MAJOR >= 13 )); then chown root:root /etc/gshadow-; else chown root:shadow /etc/gshadow-; fi
         chmod 0000 /etc/gshadow-
     fi
     [[ -f /etc/shells ]] && { chown root:root /etc/shells; chmod 0644 /etc/shells; }
@@ -1074,6 +1401,8 @@ harden_file_permissions() {
     done
     rm -f /etc/cron.deny /etc/at.deny
     printf 'root\n' | write_file 0640 /etc/cron.allow
+    # Ubuntu CIS: /etc/cron.allow group crontab (cron runs setgid crontab).
+    if is_ubuntu && getent group crontab >/dev/null; then chgrp crontab /etc/cron.allow; fi
     printf 'root\n' | write_file 0640 /etc/at.allow
 
     # sudo / sysctl / firewall directories (ANSSI)
@@ -1123,6 +1452,63 @@ harden_file_permissions() {
     chmod 0700 /root
     find /root -mindepth 1 -maxdepth 1 -name '.*' ! -type l -exec chmod g-wx,o-rwx {} + 2>/dev/null || true
     rm -f /etc/hosts.equiv /etc/shosts.equiv
+}
+
+# neutralize_sysctl_conflicts MANAGED_FILE - every other sysctl source that
+# sets a key from MANAGED_FILE to a different value is neutralised:
+#   * /etc/sysctl.conf and /etc/sysctl.d/*.conf: the line is commented out;
+#   * /usr/lib|/lib/sysctl.d/*.conf (vendor): masked by an /etc/sysctl.d file
+#     of the same name with the conflicting line commented out.
+# Vendor files such as Ubuntu's 10-network-security.conf (rp_filter=2),
+# 10-magic-sysrq.conf (sysrq=176) and 99-protect-links.conf (which sorts
+# AFTER 60-harden.conf and silently wins at boot) would otherwise override
+# the hardening or make the SCAP sysctl checks fail.
+neutralize_sysctl_conflicts() {
+    local managed=$1 f base dest
+    local -A want=()
+    local k v
+    while IFS='=' read -r k v; do
+        k=${k//[[:space:]]/}; v=$(xargs <<<"$v")
+        [[ -n $k && $k != \#* ]] && want[$k]=$v
+    done < <(grep -E '^[[:space:]]*[a-z]' "$managed")
+    # conflict_filter FILE - print FILE with conflicting assignments commented
+    conflict_filter() {
+        local line key val
+        while IFS= read -r line || [[ -n $line ]]; do
+            if [[ $line =~ ^[[:space:]]*-?([a-z0-9_.*/-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+                key=${BASH_REMATCH[1]//\//.}
+                val=$(xargs <<<"${BASH_REMATCH[2]}")
+                if [[ -n ${want[$key]+x} && $val != "${want[$key]}" ]]; then
+                    printf '# overridden by %s (%s = %s): %s\n' "$MARK" "$key" "${want[$key]}" "$line"
+                    continue
+                fi
+            fi
+            printf '%s\n' "$line"
+        done <"$1"
+    }
+    for f in /etc/sysctl.conf /etc/sysctl.d/*.conf; do
+        [[ -f $f && ! -L $f && $f != "$managed" ]] || continue
+        if ! cmp -s <(conflict_filter "$f") "$f"; then
+            backup_file "$f"
+            conflict_filter "$f" >"${f}.harden.tmp"
+            cat "${f}.harden.tmp" >"$f"
+            rm -f "${f}.harden.tmp"
+            log "sysctl: neutralised conflicting values in ${f}"
+        fi
+    done
+    for f in /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf; do
+        [[ -f $f ]] || continue
+        base=${f##*/}
+        dest=/etc/sysctl.d/${base}
+        # An /etc file of the same name already masks it (handled above).
+        [[ -e $dest ]] && continue
+        if ! cmp -s <(conflict_filter "$f") "$f"; then
+            { printf '# Managed by %s: masks %s (conflicting values commented out)\n' "$SCRIPT_NAME" "$f"; conflict_filter "$f"; } \
+                | write_file 0644 "$dest"
+            log "sysctl: ${f} masked by ${dest}"
+        fi
+    done
+    unset -f conflict_filter
 }
 
 configure_sysctl() {
@@ -1209,6 +1595,7 @@ EOF
         sed -E 's/^(-?net\.ipv4\.conf\.[a-z*]+\.rp_filter[[:space:]]*=[[:space:]]*).*/\11/' /usr/lib/sysctl.d/50-default.conf \
             | write_file 0644 /etc/sysctl.d/50-default.conf
     fi
+    neutralize_sysctl_conflicts /etc/sysctl.d/60-harden.conf
     # Media / TURN relay throughput (large UDP socket buffers).
     write_file 0644 /etc/sysctl.d/70-media-coturn.conf <<'EOF'
 # Managed by harden-and-audit.sh - socket buffers for real-time media / TURN relays.
@@ -1329,6 +1716,8 @@ EOF
     if systemctl is-active --quiet ssh.service; then
         systemctl reload ssh.service
     else
+        # Socket activation (Ubuntu 22.10+): ssh.socket holds the listener and
+        # hands it to ssh.service, which then reads the new configuration.
         systemctl start ssh.service
     fi
     log "sshd reloaded (existing sessions are not interrupted)"
@@ -1530,7 +1919,20 @@ configure_login_defs() {
     done < /etc/shadow
 
     # Interactive shells: umask 027, idle timeout.
-    write_file 0644 /etc/profile.d/60-harden.sh <<EOF
+    if is_ubuntu; then
+        # The Ubuntu CIS check expects the POSIX three-line form.
+        write_file 0644 /etc/profile.d/60-harden.sh <<EOF
+# Managed by ${SCRIPT_NAME}
+umask 027
+# Idle shell timeout (read-only, exported); skip if already set (re-sourcing).
+if [ -z "\${TMOUT:-}" ]; then
+    TMOUT=${SHELL_TMOUT}
+    readonly TMOUT
+    export TMOUT
+fi
+EOF
+    else
+        write_file 0644 /etc/profile.d/60-harden.sh <<EOF
 # Managed by ${SCRIPT_NAME}
 umask 027
 # Idle shell timeout (read-only, exported). bash only: dash also reads
@@ -1539,6 +1941,7 @@ if [ -n "\${BASH_VERSION:-}" ] && [ -z "\${TMOUT:-}" ]; then
     declare -xr TMOUT=${SHELL_TMOUT}
 fi
 EOF
+    fi
     for f in /etc/profile /etc/bash.bashrc; do
         backup_file "$f"
         sed -i -E 's/^([[:space:]]*umask[[:space:]]+0?(0[0-2][0-6]|[0-2][0-6]))[[:space:]]*$/# \1  (superseded by harden-and-audit)/' "$f"
@@ -1564,23 +1967,66 @@ EOF
     done < /etc/passwd
 }
 
+# Ubuntu 25.10+ ships sudo-rs as /usr/bin/sudo (update-alternatives), with
+# classic sudo installed as sudo.ws. sudo-rs has no sudo log file and no I/O
+# logging, which the CIS/STIG sudo controls require.
+select_sudo_provider() {
+    [[ -L /etc/alternatives/sudo ]] || return 0
+    local cur
+    cur=$(readlink -f /etc/alternatives/sudo)
+    case $SUDO_PROVIDER in
+        keep)
+            log "SUDO_PROVIDER=keep: sudo stays ${cur}"
+            ;;
+        classic)
+            [[ $cur == */sudo.ws ]] && { log "sudo is classic sudo (${cur})"; return 0; }
+            [[ -x /usr/bin/sudo.ws ]] || apt_install sudo
+            if [[ ! -x /usr/bin/sudo.ws || ! -x /usr/sbin/visudo.ws ]]; then
+                warn "classic sudo (sudo.ws) is not available: sudo stays ${cur}"
+                return 0
+            fi
+            # Anti-lockout: classic sudo must accept the existing policy first.
+            if ! /usr/sbin/visudo.ws -cq >/dev/null 2>&1; then
+                warn "the current sudoers policy does not validate under classic sudo: sudo stays ${cur} (review with visudo.ws -c)"
+                return 0
+            fi
+            update-alternatives --set sudo /usr/bin/sudo.ws >/dev/null
+            log "sudo provider: classic sudo (sudo.ws) selected over ${cur} for sudo log file and I/O logging (SUDO_PROVIDER=keep to retain it)"
+            ;;
+        *) die "SUDO_PROVIDER must be 'classic' or 'keep'" ;;
+    esac
+}
+
 configure_sudo() {
     step "5.7 sudo: pty, logging, re-authentication"
-    local tmp
+    select_sudo_provider
+    local -a settings=(
+        'Defaults use_pty'
+        'Defaults logfile="/var/log/sudo.log"'
+        'Defaults log_input, log_output'
+        'Defaults iolog_dir="/var/log/sudo-io/%{user}"'
+        'Defaults timestamp_timeout=15'
+        'Defaults env_reset'
+        'Defaults !visiblepw'
+        'Defaults always_set_home'
+        'Defaults ignore_dot'
+        'Defaults passwd_tries=3'
+    )
+    local tmp line one
     tmp=$(mktemp)
-    cat >"$tmp" <<'EOF'
-# Managed by harden-and-audit.sh
-Defaults use_pty
-Defaults logfile="/var/log/sudo.log"
-Defaults log_input, log_output
-Defaults iolog_dir="/var/log/sudo-io/%{user}"
-Defaults timestamp_timeout=15
-Defaults env_reset
-Defaults !visiblepw
-Defaults always_set_home
-Defaults ignore_dot
-Defaults passwd_tries=3
-EOF
+    one=$(mktemp)
+    echo "# Managed by ${SCRIPT_NAME}" >"$tmp"
+    # Keep only what the active sudo implementation understands (sudo-rs
+    # rejects the logging settings); classic sudo accepts every line.
+    for line in "${settings[@]}"; do
+        printf '%s\n' "$line" >"$one"
+        if visudo -cqf "$one" >/dev/null 2>&1; then
+            printf '%s\n' "$line" >>"$tmp"
+        else
+            warn "the active sudo implementation rejects '${line}': setting skipped"
+        fi
+    done
+    rm -f "$one"
     visudo -cqf "$tmp" || { rm -f "$tmp"; die "generated sudoers fragment is invalid"; }
     install -m 0440 -o root -g root "$tmp" /etc/sudoers.d/60-harden
     rm -f "$tmp"
@@ -1630,6 +2076,15 @@ configure_kernel_modules() {
     step "5.9 disable unneeded filesystems, protocols and USB storage"
     local -a mods=(cramfs freevxfs hfs hfsplus jffs2 udf usb-storage dccp rds sctp tipc atm can firewire-core firewire-ohci)
     [[ $ALLOW_CONTAINERS != 1 ]] && mods+=(overlay overlayfs)
+    # Ubuntu CIS also disables squashfs, which every snap is mounted from:
+    # only where snapd is absent.
+    if is_ubuntu; then
+        if pkg_installed snapd; then
+            log "squashfs stays available: snapd is installed (snaps are squashfs images)"
+        else
+            mods+=(squashfs)
+        fi
+    fi
     {
         echo "# Managed by ${SCRIPT_NAME}"
         local m
@@ -1801,19 +2256,33 @@ configure_timesync() {
     step "5.13 time synchronisation"
     local s
     if pkg_installed chrony; then
-        {
-            echo "# Managed by ${SCRIPT_NAME}"
-            for s in $NTP_SERVERS; do echo "server ${s} iburst"; done
-        } | write_file 0644 /etc/chrony/sources.d/60-harden.sources
+        if [[ -n $NTP_SERVERS ]]; then
+            {
+                echo "# Managed by ${SCRIPT_NAME}"
+                for s in $NTP_SERVERS; do echo "server ${s} iburst"; done
+            } | write_file 0644 /etc/chrony/sources.d/60-harden.sources
+        else
+            # Ubuntu: keep the vendor sources (authenticated NTS on 25.10+).
+            log "chrony keeps the distribution time sources (set NTP_SERVERS to use your enclave's servers)"
+        fi
         grep -q '^sourcedir /etc/chrony/sources.d' /etc/chrony/chrony.conf || echo 'sourcedir /etc/chrony/sources.d' >>/etc/chrony/chrony.conf
         systemctl enable --now chrony.service >/dev/null 2>&1 || true
         systemctl restart chrony.service || true
     else
+        # Ubuntu without NTP_SERVERS: the public pool the CIS content lists as
+        # approved (var_multiple_time_servers); the fallback list keeps
+        # NTP_FALLBACK_SERVERS (time.nist.gov, the 22.04 profile's approved
+        # value) first, then Canonical's servers.
+        local ntp=$NTP_SERVERS fallback=$NTP_FALLBACK_SERVERS
+        if [[ -z $ntp ]]; then
+            ntp="0.pool.ntp.org 1.pool.ntp.org 2.pool.ntp.org 3.pool.ntp.org"
+            fallback="${NTP_FALLBACK_SERVERS} ntp.ubuntu.com"
+        fi
         write_file 0644 /etc/systemd/timesyncd.conf.d/60-harden.conf <<EOF
 # Managed by ${SCRIPT_NAME}
 [Time]
-NTP=${NTP_SERVERS}
-FallbackNTP=${NTP_FALLBACK_SERVERS}
+NTP=${ntp}
+FallbackNTP=${fallback}
 EOF
         systemctl unmask systemd-timesyncd.service >/dev/null 2>&1 || true
         systemctl enable systemd-timesyncd.service >/dev/null 2>&1 || true
@@ -1825,16 +2294,26 @@ configure_apparmor() {
     step "5.14 AppArmor enforcing"
     systemctl enable apparmor.service >/dev/null 2>&1 || true
     local p
-    local -a enforce=()
+    local -a enforce=() complain=()
     for p in /etc/apparmor.d/*; do
         [[ -f $p ]] || continue
         # Profiles shipped as "unconfined" are allow-all by design; enforcing
         # them would block their binaries. Leave those alone.
         grep -Eq 'flags=\([^)]*unconfined' "$p" && continue
-        enforce+=("$p")
+        # Profiles the distribution ships disabled (Ubuntu) are loaded in
+        # complain mode: confined and logged, without risking a service the
+        # vendor chose not to enforce.
+        if [[ -e /etc/apparmor.d/disable/${p##*/} ]]; then
+            complain+=("$p")
+        else
+            enforce+=("$p")
+        fi
     done
     if [[ ${#enforce[@]} -gt 0 ]]; then
         host_only "aa-enforce" aa-enforce "${enforce[@]}" >/dev/null
+    fi
+    if [[ ${#complain[@]} -gt 0 ]]; then
+        host_only "aa-complain" aa-complain "${complain[@]}" >/dev/null
     fi
     host_only "start AppArmor" systemctl restart apparmor.service
 }
@@ -1902,6 +2381,17 @@ configure_aide_config() {
         done
     } >>"$aconf"
     aide --config-check --config "$aconf" >/dev/null 2>&1 || die "AIDE configuration check failed"
+    # Ubuntu's aide-common ships dailyaidecheck.{service,timer}, which the
+    # Ubuntu CIS content checks: use it rather than adding a second check.
+    if is_ubuntu && systemctl cat dailyaidecheck.timer >/dev/null 2>&1; then
+        systemctl disable --now aidecheck.timer aidecheck.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/aidecheck.service /etc/systemd/system/aidecheck.timer
+        systemctl daemon-reload
+        systemctl enable dailyaidecheck.timer >/dev/null 2>&1 || true
+        systemctl start dailyaidecheck.timer >/dev/null 2>&1 || true
+        log "AIDE: vendor dailyaidecheck.timer enabled"
+        return 0
+    fi
     write_file 0644 /etc/systemd/system/aidecheck.service <<'EOF'
 # Managed by harden-and-audit.sh
 [Unit]
@@ -1941,9 +2431,22 @@ EOF
 # ============================================================================
 provision_cuda_prereqs() {
     step "6.1 CUDA / DKMS build prerequisites (driver itself is not installed)"
-    local hdr=linux-headers-amd64
-    [[ $DEB_ARCH == arm64 ]] && hdr=linux-headers-arm64
-    apt_install libc6 libc6-dev gcc make build-essential pkg-config dkms "$hdr"
+    local -a hdrs=()
+    if is_ubuntu; then
+        # Headers follow each installed kernel flavour metapackage
+        # (linux-image-generic, -virtual, -aws, -azure, -gcp, ...).
+        local meta flavour
+        while read -r meta; do
+            flavour=${meta#linux-image-}
+            pkg_candidate "linux-headers-${flavour}" && hdrs+=("linux-headers-${flavour}")
+        done < <(dpkg-query -W -f='${db:Status-Status} ${Package}\n' 'linux-image-*' 2>/dev/null \
+                 | awk '$1=="installed" && $2 !~ /^linux-image-(unsigned-)?[0-9]/ {print $2}')
+        [[ ${#hdrs[@]} -gt 0 ]] || hdrs=(linux-headers-generic)
+    else
+        hdrs=(linux-headers-amd64)
+        [[ $DEB_ARCH == arm64 ]] && hdrs=(linux-headers-arm64)
+    fi
+    apt_install libc6 libc6-dev gcc make build-essential pkg-config dkms "${hdrs[@]}"
     local running
     running="linux-headers-$(uname -r)"
     if pkg_candidate "$running"; then
@@ -1958,41 +2461,44 @@ options nouveau modeset=0
 EOF
     if command -v update-initramfs >/dev/null 2>&1; then
         host_only "update-initramfs" update-initramfs -u -k all
+    elif command -v dracut >/dev/null 2>&1; then
+        host_only "dracut" dracut --regenerate-all --force
     fi
 }
 
 provision_media_coturn_libs() {
     step "6.2 coturn & real-time media runtime libraries (no coturn, no X11)"
     # Each entry lists alternatives across Debian 12/13 sonames; the first
-    # available one is installed.
+    # available one is installed. A trailing ~REGEX picks the newest soname
+    # on releases not listed explicitly (Ubuntu 22.04/24.04/26.04 ...).
     local -a groups=(
         "libevent-core-2.1-7t64 libevent-core-2.1-7"
         "libevent-extra-2.1-7t64 libevent-extra-2.1-7"
         "libevent-openssl-2.1-7t64 libevent-openssl-2.1-7"
         "libevent-pthreads-2.1-7t64 libevent-pthreads-2.1-7"
-        "libhiredis1.1.0 libhiredis0.14"
+        "libhiredis1.1.0 libhiredis0.14 ~^libhiredis[0-9.]+$"
         "libmariadb3"
         "libpq5"
         "libsqlite3-0"
         "sqlite3"
         "libssl3t64 libssl3"
         "libsystemd0"
-        "libmicrohttpd12t64 libmicrohttpd12"
+        "libmicrohttpd12t64 libmicrohttpd12 ~^libmicrohttpd[0-9]+(t64)?$"
         "libopus0"
-        "libvpx9 libvpx8 libvpx7"
+        "libvpx9 libvpx8 libvpx7 ~^libvpx[0-9]+(t64)?$"
         "libsrtp2-1"
-        "libx264-164"
-        "libx265-215 libx265-199"
+        "libx264-164 ~^libx264-[0-9]+$"
+        "libx265-215 libx265-199 ~^libx265-[0-9]+$"
         "libaom3"
-        "libdav1d7 libdav1d6"
+        "libdav1d7 libdav1d6 ~^libdav1d[0-9]+$"
         "libogg0"
         "libvorbis0a"
         "libvorbisenc2"
         "libspeex1"
         "libspeexdsp1"
         "libwebp7"
-        "libtheora0 libtheora0t64"
-        "libflac14 libflac12t64 libflac12"
+        "libtheora0 libtheora0t64 ~^libtheora[0-9]+(t64)?$"
+        "libflac14 libflac12t64 libflac12 ~^libflac[0-9]+(t64)?$"
         "libmp3lame0"
         "libsndfile1"
         "libsamplerate0"
@@ -2000,15 +2506,17 @@ provision_media_coturn_libs() {
         "libgsm1"
         "libusrsctp2"
         "libjansson4"
-        "libconfig11 libconfig9"
-        "libwebsockets19t64 libwebsockets17 libwebsockets16"
+        "libconfig11 libconfig9 ~^libconfig[0-9]+$"
+        "libwebsockets19t64 libwebsockets17 libwebsockets16 ~^libwebsockets[0-9]+(t64)?$"
         "libcurl4t64 libcurl4"
     )
-    local -a pkgs=() missing=()
+    local -a pkgs=() missing=() alts
     local g p
     for g in "${groups[@]}"; do
-        # shellcheck disable=SC2086
-        if p=$(first_available $g); then
+        # read -a splits without pathname expansion: with nullglob, an
+        # unquoted "~^libx264-[0-9]+$" would otherwise vanish.
+        read -r -a alts <<<"$g"
+        if p=$(first_available "${alts[@]}"); then
             pkgs+=("$p")
         else
             missing+=("$g")
@@ -2028,41 +2536,54 @@ provision_media_coturn_libs() {
 # ============================================================================
 install_openscap() {
     step "7.1 OpenSCAP tooling"
-    local -a pkgs=(openscap-scanner openscap-utils ssg-debian ssg-base unzip)
-    if pkg_candidate libopenscap8; then
-        pkgs+=(libopenscap8)
+    local -a pkgs=(unzip) p
+    # Debian 12/13, Ubuntu 24.04+: openscap-scanner/-utils (libopenscap25).
+    # Ubuntu 22.04: only libopenscap8 (oscap 1.2.17) and no ssg-* packages.
+    local -a wanted=(openscap-scanner openscap-utils libopenscap8 ssg-base)
+    if is_ubuntu; then
+        wanted+=(ssg-debderived)    # the ssg-* binary package with Ubuntu content
     else
-        log "libopenscap8 is not packaged for Debian ${OS_MAJOR}; the scanner's own libopenscap library is used"
+        wanted+=(ssg-debian)
     fi
+    for p in "${wanted[@]}"; do
+        if pkg_candidate "$p"; then
+            pkgs+=("$p")
+        else
+            log "${p} is not packaged for ${OS_NAME}"
+        fi
+    done
     apt_install "${pkgs[@]}"
+    command -v oscap >/dev/null 2>&1 || die "no OpenSCAP scanner (oscap) could be installed on ${OS_NAME}"
+    log "OpenSCAP: $(oscap --version 2>/dev/null | head -n1)"
 }
 
-resolve_datastream() {
-    local name="ssg-debian${OS_MAJOR}-ds.xml"
-    if [[ -n $SSG_DATASTREAM ]]; then
-        [[ -f $SSG_DATASTREAM ]] || die "SSG_DATASTREAM=${SSG_DATASTREAM} does not exist"
-        printf '%s\n' "$SSG_DATASTREAM"
-        return 0
-    fi
+# find_datastream NAME - pinned upstream SSG (cache, then download), then
+# the packaged content. Prints the path or returns 1.
+find_datastream() {
+    local name=$1
     local cache=${CACHE_DIR}/ssg-${SSG_VERSION}
     if [[ -f ${cache}/${name} ]]; then
         printf '%s\n' "${cache}/${name}"
         return 0
     fi
-    if [[ $SSG_DOWNLOAD == 1 ]]; then
+    if [[ $SSG_DOWNLOAD == 1 && ! -f ${cache}/.unavailable-${name} ]]; then
         install -d -m 0750 "$cache"
         local zip=${CACHE_DIR}/scap-security-guide-${SSG_VERSION}.zip
-        if curl -fsSL --proto '=https' --tlsv1.2 --retry 5 -o "$zip" "$SSG_URL" \
-            && echo "${SSG_SHA512}  ${zip}" | sha512sum -c --status; then
-            unzip -o -j -q "$zip" "scap-security-guide-${SSG_VERSION}/${name}" -d "$cache"
+        if [[ -f $zip ]] && echo "${SSG_SHA512}  ${zip}" | sha512sum -c --status; then
+            :
+        elif ! { curl -fsSL --proto '=https' --tlsv1.2 --retry 5 -o "$zip" "$SSG_URL" \
+                 && echo "${SSG_SHA512}  ${zip}" | sha512sum -c --status; }; then
             rm -f "$zip"
+            echo "SSG ${SSG_VERSION} download or SHA-512 verification failed" >&2
+            zip=""
+        fi
+        if [[ -n $zip ]]; then
+            unzip -o -j -q "$zip" "scap-security-guide-${SSG_VERSION}/${name}" -d "$cache" 2>/dev/null \
+                || touch "${cache}/.unavailable-${name}"
             if [[ -f ${cache}/${name} ]]; then
                 printf '%s\n' "${cache}/${name}"
                 return 0
             fi
-        else
-            rm -f "$zip"
-            echo "SSG ${SSG_VERSION} download or SHA-512 verification failed" >&2
         fi
     fi
     if [[ -f /usr/share/xml/scap/ssg/content/${name} ]]; then
@@ -2072,12 +2593,67 @@ resolve_datastream() {
     return 1
 }
 
+ds_has_profile() {
+    oscap info --profiles "$1" 2>/dev/null | qgrep "^xccdf_org\.ssgproject\.content_profile_${2}:"
+}
+
+# retarget_datastream SRC DST SRC_CODENAME - copy of an older Ubuntu LTS
+# datastream whose platform check (DISTRIB_CODENAME in /etc/lsb-release)
+# accepts the running release. Used only when no native content exists.
+retarget_datastream() {
+    local src=$1 dst=$2 from=$3
+    # 1. platform: accept this release's codename.
+    # 2. audit 4.1 (Ubuntu 26.04) loads rules.d through audit-rules.service
+    #    (ExecStart=augenrules --load), which auditd.service only "Wants";
+    #    the 24.04 checks recognise augenrules mode only by the audit 3.x
+    #    "Requires=augenrules.service" line and would fail every audit rule.
+    sed -e 's/\^DISTRIB_CODENAME='"${from}"'\$/^DISTRIB_CODENAME='"${OS_CODENAME}"'$/g' \
+        -e 's#|Requires=augenrules.service)<#|Requires=augenrules.service|Wants=audit-rules.service)<#g' \
+        "$src" >"${dst}.tmp"
+    qgrep -F "^DISTRIB_CODENAME=${OS_CODENAME}\$" "${dst}.tmp" || { rm -f "${dst}.tmp"; return 1; }
+    mv -f "${dst}.tmp" "$dst"
+}
+
+# resolve_datastream - print the datastream to scan. Native content for this
+# release first; on Ubuntu without native content for SCAP_PROFILE (26.04
+# with SSG 0.1.82: empty skeleton) the newest older LTS content, retargeted.
+resolve_datastream() {
+    local name="ssg-${SSG_PRODUCT}-ds.xml" ds=""
+    if [[ -n $SSG_DATASTREAM ]]; then
+        [[ -f $SSG_DATASTREAM ]] || die "SSG_DATASTREAM=${SSG_DATASTREAM} does not exist"
+        printf '%s\n' "$SSG_DATASTREAM"
+        return 0
+    fi
+    ds=$(find_datastream "$name" || true)
+    if [[ -n $ds ]] && ds_has_profile "$ds" "$SCAP_PROFILE"; then
+        printf '%s\n' "$ds"
+        return 0
+    fi
+    if is_ubuntu && [[ $SSG_CONTENT_FALLBACK == 1 ]]; then
+        local lts num code src dst
+        for lts in 2404:noble 2204:jammy; do
+            num=${lts%%:*}; code=${lts#*:}
+            (( num < OS_NUM )) || continue
+            src=$(find_datastream "ssg-ubuntu${num}-ds.xml" || true)
+            [[ -n $src ]] && ds_has_profile "$src" "$SCAP_PROFILE" || continue
+            dst=${CACHE_DIR}/ssg-${SSG_VERSION}/ssg-ubuntu${num}-ds.retarget-${SSG_PRODUCT}.xml
+            # Regenerated every time: cheap, and never stale after an update.
+            retarget_datastream "$src" "$dst" "$code" || continue
+            echo "no native ${SCAP_PROFILE} content for ${OS_NAME} in SSG ${SSG_VERSION}: scanning with the Ubuntu ${num:0:2}.${num:2} content retargeted to ${OS_CODENAME}" >&2
+            printf '%s\n' "$dst"
+            return 0
+        done
+    fi
+    # Last resort: whatever exists (scap_eval reports a missing profile).
+    [[ -n $ds ]] && { printf '%s\n' "$ds"; return 0; }
+    return 1
+}
+
 # scap_eval PROFILE RESULTS REPORT DS - returns oscap's exit status (0 or 2 ok)
 scap_eval() {
     local profile=$1 results=$2 report=$3 ds=$4 rc=0
     local pid="xccdf_org.ssgproject.content_profile_${profile}"
-    oscap info --profiles "$ds" 2>/dev/null | qgrep "^${pid}:" \
-        || die "profile '${profile}' does not exist in ${ds}"
+    ds_has_profile "$ds" "$profile" || die "profile '${profile}' does not exist in ${ds}"
     log "evaluating profile ${profile} (this can take several minutes)"
     # umask 077: report files must not themselves violate /var/log permission
     # rules while the scan is reading /var/log.
@@ -2103,9 +2679,12 @@ scap_summarize() {
     {
         echo "OpenSCAP compliance summary - $(ts)"
         echo "host:           $(hostname -f 2>/dev/null || hostname)"
-        echo "os:             Debian ${OS_MAJOR} (${OS_CODENAME})"
+        echo "os:             ${OS_NAME} (${OS_CODENAME})"
         echo "profile:        ${profile}"
         echo "datastream:     ${DS_PATH}"
+        if [[ $DS_PATH == *.retarget-* ]]; then
+            echo "content note:   no native SSG content for ${OS_NAME}; ${DS_PATH##*/ssg-} evaluated (see docs/EXCEPTIONS.md)"
+        fi
         echo "pass:           ${pass}"
         echo "fail:           ${fail}"
         echo "error:          ${err}"
@@ -2136,13 +2715,23 @@ DS_PATH=""
 run_scap_audit() {
     step "7.2 OpenSCAP evaluation"
     normalize_log_permissions
-    DS_PATH=$(resolve_datastream) || die "no SCAP datastream for Debian ${OS_MAJOR}: set SSG_DATASTREAM or allow SSG_DOWNLOAD"
+    DS_PATH=$(resolve_datastream) || die "no SCAP datastream for ${OS_NAME}: set SSG_DATASTREAM or allow SSG_DOWNLOAD"
+    rm -f "${CACHE_DIR}"/scap-security-guide-*.zip
     log "datastream: ${DS_PATH}"
     scap_eval "$SCAP_PROFILE" "$SCAP_RESULTS" "$SCAP_REPORT" "$DS_PATH"
     local rate score
     read -r rate score < <(scap_summarize "$SCAP_PROFILE" "$SCAP_RESULTS" "$SCAP_SUMMARY")
+    # Content whose platform does not match this host scores every rule
+    # "notapplicable" - an empty, meaningless 0% (or 100%) result.
+    if ! awk '/^(pass|fail):/ {n += $2} END {exit !(n > 0)}' "$SCAP_SUMMARY"; then
+        die "${DS_PATH##*/} has no applicable rules on ${OS_NAME}: the SCAP content does not match this release"
+    fi
     local p
     for p in $SCAP_EXTRA_PROFILES; do
+        if ! ds_has_profile "$DS_PATH" "$p"; then
+            warn "extra profile '${p}' is not in ${DS_PATH##*/} for ${OS_NAME}: skipped"
+            continue
+        fi
         scap_eval "$p" "/var/log/scap-results-${p}.xml" "/var/log/scap-report-${p}.html" "$DS_PATH"
         scap_summarize "$p" "/var/log/scap-results-${p}.xml" "/var/log/scap-summary-${p}.txt" >/dev/null
         log "extra profile ${p}: $(awk '/^pass_rate/{print $2}' "/var/log/scap-summary-${p}.txt") pass rate"
