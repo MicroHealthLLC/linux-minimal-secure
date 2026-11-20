@@ -2270,11 +2270,13 @@ configure_timesync() {
         systemctl restart chrony.service || true
     else
         # Ubuntu without NTP_SERVERS: the public pool the CIS content lists as
-        # approved (var_multiple_time_servers), Canonical's servers as fallback.
+        # approved (var_multiple_time_servers); the fallback list keeps
+        # NTP_FALLBACK_SERVERS (time.nist.gov, the 22.04 profile's approved
+        # value) first, then Canonical's servers.
         local ntp=$NTP_SERVERS fallback=$NTP_FALLBACK_SERVERS
         if [[ -z $ntp ]]; then
             ntp="0.pool.ntp.org 1.pool.ntp.org 2.pool.ntp.org 3.pool.ntp.org"
-            fallback="ntp.ubuntu.com ${NTP_FALLBACK_SERVERS}"
+            fallback="${NTP_FALLBACK_SERVERS} ntp.ubuntu.com"
         fi
         write_file 0644 /etc/systemd/timesyncd.conf.d/60-harden.conf <<EOF
 # Managed by ${SCRIPT_NAME}

@@ -79,7 +79,7 @@ The CI proves #3: after hardening, the sudo admin must still log in over SSH wit
 | `FIPS_STRICT` | `0` | `1` = `default_properties = fips=yes` (non-FIPS algorithms unavailable system-wide) |
 | `DEBIAN_MIRROR` / `DEBIAN_SECURITY_MIRROR` | deb.debian.org / security.debian.org | Internal mirrors (Debian) |
 | `UBUNTU_MIRROR` / `UBUNTU_SECURITY_MIRROR` | *(the mirror already configured)*, else archive/security (amd64) or ports.ubuntu.com | Internal mirrors (Ubuntu) |
-| `NTP_SERVERS` / `NTP_FALLBACK_SERVERS` | Debian pool / time.nist.gov. Ubuntu: vendor chrony sources (NTS), or for timesyncd `0-3.pool.ntp.org` with `ntp.ubuntu.com` fallback | Use your enclave's time sources |
+| `NTP_SERVERS` / `NTP_FALLBACK_SERVERS` | Debian pool / time.nist.gov. Ubuntu: vendor chrony sources (NTS), or for timesyncd `0-3.pool.ntp.org` with `time.nist.gov ntp.ubuntu.com` fallback | Use your enclave's time sources |
 | `SUDO_PROVIDER` | `classic` | Ubuntu 25.10+: `classic` selects `sudo.ws` (log file + I/O logging), `keep` leaves sudo-rs and writes only the settings it accepts |
 | `SSG_CONTENT_FALLBACK` | `1` | Scan a release that has no native SSG content (Ubuntu 26.04) with the newest older Ubuntu LTS content, retargeted |
 | `PASS_MAX_DAYS` | `365` | DoD sites commonly use `60` |
