@@ -95,3 +95,27 @@ Everything in sections 1–6 applies to Ubuntu as well (same owner-mandated audi
 | **Ubuntu Pro FIPS** | If `pro status` shows `fips`/`fips-updates` enabled, Canonical's certified modules and kernel are kept and the OpenSSL 3.1.2 provider is not built or configured. Two FIPS providers are never stacked. |
 | **AppArmor profiles shipped disabled** | Ubuntu disables some profiles on purpose (`/etc/apparmor.d/disable`). They are loaded in **complain** mode (confined and logged) rather than enforced, which satisfies "enforce or complain" without breaking a service the vendor chose not to enforce. |
 | **apport** | Purged when no other installed package depends on it. If a metapackage depends on it, it is disabled and masked (`/etc/default/apport enabled=0`) instead; metapackages are never removed. |
+
+### 8.2 Rules that remain failing on Ubuntu (CI, privileged)
+
+All three releases fail the same core set. It falls into the categories already described for Debian:
+
+| Rule(s) | 22.04 | 24.04 | 26.04 | Category |
+|---|---|---|---|---|
+| `auditd_data_disk_full_action`, `auditd_data_retention_{admin_space_left,max_log_file,space_left}_action` | ✗ | ✗ | ✗ | Owner-mandated (§1) |
+| `partition_for_{home,var,var_log,var_log_audit}` | ✗ | ✗ | ✗ | Install-time (§4) |
+| `package_ufw_removed` | ✗ | ✗ | ✗ | Profile conflict: the nftables path of the benchmark; UFW is mandated (§2) |
+| `set_ufw_default_rule` | ✗ | ✗ | ✗ | Requires default-deny **outbound**: same decision as Debian's `ufw_default_outgoing_rule` (§2). Opt in with `UFW_OUTBOUND_POLICY=deny` |
+| `ufw_rules_for_open_ports` | ✗→✓ | ✗→✓ | ✗→✓ | Fixed, see §8.3 |
+| `aide_build_database` | ✗ | ✗ | ✗ | **SSG content defect** (as on Debian 12, §3): the check derives the database path from the pre-0.17 `database=` key; Ubuntu's AIDE uses `database_in=`. The baseline database is built (`/var/lib/aide/aide.db`) |
+| `grub2_password`, `grub2_uefi_password`, `grub2_audit_argument`, `grub2_audit_backlog_limit_argument`, `grub2_enable_apparmor` | ✗ | ✗ | ✗ | CI container only: `/boot/grub/grub.cfg` is never generated (§5). `/etc/default/grub` and the password drop-in are asserted |
+| `service_auditd_enabled`, `service_timesyncd_enabled`, `ntp_single_service_active`, `all_apparmor_profiles_in_enforce_complain_mode` | ✗ | ✗ | ✗ | CI container only (§5) |
+| `service_timesyncd_configured` | ✓ | ✗→✓ | ✗→✓ | Fixed: on Ubuntu without `NTP_SERVERS`, timesyncd now uses the pool servers the benchmark lists as approved (`0-3.pool.ntp.org`), with `ntp.ubuntu.com` as fallback. Set `NTP_SERVERS` to your enclave's servers (then this rule reports them as unapproved unless the profile value is tailored) |
+| `ensure_root_access_controlled` | ✗ | ✓ | ✓ | 22.04 content requires a root **password hash**. Root stays locked and administrators use sudo, which is stricter; the 24.04 content accepts a locked root |
+| `journald_disable_forward_to_syslog` | ✗ | – | – | Profile-internal conflict (§2) |
+| `audit_rules_privileged_commands` | ✗ | ✓ | ✓ | CI container only (§5) |
+| `set_ufw_loopback_traffic`, `no_files_unowned_by_user` (+ the two UFW rules above) | error | – | – | **Scanner limit**: jammy's oscap 1.2.17 cannot run these SCE/OVAL checks and reports `error`. The loopback rules are in place and asserted |
+
+### 8.3 `ufw_rules_for_open_ports`: a real defect, fixed
+
+The check requires a UFW rule for every non-loopback listener. Inspection of a hardened 24.04 host showed **rpcbind's socket (port 111) still listening** after the script had purged rpcbind. The package's own "stop" was suppressed (a `policy-rc.d`, present in container images and some image-build pipelines), and the script only disabled units whose unit file still existed. UFW kept blocking the port inbound, but a removed service must not keep a socket open. `disable_service` now also stops a unit that is still active after its unit file is gone, the CI image no longer carries `policy-rc.d`, and an assertion verifies nothing listens on port 111. The fix applies to Debian as well.

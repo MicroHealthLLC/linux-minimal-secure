@@ -21,6 +21,10 @@ RUN set -eux; \
         # install has neither.
         userdel -r ubuntu 2>/dev/null || true; \
         rm -f /etc/dpkg/dpkg.cfg.d/excludes; \
+        # Cloud images replace the default kernel command line in a GRUB
+        # drop-in; the script must re-apply fips=1 after it.
+        mkdir -p /etc/default/grub.d; \
+        printf 'GRUB_CMDLINE_LINUX_DEFAULT="console=tty1 console=ttyS0"\n' > /etc/default/grub.d/50-cloudimg-settings.cfg; \
     else \
         kernel=linux-image-amd64; \
     fi; \
@@ -36,6 +40,9 @@ RUN set -eux; \
         "${avcodec}"; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*; \
+    # Docker images forbid service start/stop in maintainer scripts; a server
+    # does not (the purge of a running service must really stop it).
+    rm -f /usr/sbin/policy-rc.d; \
     systemctl mask systemd-firstboot.service systemd-udevd.service systemd-udevd-kernel.socket \
         systemd-udevd-control.socket systemd-modules-load.service getty@tty1.service \
         sys-kernel-config.mount sys-kernel-debug.mount sys-kernel-tracing.mount; \

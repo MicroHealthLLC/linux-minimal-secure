@@ -291,6 +291,12 @@ disable_service() {
             systemctl disable --now "$u" >/dev/null 2>&1 || true
             systemctl mask "$u" >/dev/null 2>&1 || true
             log "disabled and masked ${u}"
+        elif systemctl is-active --quiet "$u" 2>/dev/null; then
+            # Purged package whose unit is still running (its prerm "stop"
+            # was suppressed, e.g. by a policy-rc.d): the socket stays open
+            # until reboot unless it is stopped here.
+            systemctl stop "$u" >/dev/null 2>&1 || true
+            log "stopped ${u} (left running after its package was removed)"
         fi
     done
 }
@@ -1051,22 +1057,30 @@ configure_grub() {
     # Drop-ins are sourced after /etc/default/grub. Cloud images replace the
     # command line there (e.g. Ubuntu's 50-cloudimg-settings.cfg sets
     # GRUB_CMDLINE_LINUX_DEFAULT); re-append the hardening arguments last.
-    local d override=0 dropin=/etc/default/grub.d/99-harden-and-audit.cfg
-    for d in /etc/default/grub.d/*.cfg; do
-        [[ $d == "$dropin" ]] && continue
-        if grep -Eq '^[[:space:]]*(export[[:space:]]+)?GRUB_CMDLINE_LINUX(_DEFAULT)?=' "$d" \
-            && ! grep -Eq 'GRUB_CMDLINE_LINUX(_DEFAULT)?=.*\$\{?GRUB_CMDLINE_LINUX' "$d"; then
-            log "${d} replaces the kernel command line; hardening arguments are re-applied by ${dropin}"
-            override=1
-        fi
+    local d var dropin=/etc/default/grub.d/99-harden-and-audit.cfg
+    local -a lines=()
+    for var in GRUB_CMDLINE_LINUX_DEFAULT GRUB_CMDLINE_LINUX; do
+        for d in /etc/default/grub.d/*.cfg; do
+            [[ $d == "$dropin" ]] && continue
+            # An assignment that does not build on the previous value wins.
+            if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${var}=" "$d" \
+                && ! grep -Eq "^[[:space:]]*(export[[:space:]]+)?${var}=.*\\\$\\{?${var}([^_A-Z]|\$)" "$d"; then
+                log "${d} replaces ${var}; hardening arguments are re-applied by ${dropin}"
+                if [[ $var == GRUB_CMDLINE_LINUX_DEFAULT ]]; then
+                    lines+=("${var}=\"\${${var}} fips=1\"")
+                else
+                    lines+=("${var}=\"\${${var}} ${kargs[*]}\"")
+                fi
+                break
+            fi
+        done
     done
-    if [[ $override == 1 ]]; then
-        write_file 0644 "$dropin" <<EOF
-# Managed by ${SCRIPT_NAME}: sourced after the other drop-ins, which replace
-# the kernel command line; re-append the hardening arguments.
-GRUB_CMDLINE_LINUX_DEFAULT="\${GRUB_CMDLINE_LINUX_DEFAULT} fips=1"
-GRUB_CMDLINE_LINUX="\${GRUB_CMDLINE_LINUX} ${kargs[*]}"
-EOF
+    if [[ ${#lines[@]} -gt 0 ]]; then
+        {
+            echo "# Managed by ${SCRIPT_NAME}: sourced after the other drop-ins, which"
+            echo "# replace the kernel command line; re-append the hardening arguments."
+            printf '%s\n' "${lines[@]}"
+        } | write_file 0644 "$dropin"
     else
         rm -f "$dropin"
     fi
@@ -2255,11 +2269,18 @@ configure_timesync() {
         systemctl enable --now chrony.service >/dev/null 2>&1 || true
         systemctl restart chrony.service || true
     else
+        # Ubuntu without NTP_SERVERS: the public pool the CIS content lists as
+        # approved (var_multiple_time_servers), Canonical's servers as fallback.
+        local ntp=$NTP_SERVERS fallback=$NTP_FALLBACK_SERVERS
+        if [[ -z $ntp ]]; then
+            ntp="0.pool.ntp.org 1.pool.ntp.org 2.pool.ntp.org 3.pool.ntp.org"
+            fallback="ntp.ubuntu.com ${NTP_FALLBACK_SERVERS}"
+        fi
         write_file 0644 /etc/systemd/timesyncd.conf.d/60-harden.conf <<EOF
 # Managed by ${SCRIPT_NAME}
 [Time]
-NTP=${NTP_SERVERS:-ntp.ubuntu.com}
-FallbackNTP=${NTP_FALLBACK_SERVERS}
+NTP=${ntp}
+FallbackNTP=${fallback}
 EOF
         systemctl unmask systemd-timesyncd.service >/dev/null 2>&1 || true
         systemctl enable systemd-timesyncd.service >/dev/null 2>&1 || true

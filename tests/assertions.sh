@@ -41,6 +41,7 @@ for p in xserver-xorg-core xterm xauth x11-utils; do check "graphical package ${
 avc=$(dpkg-query -W -f='${Package}\n' 'libavcodec[0-9]*' 2>/dev/null | head -n1)
 check "dependency-aware purge kept non-graphical ${avc:-libavcodec}" installed "${avc:-libavcodec-missing}"
 for p in inetutils-telnet rpcbind; do check "legacy service ${p} purged" not_installed "$p"; done
+check "nothing left listening on the portmapper port 111" bash -c "! ss -Htuln | awk '{print \$5}' | grep -Eq ':111\$'"
 check "default target is multi-user" bash -c "[[ \$(systemctl get-default) == multi-user.target ]]"
 
 echo "== 2. repositories, base stack, unattended upgrades"
@@ -81,6 +82,11 @@ echo "== 4. FIPS"
 check "fips=1 on the GRUB command line" grep -Eq '^GRUB_CMDLINE_LINUX=".*\bfips=1\b' /etc/default/grub
 check "fips=1 on the default GRUB command line string" grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=".*\bfips=1\b' /etc/default/grub
 check "audit=1 on the GRUB command line" grep -Eq '^GRUB_CMDLINE_LINUX=".*\baudit=1\b' /etc/default/grub
+# Effective command line as grub-mkconfig sees it: /etc/default/grub, then
+# every drop-in (cloud images override GRUB_CMDLINE_LINUX_DEFAULT there).
+check "effective GRUB command line keeps fips=1 and audit=1 after drop-ins" bash -c '
+    . /etc/default/grub; for f in /etc/default/grub.d/*.cfg; do [ -f "$f" ] && . "$f"; done
+    [[ " $GRUB_CMDLINE_LINUX_DEFAULT " == *" fips=1 "* && " $GRUB_CMDLINE_LINUX " == *" fips=1 "* && " $GRUB_CMDLINE_LINUX " == *" audit=1 "* ]]'
 check "GRUB entries remain bootable without password (--unrestricted)" grep -q -- '--unrestricted' /etc/grub.d/10_linux
 check "OpenSSL FIPS provider active"    bash -c "openssl list -providers | grep -A3 -E '^[[:space:]]*fips' | grep -q 'status: active'"
 check "OpenSSL default provider active" bash -c "openssl list -providers | grep -A3 -E '^[[:space:]]*default' | grep -q 'status: active'"
@@ -169,9 +175,10 @@ check "AIDE configuration valid" aide --config-check --config /etc/aide/aide.con
 if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
     check "AIDE baseline database built" test -s /var/lib/aide/aide.db
 fi
-# Ubuntu 24.04+ aide-common ships dailyaidecheck.timer (used as is); Debian
-# and Ubuntu 22.04 (cron job only) get the script's aidecheck units.
-if [[ -f /usr/lib/systemd/system/dailyaidecheck.timer || -f /lib/systemd/system/dailyaidecheck.timer ]]; then
+# Ubuntu 24.04+ aide-common ships dailyaidecheck.timer (used as is). Debian
+# (whose Debian CIS content checks aidecheck) and Ubuntu 22.04 (cron job
+# only) get the script's aidecheck units.
+if [[ $OS == ubuntu && ( -f /usr/lib/systemd/system/dailyaidecheck.timer || -f /lib/systemd/system/dailyaidecheck.timer ) ]]; then
     check "vendor dailyaidecheck.timer enabled" systemctl is-enabled dailyaidecheck.timer
     check "no duplicate aidecheck.timer" bash -c "! systemctl cat aidecheck.timer >/dev/null 2>&1"
 else
