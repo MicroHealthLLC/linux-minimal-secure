@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | Gate profile | **CIS Level 2 – Server** for the running OS (ComplianceAsCode/SSG 0.1.82). Target pass rate ≥ 90%, enforced in CI on Debian 12, 13 and Ubuntu 22.04, 24.04, 26.04 |
-| Measured in CI | Debian 12: **94.46%** · Debian 13: **95.22%** (every remaining failure is explained in [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md)) |
+| Measured in CI | Debian 12: **94.46%** · Debian 13: **95.22%** · Ubuntu 22.04: **94.17%** · Ubuntu 24.04: **95.39%** · Ubuntu 26.04: **95.39%** (every remaining failure is explained in [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md)) |
 | Also reported | Debian: ANSSI BP-028 High. Ubuntu: **DISA STIG** (Canonical Ubuntu 22.04 / 24.04 STIG). Both informational; see [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md) |
 | FIPS | Kernel `fips=1` plus the **NIST CMVP validated OpenSSL 3.1.2 FIPS provider (FIPS 140-3, cert #4985)**, active alongside the default provider |
 | Reports | `/var/log/scap-results.xml`, `/var/log/scap-report.html`, `/var/log/scap-summary.txt` |
