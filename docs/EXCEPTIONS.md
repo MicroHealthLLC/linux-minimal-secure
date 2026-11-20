@@ -78,3 +78,20 @@ ANSSI High is scanned and reported but **not gated**. Large parts of it assume a
 * Separate `/boot`, `/opt`, `/srv`, `/usr` partitions (install-time).
 * `kernel.modules_disabled=1`, `mce=0`, `l1tf=full,force`, `mds=full,nosmt`. These are incompatible with NVIDIA/DKMS, or halve CPU capacity, or panic on machine checks (against the no-halt policy).
 * `sudo` `noexec`/`requiretty`, which break package management and automation.
+
+## 8. Ubuntu
+
+Everything in sections 1–6 applies to Ubuntu as well (same owner-mandated auditd policy, install-time partitions, and CI-container limits). Ubuntu adds the following.
+
+### 8.1 Content and platform decisions
+
+| Topic | Decision |
+|---|---|
+| **Ubuntu 26.04 SCAP content** | SSG 0.1.82 (the newest ComplianceAsCode release, 2026-09-01) ships `ssg-ubuntu2604-ds.xml` as an empty skeleton with **no profiles**. The script therefore evaluates the **CIS Ubuntu 24.04 LTS Level 2 Server** benchmark on 26.04: a copy of the 24.04 datastream whose platform check (`DISTRIB_CODENAME` in `/etc/lsb-release`) accepts `resolute`. The summary says so (`content note:`), and the HTML report title still reads "Ubuntu 24.04". Disable with `SSG_CONTENT_FALLBACK=0`; re-pin `SSG_VERSION` when native 26.04 content is released. |
+| **DISA STIG (Ubuntu)** | Reported for information only (`stig` profile, Canonical Ubuntu 22.04 STIG V2R7 / 24.04 STIG). It requires controls the owner rejected for availability (e.g. `admin_space_left_action = single`, permanent faillock lockout, auto-logout of every session) and site-specific items (SSSD/smart-card PKI, remote audit offload). The CIS L2 Server gate is the same on every OS. There is no 26.04 STIG. |
+| **Ubuntu 22.04 OpenSCAP** | jammy packages only `libopenscap8` (oscap 1.2.17) and no `ssg-*`. That scanner is used with the pinned SSG 0.1.82 content (verified: 0 evaluation errors). |
+| **sudo-rs (Ubuntu 25.10+)** | sudo-rs is the default `sudo` on 26.04, but it has no sudo log file and no I/O logging (`logfile`, `log_input`, `log_output` and `iolog_dir` are rejected). Classic sudo (`sudo.ws`, still installed) is selected through `update-alternatives` after the existing policy validates under it. `SUDO_PROVIDER=keep` keeps sudo-rs; then only the settings it accepts are written, and the sudo logging rules fail. |
+| **snapd** | Not removed. Cloud management agents (e.g. the AWS SSM agent on Ubuntu AMIs) ship as snaps, so removing snapd can cut the only management path. Remove it manually where it is not needed. |
+| **Ubuntu Pro FIPS** | If `pro status` shows `fips`/`fips-updates` enabled, Canonical's certified modules and kernel are kept and the OpenSSL 3.1.2 provider is not built or configured. Two FIPS providers are never stacked. |
+| **AppArmor profiles shipped disabled** | Ubuntu disables some profiles on purpose (`/etc/apparmor.d/disable`). They are loaded in **complain** mode (confined and logged) rather than enforced, which satisfies "enforce or complain" without breaking a service the vendor chose not to enforce. |
+| **apport** | Purged when no other installed package depends on it. If a metapackage depends on it, it is disabled and masked (`/etc/default/apport enabled=0`) instead; metapackages are never removed. |

@@ -2,8 +2,8 @@
 #
 # Every push to main re-runs the full CI matrix; if it passes, the script is
 # published as a GitHub Release (tag v<VERSION>) with its SHA-256 checksum
-# and the CI compliance reports for Debian 12 and 13. A VERSION that is
-# already released is skipped, never overwritten.
+# and the CI compliance reports for Debian 12/13 and Ubuntu 22.04/24.04/26.04.
+# A VERSION that is already released is skipped, never overwritten.
 name: release
 
 on:
@@ -55,7 +55,7 @@ jobs:
         if: steps.version.outputs.exists == 'false'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: scap-debian*
+          pattern: scap-*
           path: reports
 
       - name: build release assets
@@ -65,16 +65,16 @@ jobs:
           mkdir -p dist
           install -m 0755 harden-and-audit.sh dist/harden-and-audit.sh
           (cd dist && sha256sum harden-and-audit.sh > harden-and-audit.sh.sha256)
-          for d in reports/scap-debian*; do
+          for d in reports/scap-*; do
             v=${d##*/scap-}
-            for f in scap-report.html scap-summary.txt scap-report-anssi_bp28_high.html; do
+            for f in scap-report.html scap-summary.txt scap-report-anssi_bp28_high.html scap-report-stig.html; do
               [[ -f "$d/$f" ]] && cp "$d/$f" "dist/${v}-${f}"
             done
           done
           {
             echo "## harden-and-audit.sh v${{ steps.version.outputs.version }}"
             echo
-            echo "FIPS-ready, CIS Level 2 hardened headless Debian 12 / 13 server transformation with an OpenSCAP self-audit."
+            echo "FIPS-ready, CIS Level 2 hardened headless Debian 12 / 13 and Ubuntu 22.04 / 24.04 / 26.04 server transformation with an OpenSCAP self-audit."
             echo
             echo "### Install"
             echo '```bash'
@@ -84,7 +84,7 @@ jobs:
             echo '```'
             echo
             echo "### CI compliance results (this commit)"
-            for s in reports/scap-debian*/summary.md; do
+            for s in reports/scap-*/summary.md; do
               [[ -f "$s" ]] && { cat "$s"; echo; }
             done
             echo
@@ -103,4 +103,4 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "harden-and-audit $v" \
             --notes-file dist/RELEASE_NOTES.md \
-            dist/harden-and-audit.sh dist/harden-and-audit.sh.sha256 dist/debian*-scap-*.html dist/debian*-scap-*.txt
+            dist/harden-and-audit.sh dist/harden-and-audit.sh.sha256 dist/*-scap-*.html dist/*-scap-*.txt
