@@ -99,6 +99,7 @@ run_script() {
         -e SCAP_EXTRA_PROFILES="${SCAP_EXTRA}" \
         -e SCAP_ENFORCE_MIN=0 \
         -e AIDE_INIT="${AIDE_INIT:-1}" \
+        -e PROGRESS_INTERVAL=10 \
         "$NAME" bash /src/harden-and-audit.sh 2>&1 | tee "${OUT_DIR}/harden-${label}.log"
     local rc=${PIPESTATUS[0]}
     set -e

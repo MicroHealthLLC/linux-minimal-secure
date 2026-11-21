@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly SCRIPT_NAME="harden-and-audit.sh"
 readonly LOG_FILE="/var/log/harden-and-audit.log"
 readonly STATE_DIR="/var/lib/harden-and-audit"
@@ -72,6 +72,11 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${FIPS_OPENSSL_SHA256:=a0ce69b8b97ea6a35b96875235aa453b966ba3cba8af2de23657d8b6767d6539}"
 : "${FIPS_OPENSSL_URL:=https://github.com/openssl/openssl/releases/download/openssl-${FIPS_OPENSSL_VERSION}/openssl-${FIPS_OPENSSL_VERSION}.tar.gz}"
 : "${AIDE_INIT:=1}"
+: "${LOG_MAX_TOTAL:=4G}"             # hard cap for /var/log; oldest rotated archives are pruned past it
+: "${LOG_MIN_FREE_PCT:=15}"          # also prune while the /var/log filesystem has less free space than this
+: "${LOG_ROTATE_KEEP:=14}"           # rotated generations kept per log (logs are shipped off-host)
+: "${LOG_MAXSIZE:=100M}"             # a log larger than this rotates at the next hourly logrotate run
+: "${PROGRESS_INTERVAL:=60}"         # seconds between progress lines during long steps (AIDE, OpenSCAP)
 : "${SSG_VERSION:=0.1.82}"
 : "${SSG_SHA512:=1caea418f0a5aaef7025e1655ca45a80942ea87ee832b943644ba6f9991b14a6ac5b35dddcd04b754e1fc8fbdee7b7f394507d24b123e821cca0354dc4e03cfd}"
 : "${SSG_URL:=https://github.com/ComplianceAsCode/content/releases/download/v${SSG_VERSION}/scap-security-guide-${SSG_VERSION}.zip}"
@@ -111,7 +116,23 @@ ts()   { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 log()  { printf '%s [INFO ] %s\n' "$(ts)" "$*"; }
 warn() { printf '%s [WARN ] %s\n' "$(ts)" "$*" >&2; WARNINGS+=("$*"); }
 die()  { printf '%s [FATAL] %s\n' "$(ts)" "$*" >&2; exit 1; }
-step() { CURRENT_STEP="$1"; printf '\n%s [STEP ] ===== %s =====\n' "$(ts)" "$1"; }
+# fmt_dur SECONDS - "42s", "7m05s", "1h12m"
+fmt_dur() {
+    local t=$1
+    if (( t < 60 )); then printf '%ss' "$t"
+    elif (( t < 3600 )); then printf '%dm%02ds' $(( t / 60 )) $(( t % 60 ))
+    else printf '%dh%02dm' $(( t / 3600 )) $(( t % 3600 / 60 )); fi
+}
+STEP_NO=0
+STEP_TOTAL=0    # set in main; 0 = unknown (step numbers shown without a total)
+step() {
+    CURRENT_STEP="$1"
+    STEP_NO=$(( STEP_NO + 1 ))
+    if (( STEP_TOTAL > 0 && STEP_NO > STEP_TOTAL )); then STEP_TOTAL=$STEP_NO; fi
+    local n=$STEP_NO
+    if (( STEP_TOTAL > 0 )); then n+="/${STEP_TOTAL}"; fi
+    printf '\n%s [STEP %s] ===== %s ===== (run time %s)\n' "$(ts)" "$n" "$1" "$(fmt_dur "$SECONDS")"
+}
 
 # shellcheck disable=SC2329  # invoked through the ERR trap
 on_error() {
@@ -163,6 +184,42 @@ host_only() {
         return 0
     fi
     die "${desc} failed"
+}
+
+PROGRESS_ELAPSED=0   # seconds the current run_with_progress command has run (for probes)
+
+# eta DONE TOTAL - "~12m left" from PROGRESS_ELAPSED, or nothing if unknown
+eta() {
+    local d=$1 t=$2
+    (( d > 0 && t > d && PROGRESS_ELAPSED > 0 )) || return 0
+    printf '~%s left' "$(fmt_dur $(( PROGRESS_ELAPSED * (t - d) / d )))"
+}
+
+# run_with_progress DESC PROBE CMD... - run CMD in the background and log
+# elapsed time every PROGRESS_INTERVAL seconds, plus a one-line status from
+# PROBE (a function given CMD's PID; "-" for none). Returns CMD's status.
+run_with_progress() {
+    local desc=$1 probe=$2; shift 2
+    local start=$SECONDS n=0 pid rc=0 el msg
+    "$@" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        (( ++n % PROGRESS_INTERVAL == 0 )) || continue
+        el=$(( SECONDS - start ))
+        PROGRESS_ELAPSED=$el
+        msg=""
+        [[ $probe == - ]] || msg=$("$probe" "$pid" 2>/dev/null || true)
+        log "${desc}: $(fmt_dur "$el") elapsed${msg:+ - ${msg}}"
+    done
+    wait "$pid" || rc=$?
+    # Closing line, so even a step shorter than the interval reports its result.
+    el=$(( SECONDS - start ))
+    PROGRESS_ELAPSED=$el
+    msg=""
+    [[ $probe == - ]] || msg=$("$probe" "" 2>/dev/null || true)
+    log "${desc}: completed in $(fmt_dur "$el") (exit ${rc})${msg:+ - ${msg}}"
+    return "$rc"
 }
 
 backup_file() {
@@ -709,7 +766,10 @@ install_base_stack() {
 }
 
 configure_unattended_upgrades() {
-    step "2.3 unattended security upgrades (daily)"
+    step "2.3 unattended security upgrades (daily, mandatory)"
+    # Owner policy: automatic distro security updates are NOT optional. There
+    # is deliberately no opt-out variable, and the run fails on a real host if
+    # they are not effectively enabled (masked timers, overriding apt.conf.d).
     write_file 0644 /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 // Managed by harden-and-audit.sh
 APT::Periodic::Enable "1";
@@ -744,6 +804,7 @@ Unattended-Upgrade::Origins-Pattern {
         echo "// Managed by ${SCRIPT_NAME} - apply official ${OS_ID^} security updates daily."
         printf '%s\n' "$origins"
         cat <<'EOF'
+#clear Unattended-Upgrade::Package-Blacklist;
 Unattended-Upgrade::Package-Blacklist {
 };
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
@@ -762,9 +823,48 @@ Dpkg::Options {
 };
 EOF
     } | write_file 0644 /etc/apt/apt.conf.d/52unattended-upgrades-harden
-    systemctl enable apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service >/dev/null 2>&1 || true
-    systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+    # apt.conf.d is read in lexical order and the last value wins: images ship
+    # files such as docker-disable-periodic-update (APT::Periodic::Enable "0")
+    # that silently turn updates off. Neutralise every such override (backed
+    # up first), then write our values in a file that sorts last.
+    rm -f /etc/apt/apt.conf.d/99zz-harden-auto-upgrades
+    local f
+    for f in /etc/apt/apt.conf /etc/apt/apt.conf.d/*; do
+        [[ -f $f && $f != */zz-harden-auto-upgrades ]] || continue
+        grep -Eq '^[[:space:]]*APT::Periodic::(Enable|Update-Package-Lists|Download-Upgradeable-Packages|Unattended-Upgrade)[[:space:]]+"?(0|false)"?' "$f" || continue
+        backup_file "$f"
+        sed -i -E 's@^([[:space:]]*APT::Periodic::(Enable|Update-Package-Lists|Download-Upgradeable-Packages|Unattended-Upgrade)[[:space:]]+"?(0|false)"?.*)$@// disabled by harden-and-audit (automatic security updates are mandatory): \1@' "$f"
+        log "automatic security updates: neutralised an override in ${f}"
+    done
+    write_file 0644 /etc/apt/apt.conf.d/zz-harden-auto-upgrades <<'EOF'
+// Managed by harden-and-audit.sh - read last on purpose: automatic security
+// updates are mandatory and must not be overridden by another apt.conf.d file.
+APT::Periodic::Enable "1";
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
     apt-config dump | qgrep -F "$check" || die "unattended-upgrades origin pattern did not take effect"
+    local key val
+    for key in APT::Periodic::Enable APT::Periodic::Update-Package-Lists APT::Periodic::Unattended-Upgrade; do
+        val=""
+        eval "$(apt-config shell val "$key")"
+        [[ $val == 1 ]] || die "automatic security updates are mandatory but ${key} is '${val}' after configuration"
+    done
+    # Cloud/golden images often MASK the apt timers; enable fails on a masked unit.
+    local u
+    for u in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do
+        systemctl unmask "$u" >/dev/null 2>&1 || true
+    done
+    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+    systemctl enable unattended-upgrades.service >/dev/null 2>&1 || true
+    for u in apt-daily.timer apt-daily-upgrade.timer; do
+        if ! systemctl is-enabled --quiet "$u" 2>/dev/null || ! systemctl is-active --quiet "$u" 2>/dev/null; then
+            in_container || die "automatic security updates are mandatory but ${u} is not enabled and active"
+            warn "container: ${u} is not active here (it is enforced on a real host)"
+        fi
+    done
+    log "automatic security updates: enabled (apt-daily + apt-daily-upgrade timers active, security origins only)"
 }
 
 # ============================================================================
@@ -2188,6 +2288,65 @@ ProcessSizeMax=0
 EOF
 }
 
+# Hourly logrotate (so maxsize is enforced within the hour, not once a day)
+# followed by a hard size/free-space budget for /var/log: a noisy service can
+# never fill the disk and take the host down.
+configure_log_budget() {
+    numfmt --from=iec "$LOG_MAX_TOTAL" >/dev/null 2>&1 || die "LOG_MAX_TOTAL='${LOG_MAX_TOTAL}' is not a size (e.g. 4G)"
+    [[ $LOG_MIN_FREE_PCT =~ ^[0-9]+$ && $LOG_MIN_FREE_PCT -lt 90 ]] || die "LOG_MIN_FREE_PCT must be 0-89"
+    {
+        printf '#!/bin/bash\n'
+        printf '# Managed by harden-and-audit.sh - prune /var/log to its budget.\n'
+        printf 'DEFAULT_MAX=%q\nDEFAULT_MIN_FREE_PCT=%q\n' "$LOG_MAX_TOTAL" "$LOG_MIN_FREE_PCT"
+        cat <<'EOF'
+# Deletes the OLDEST ROTATED archives (never a live log, never the journal,
+# which journald caps itself) while /var/log is larger than MAX or its
+# filesystem has less than MIN_FREE_PCT free. Usage: [MAX] [MIN_FREE_PCT]
+set -u
+MAX=$(numfmt --from=iec "${1:-$DEFAULT_MAX}")
+MIN_FREE_PCT=${2:-$DEFAULT_MIN_FREE_PCT}
+used=$(du -sxb /var/log 2>/dev/null | cut -f1)
+free_pct() { df -P /var/log | awk 'NR == 2 { gsub("%", "", $5); print 100 - $5 }'; }
+over() { (( used > MAX || $(free_pct) < MIN_FREE_PCT )); }
+over || exit 0
+start=$used n=0
+while IFS= read -r -d '' rec; do
+    over || break
+    rec=${rec#* }; size=${rec%% *}; f=${rec#* }
+    if rm -f -- "$f"; then used=$(( used - size )); n=$(( n + 1 )); fi
+done < <(find /var/log -xdev -regextype posix-extended -type f -not -path '/var/log/journal/*' \
+    \( -name '*.gz' -o -name '*.xz' -o -name '*.zst' -o -name '*.bz2' -o -name '*.old' \
+       -o -regex '.*\.[0-9]+(\.log)?' -o -regex '.*-[0-9]{8}(\.log)?' \) \
+    -printf '%T@ %s %p\0' | sort -zn)
+msg="pruned ${n} rotated log file(s), freed $(numfmt --to=iec $(( start - used ))); /var/log now $(numfmt --to=iec "$used"), $(free_pct)% free"
+if over; then msg+=" - STILL OVER BUDGET: live logs alone exceed it"; fi
+logger -t harden-log-budget -p user.warning "$msg"
+echo "$msg"
+EOF
+    } | write_file 0700 /usr/local/sbin/harden-log-budget
+    write_file 0644 /etc/systemd/system/logrotate.timer.d/60-harden.conf <<'EOF'
+# Managed by harden-and-audit.sh - rotate hourly so maxsize is enforced
+# within the hour (logrotate.conf keeps "daily" for time-based rotation).
+[Timer]
+OnCalendar=
+OnCalendar=hourly
+AccuracySec=1m
+RandomizedDelaySec=0
+EOF
+    write_file 0644 /etc/systemd/system/logrotate.service.d/60-harden.conf <<'EOF'
+# Managed by harden-and-audit.sh - after rotating, prune /var/log to budget.
+[Service]
+ExecStartPost=-/usr/local/sbin/harden-log-budget
+EOF
+    systemctl daemon-reload
+    systemctl enable --now logrotate.timer >/dev/null 2>&1 || true
+    log "log budget: /var/log capped at ${LOG_MAX_TOTAL} with >= ${LOG_MIN_FREE_PCT}% disk free; ${LOG_ROTATE_KEEP} generations, ${LOG_MAXSIZE} max per file, rotated hourly"
+    # Enforce now: an oversized /var/log also makes the AIDE baseline crawl.
+    local out
+    out=$(/usr/local/sbin/harden-log-budget) || true
+    if [[ -n $out ]]; then log "log budget: ${out}"; fi
+}
+
 configure_logging() {
     step "5.12 journald, rsyslog and logrotate (bounded, rotated, persistent)"
     # Storage/Compress/ForwardToSyslog are set in journald.conf itself (where
@@ -2231,14 +2390,33 @@ EOF
             -e 's/^([[:space:]]*\$(InputTCPServerRun|UDPServerRun).*)$/# disabled by harden-and-audit: \1/' "$f"
     done
     rsyslogd -N1 >/dev/null 2>&1 || die "rsyslog configuration is invalid"
-    # Rotation: daily, 30 generations, compressed, size-capped.
+    # Rotation: daily, LOG_ROTATE_KEEP generations, compressed, size-capped.
+    # Logs are shipped off-host, so local copies are a short buffer only.
     backup_file /etc/logrotate.conf
     sed -i -E 's/^(weekly|monthly)$/daily/' /etc/logrotate.conf
-    sed -i -E 's/^rotate [0-9]+$/rotate 30/' /etc/logrotate.conf
+    sed -i -E "s/^rotate [0-9]+$/rotate ${LOG_ROTATE_KEEP}/" /etc/logrotate.conf
+    grep -q '^rotate ' /etc/logrotate.conf || sed -i "1i rotate ${LOG_ROTATE_KEEP}" /etc/logrotate.conf
     grep -q '^compress$' /etc/logrotate.conf || sed -i -E 's/^#[[:space:]]*compress$/compress/' /etc/logrotate.conf
     grep -q '^compress$' /etc/logrotate.conf || sed -i '/^create/a compress' /etc/logrotate.conf
-    grep -q '^maxsize ' /etc/logrotate.conf || sed -i '/^compress$/a maxsize 200M' /etc/logrotate.conf
+    sed -i '/^maxsize /d' /etc/logrotate.conf
+    sed -i "/^compress$/a maxsize ${LOG_MAXSIZE}" /etc/logrotate.conf
     grep -q '^daily$' /etc/logrotate.conf || sed -i '1i daily' /etc/logrotate.conf
+    # This script's own logs.
+    write_file 0644 /etc/logrotate.d/harden-and-audit <<'EOF'
+# Managed by harden-and-audit.sh
+/var/log/harden-and-audit.log /var/log/harden-and-audit-aideinit.log {
+    # Ubuntu's /var/log is group-writable (root:syslog 0775): without "su"
+    # logrotate refuses the stanza when it is evaluated on its own.
+    su root root
+    rotate 4
+    size 50M
+    missingok
+    notifempty
+    compress
+    create 0600 root root
+}
+EOF
+    configure_log_budget
     # Recreated logs must not be world readable either (dpkg/apt ship 0644).
     for f in /etc/logrotate.conf /etc/logrotate.d/*; do
         [[ -f $f ]] || continue
@@ -2380,6 +2558,39 @@ configure_aide_config() {
             echo "/usr/sbin/${t} p+i+n+u+g+s+b+acl+selinux+xattrs+sha512"
         done
     } >>"$aconf"
+    # The vendor catch-all (99_aide_root: "/ 0 Full") checksums every byte
+    # under /, including container layers, VM disks and caches. On a docker/
+    # containerd host that is 100+ GB, so the baseline takes hours and the
+    # daily check never finishes; the content also churns constantly, so it
+    # would only produce noise. Exclude bulk runtime data, not system files.
+    # (Name must match aide.conf's x_include filter: [a-zA-Z0-9_-]+.)
+    write_file 0644 /etc/aide/aide.conf.d/90_harden_bulk_excludes <<'EOF'
+# Managed by harden-and-audit.sh: bulk / volatile data kept out of AIDE.
+# Container and VM storage (images are verified by their runtime digests)
+!/var/lib/(containerd|docker|containers|kubelet|rancher)(/|$)
+!/var/lib/libvirt/images(/|$)
+!/var/lib/snapd/(snaps|cache)(/|$)
+# Caches and scratch space
+!/var/cache(/|$)
+!/var/tmp(/|$)
+!/tmp(/|$)
+# Home directories hold user data (repositories, package caches, app
+# profiles), not the system. Still watched: the shell dotfiles, .ssh,
+# .config/autostart, systemd user units and .local/bin - where something
+# planted would run.
+!/(root|home/[^/]+)/[^.][^/]*(/|$)
+!/(root|home/[^/]+)/\.(cache|npm|pnpm-store|yarn|bun|deno|nvm|pyenv|cargo|rustup|go|gradle|m2|terraform\.d|vscode-server|mozilla|var)(/|$)
+!/(root|home/[^/]+)/\.local/(share|lib|state)(/|$)
+!/(root|home/[^/]+)/\.config/(?!(autostart|systemd)(/|$))[^/]+(/|$)
+# Swap files (contents change with every page out)
+!/(swap\.img|swapfile)$
+EOF
+    # Any other active swap file, wherever it lives.
+    local sw
+    while read -r sw t _; do
+        [[ $t == file && $sw == /* ]] || continue
+        printf '!%s$\n' "$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<<"$sw")"
+    done < <(tail -n +2 /proc/swaps) >>/etc/aide/aide.conf.d/90_harden_bulk_excludes
     aide --config-check --config "$aconf" >/dev/null 2>&1 || die "AIDE configuration check failed"
     # Ubuntu's aide-common ships dailyaidecheck.{service,timer}, which the
     # Ubuntu CIS content checks: use it rather than adding a second check.
@@ -2649,6 +2860,39 @@ resolve_datastream() {
     return 1
 }
 
+# stdbuf -oL: oscap's per-rule lines reach the log as they happen.
+scap_eval_quiet() {
+    ( umask 077; stdbuf -oL oscap xccdf eval --profile "$1" --results "$2" --report "$3" "$4" </dev/null >"$5" 2>&1 )
+}
+
+# scap_rule_count DS PROFILE_ID - rules the profile selects (SSG datastreams
+# carry resolved profiles: one <select> per rule). Prints 0 if unknown.
+scap_rule_count() {
+    awk -v id="$2" '
+        !p && /<([A-Za-z0-9.-]+:)?Profile[[:space:]]/ && index($0, "id=\"" id "\"") { p = 1; next }
+        p && /<\/([A-Za-z0-9.-]+:)?Profile>/ { exit }
+        p && /<([A-Za-z0-9.-]+:)?select[[:space:]]/ && /selected="true"/ && /content_rule_/ { n++ }
+        END { print n + 0 }' "$1" 2>/dev/null || echo 0
+}
+
+# Progress probe: rules finished / rules selected, time left, last rule.
+SCAP_PROGRESS_LOG=""
+SCAP_RULE_TOTAL=0
+scap_progress() {
+    local ndone last out r
+    [[ -f $SCAP_PROGRESS_LOG ]] || return 0
+    ndone=$(grep -c '^Result' "$SCAP_PROGRESS_LOG" || true)
+    last=$({ grep '^Title' "$SCAP_PROGRESS_LOG" || true; } | tail -n1 | sed -E 's/^Title[[:space:]]+//' | cut -c1-60)
+    if (( SCAP_RULE_TOTAL > 0 )); then
+        out="${ndone}/${SCAP_RULE_TOTAL} rules ($(( ndone * 100 / SCAP_RULE_TOTAL ))%)"
+        r=$(eta "$ndone" "$SCAP_RULE_TOTAL")
+        out+="${r:+, ${r}}"
+    else
+        out="${ndone} rules evaluated"
+    fi
+    printf '%s%s\n' "$out" "${last:+, last: ${last}}"
+}
+
 # scap_eval PROFILE RESULTS REPORT DS - returns oscap's exit status (0 or 2 ok)
 scap_eval() {
     local profile=$1 results=$2 report=$3 ds=$4 rc=0
@@ -2657,8 +2901,11 @@ scap_eval() {
     log "evaluating profile ${profile} (this can take several minutes)"
     # umask 077: report files must not themselves violate /var/log permission
     # rules while the scan is reading /var/log.
-    ( umask 077; oscap xccdf eval --profile "$pid" --results "$results" --report "$report" "$ds" \
-        >"${results%.xml}.log" 2>&1 ) || rc=$?
+    SCAP_PROGRESS_LOG="${results%.xml}.log"
+    SCAP_RULE_TOTAL=$(scap_rule_count "$ds" "$pid")
+    if (( SCAP_RULE_TOTAL > 0 )); then log "${SCAP_RULE_TOTAL} rules selected by ${profile}; progress every ${PROGRESS_INTERVAL}s"; fi
+    run_with_progress "OpenSCAP ${profile}" scap_progress \
+        scap_eval_quiet "$pid" "$results" "$report" "$ds" "$SCAP_PROGRESS_LOG" || rc=$?
     # 0 = all passed, 2 = at least one rule failed; anything else is an error.
     if [[ $rc -ne 0 && $rc -ne 2 ]]; then
         tail -n 20 "${results%.xml}.log" >&2 || true
@@ -2792,6 +3039,76 @@ EOF
     systemctl start scap-audit.timer >/dev/null 2>&1 || true
 }
 
+readonly AIDE_INIT_LOG=/var/log/harden-and-audit-aideinit.log
+
+# stdin from /dev/null: a prompt must fail, never wait invisibly.
+aide_init_quiet() {
+    # Lowest CPU/IO priority: the baseline still reads every in-scope file.
+    ( umask 077; nice -n 19 ionice -c 3 aideinit -y -f </dev/null >"$AIDE_INIT_LOG" 2>&1 )
+}
+
+# Bytes in use on local disk filesystems: the upper bound of what AIDE reads
+# (its exclusions make the real amount smaller, so the estimate is cautious).
+AIDE_TOTAL_BYTES=0
+# Minus the bulk data 90_harden_bulk_excludes keeps out of AIDE (same paths,
+# as globs; each du is time-boxed so a huge tree cannot stall the estimate).
+aide_estimate_total() {
+    local total skip=0 d b h
+    local -a dirs=(/var/lib/containerd /var/lib/docker /var/lib/containers /var/lib/kubelet /var/lib/rancher
+                   /var/lib/libvirt/images /var/lib/snapd/snaps /var/lib/snapd/cache /var/cache /var/tmp /tmp
+                   /swap.img /swapfile)
+    total=$(df -l -B1 --output=used -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null \
+        | awk 'NR > 1 { s += $1 } END { printf "%d\n", s }')
+    for h in /root /home/*; do
+        [[ -d $h ]] || continue
+        for d in "$h"/[!.]* "$h"/.{cache,npm,pnpm-store,yarn,bun,deno,nvm,pyenv,cargo,rustup,go,gradle,m2,terraform.d,vscode-server,mozilla,var} \
+                 "$h"/.local/{share,lib,state} "$h"/.config/*; do
+            case ${d##*/.config/} in autostart|systemd) [[ $d == */.config/* ]] && continue ;; esac
+            dirs+=("$d")
+        done
+    done
+    while read -r d b _; do
+        [[ $b == file && $d == /* && $d != /swap.img && $d != /swapfile ]] && dirs+=("$d")
+    done < <(tail -n +2 /proc/swaps 2>/dev/null)
+    for d in "${dirs[@]}"; do
+        [[ -e $d ]] || continue
+        b=$(timeout 20 du -sxb "$d" 2>/dev/null | cut -f1) || continue
+        skip=$(( skip + ${b:-0} ))
+    done
+    (( total > skip )) && total=$(( total - skip ))
+    printf '%d\n' "$total"
+}
+
+# Progress probe: share of AIDE_TOTAL_BYTES that aide has read so far (all
+# aide processes, from /proc/PID/io), time left, and the file now open.
+aide_progress() {
+    local apid f rd=0 r pct cur="" out apids
+    apids=$(pgrep -x aide) || return 0    # finished (closing line) or not started
+    for apid in $apids; do
+        r=$(awk '/^rchar:/ { print $2 }' /proc/"$apid"/io 2>/dev/null) || r=0
+        rd=$(( rd + ${r:-0} ))
+        [[ -n $cur ]] && continue
+        for f in /proc/"$apid"/fd/*; do
+            f=$(readlink "$f") || continue
+            case $f in
+                /dev/*|/proc/*|pipe:*|socket:*|anon_inode:*|/var/lib/aide/*|/etc/aide/*|/var/log/*) ;;
+                /*) cur=$f; break ;;
+            esac
+        done
+    done
+    if (( AIDE_TOTAL_BYTES > 0 && rd > 0 )); then
+        pct=$(( rd * 100 / AIDE_TOTAL_BYTES ))
+        (( pct <= 99 )) || pct=99
+        out="~${pct}% ($(numfmt --to=iec "$rd") of ~$(numfmt --to=iec "$AIDE_TOTAL_BYTES") read)"
+        r=$(eta "$rd" "$AIDE_TOTAL_BYTES")
+        out+="${r:+, ${r}}"
+    elif (( rd == 0 )); then
+        out="starting"
+    fi
+    out+="${cur:+, reading ${cur}}"
+    printf '%s\n' "${out#, }"
+}
+
 build_aide_database() {
     step "AIDE baseline database (final state)"
     if [[ $AIDE_INIT != 1 ]]; then
@@ -2801,9 +3118,17 @@ build_aide_database() {
     if [[ -f /var/lib/aide/aide.db ]]; then
         log "updating existing AIDE database"
     fi
+    AIDE_TOTAL_BYTES=$(aide_estimate_total || echo 0)
+    log "AIDE reads and checksums every file on the system (up to ~$(numfmt --to=iec "${AIDE_TOTAL_BYTES:-0}") here): this usually takes 5-30 minutes"
+    log "progress is reported every ${PROGRESS_INTERVAL}s; percentage and time left are estimates"
+    log "AIDE output: ${AIDE_INIT_LOG}"
     # AIDE >= 0.19 drops to the _aide user via capsh, which needs
     # CAP_SETPCAP/CAP_DAC_READ_SEARCH (absent in unprivileged containers).
-    host_only "aideinit" aideinit -y -f >/dev/null 2>&1
+    if ! run_with_progress "AIDE baseline" aide_progress aide_init_quiet; then
+        tail -n 20 "$AIDE_INIT_LOG" >&2 || true
+        in_container || die "aideinit failed (full output: ${AIDE_INIT_LOG})"
+        warn "container: 'aideinit' could not be applied here (it applies on a real host)"
+    fi
     if [[ -f /var/lib/aide/aide.db ]]; then
         chmod 0600 /var/lib/aide/aide.db*
     elif ! in_container; then
@@ -2825,6 +3150,7 @@ main() {
         shift
     done
 
+    [[ $PROGRESS_INTERVAL =~ ^[1-9][0-9]*$ ]] || { echo "PROGRESS_INTERVAL must be a positive number of seconds" >&2; exit 64; }
     preflight_root
     install -d -m 0700 -o root -g root "$BACKUP_DIR"
     touch "$LOG_FILE"
@@ -2838,6 +3164,12 @@ main() {
         run_scap_audit || src=$?
         return "$src"
     fi
+
+    # Full run: every step header in this file, minus the repository step
+    # of the other distribution, plus purge_graphical and
+    # harden_file_permissions running twice. tests/assertions.sh checks that
+    # the final step number equals this total.
+    STEP_TOTAL=$(( $(grep -c '^[[:space:]]*step "' "${BASH_SOURCE[0]}") - 1 + 2 ))
 
     preflight_admin
     detect_ssh_ports

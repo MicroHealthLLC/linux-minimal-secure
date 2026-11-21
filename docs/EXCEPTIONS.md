@@ -13,7 +13,7 @@ The system owner requires that audit-log pressure must never suspend logging, dr
 | `auditd_data_retention_admin_space_left_action` | `single` or `halt` | `SYSLOG` | `single`/`halt` remove remote access |
 | `auditd_data_disk_full_action` | `halt` or `single` | `SYSLOG` | Same |
 
-Compensating controls: `max_log_file = 20` (passes the CIS `>= 6` check), `num_logs = 10` (200 MB ceiling), the audit failure flag `-f 1` (printk, never panic), a 512 MB journald cap with 1 GB kept free, logrotate `maxsize 200M`, and syslog alerts that can be forwarded to the SIEM over TLS (`rsyslog-gnutls` is installed).
+Compensating controls: `max_log_file = 20` (passes the CIS `>= 6` check), `num_logs = 10` (200 MB ceiling), the audit failure flag `-f 1` (printk, never panic), a 512 MB journald cap with 1 GB kept free, logrotate `maxsize 100M` checked hourly, a hard `/var/log` budget (`LOG_MAX_TOTAL`, default 4G, plus `LOG_MIN_FREE_PCT` disk free) enforced by pruning the oldest rotated archives, and syslog alerts that can be forwarded to the SIEM over TLS (`rsyslog-gnutls` is installed).
 
 ## 2. Conflicts inside the profile, or with mandated components
 
