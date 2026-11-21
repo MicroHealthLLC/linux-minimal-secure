@@ -2846,16 +2846,16 @@ scap_rule_count() {
 SCAP_PROGRESS_LOG=""
 SCAP_RULE_TOTAL=0
 scap_progress() {
-    local done last out r
+    local ndone last out r
     [[ -f $SCAP_PROGRESS_LOG ]] || return 0
-    done=$(grep -c '^Result' "$SCAP_PROGRESS_LOG" || true)
+    ndone=$(grep -c '^Result' "$SCAP_PROGRESS_LOG" || true)
     last=$({ grep '^Title' "$SCAP_PROGRESS_LOG" || true; } | tail -n1 | sed -E 's/^Title[[:space:]]+//' | cut -c1-60)
     if (( SCAP_RULE_TOTAL > 0 )); then
-        out="${done}/${SCAP_RULE_TOTAL} rules ($(( done * 100 / SCAP_RULE_TOTAL ))%)"
-        r=$(eta "$done" "$SCAP_RULE_TOTAL")
+        out="${ndone}/${SCAP_RULE_TOTAL} rules ($(( ndone * 100 / SCAP_RULE_TOTAL ))%)"
+        r=$(eta "$ndone" "$SCAP_RULE_TOTAL")
         out+="${r:+, ${r}}"
     else
-        out="${done} rules evaluated"
+        out="${ndone} rules evaluated"
     fi
     printf '%s%s\n' "$out" "${last:+, last: ${last}}"
 }
