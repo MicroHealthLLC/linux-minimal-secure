@@ -66,7 +66,8 @@ check "apt-daily-upgrade.timer enabled" systemctl is-enabled apt-daily-upgrade.t
 for k in APT::Periodic::Enable APT::Periodic::Update-Package-Lists APT::Periodic::Unattended-Upgrade; do
     check "effective ${k} = 1" bash -c "eval \"\$(apt-config shell v $k)\"; [[ \$v == 1 ]]"
 done
-check "auto-upgrade settings read last (99zz)"  test -f /etc/apt/apt.conf.d/99zz-harden-auto-upgrades
+check "no apt.conf override disables periodic updates" bash -c "! grep -sEq '^[[:space:]]*APT::Periodic::(Enable|Update-Package-Lists|Download-Upgradeable-Packages|Unattended-Upgrade)[[:space:]]+\"?(0|false)' /etc/apt/apt.conf /etc/apt/apt.conf.d/*"
+check "auto-upgrade settings read last (zz, sorts last)"  test -f /etc/apt/apt.conf.d/zz-harden-auto-upgrades
 for u in apt-daily.timer apt-daily-upgrade.timer; do
     check "${u} active"     systemctl is-active --quiet "$u"
     check "${u} not masked" bash -c "[[ \$(systemctl is-enabled $u 2>/dev/null) != masked ]]"
@@ -221,6 +222,7 @@ USED=$(du -sxb /var/log | cut -f1)
 check "budget prunes the oldest rotated archive" test ! -e "$BT/old.log.1"
 check "budget never touches a live log"         test -e "$BT/live.log"
 rm -rf "$BT"
+check "OpenSCAP reports rule progress (n/N, %)"  grep -Eq '\] OpenSCAP cis_level2_server: [0-9hms]+ elapsed - [0-9]+/[0-9]+ rules \([0-9]+%\)' /var/log/harden-and-audit.log
 check "step counter total is exact"             bash -c "grep -E '\[STEP [0-9]+/[0-9]+\] ===== done =====' /var/log/harden-and-audit.log | tail -n1 | grep -Eq '\[STEP ([0-9]+)/\1\]'"
 
 echo "== 6. CUDA prerequisites and media/coturn libraries"

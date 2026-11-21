@@ -52,7 +52,7 @@ The CI proves #3: after hardening, the sudo admin must still log in over SSH wit
 | Minimalism | `APT::Install-Recommends/Suggests "false"`. Dependency-aware purge of display managers, desktops, X servers, toolkits, and X11/Wayland/Mesa libraries (never removes a non-graphical package that links to them). Removes telnet/rsh/tftp/NIS/inetd/avahi/cups/rpcbind/etc. |
 | Repositories | Debian: deb822 `debian.sources` → `<codename>`, `-updates`, `-security` (`main contrib non-free non-free-firmware`). Ubuntu: deb822 `ubuntu.sources` → `<codename>`, `-updates`, `-security` (`main restricted universe multiverse`); the configured (cloud/regional/private) mirror is kept. Third-party repositories are never touched |
 | Base stack | openssh-server, tmux, curl, git, ufw, fail2ban, libpam-pwquality, auditd, unattended-upgrades (+ sudo, rsyslog, AIDE, AppArmor, timesyncd, vlock) |
-| Updates | **Mandatory, no opt-out.** unattended-upgrades applies Debian-Security / Ubuntu `-security` (+ ESM when Pro-attached) daily, keeps local conffiles, never auto-reboots. The apt timers are unmasked and enabled, a last-read `99zz-harden-auto-upgrades` stops other `apt.conf.d` files from turning updates off, and the run fails on a host where the effective config or the timers are not active |
+| Updates | **Mandatory, no opt-out.** unattended-upgrades applies Debian-Security / Ubuntu `-security` (+ ESM when Pro-attached) daily, keeps local conffiles, never auto-reboots. The apt timers are unmasked and enabled, a last-read `zz-harden-auto-upgrades` stops other `apt.conf.d` files from turning updates off, and the run fails on a host where the effective config or the timers are not active |
 | auditd | Owner policy above, plus the full CIS/STIG rule set (time, identity, network, MAC, logins, sessions, DAC, failed access, mounts, deletions, modules, setuid/setgid exec, sudoers, privileged commands generated from disk), immutable `-e 2` |
 | FIPS | `fips=1` in `GRUB_CMDLINE_LINUX` + `update-grub`. OpenSSL 3.1.2 FIPS provider built from the SHA-256-pinned source per its Security Policy into `/opt/openssl-fips-3.1.2`. `openssl.cnf` activates `fips` **and** `default` (strict `fips=yes` is opt-in with `FIPS_STRICT=1`). TLS ≥ 1.2. On Ubuntu with **Ubuntu Pro FIPS** enabled, Canonical's certified modules are kept and the 3.1.2 build is skipped |
 | Kernel cmdline | `audit=1 audit_backlog_limit=8192 apparmor=1 security=apparmor slab_nomerge=yes pti=on page_alloc.shuffle=1 vsyscall=none init_on_alloc=1 spectre_v2=on spec_store_bypass_disable=seccomp rng_core.default_quality=500` |
@@ -97,6 +97,23 @@ The CI proves #3: after hardening, the sudo admin must still log in over SSH wit
 | `LOG_MIN_FREE_PCT` | `15` | Also prune while the `/var/log` filesystem has less free space than this, so logs can never fill the disk |
 | `LOG_ROTATE_KEEP` / `LOG_MAXSIZE` | `14` / `100M` | Rotated generations per log / size that triggers rotation at the next hourly run |
 | `BANNER_FILE` | *(DoD banner)* | Custom login banner text |
+
+## Progress output
+
+Every step header shows where the run is and how long it has taken:
+
+```
+2026-11-21T17:28:24Z [STEP 41/44] ===== AIDE baseline database (final state) ===== (run time 38m12s)
+```
+
+The two long steps print a status line every `PROGRESS_INTERVAL` seconds (60 by default):
+
+```
+[INFO ] AIDE baseline: 6m00s elapsed - ~41% (3.2G of ~7.8G read), ~8m37s left, reading /usr/lib/x86_64-linux-gnu/libLLVM.so.19
+[INFO ] OpenSCAP cis_level2_server: 3m00s elapsed - 214/507 rules (42%), ~4m06s left, last: Ensure auditd Collects ...
+```
+
+AIDE's percentage compares data read against disk space in use, minus the bulk paths AIDE skips. AIDE has other exclusions too, so the estimate reads low and the time left errs long. AIDE's full output is in `/var/log/harden-and-audit-aideinit.log`.
 
 ## CI and releases
 

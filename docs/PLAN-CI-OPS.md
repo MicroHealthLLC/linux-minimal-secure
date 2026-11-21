@@ -39,7 +39,7 @@ target, the SCAP gates pass (95.2% / 95.4%), and the hardening itself is correct
 | P6 | OpenSCAP progress: rules done / rules in profile, %, time left, last rule (`stdbuf -oL`) | script |
 | P7 | logrotate: `rotate 14`, `maxsize 100M`, **hourly** timer drop-in, and the script's own logs get a logrotate entry | script |
 | P8 | `/var/log` budget: `harden-log-budget` runs after every logrotate and prunes the oldest **rotated** archives while usage is over `LOG_MAX_TOTAL` (4G) or disk free is under `LOG_MIN_FREE_PCT` (15%). It never touches live logs or the journal, and also runs once during hardening | script, assertions |
-| P9 | Mandatory automatic updates: unmask the apt units, `enable --now`, add a last-read `99zz-harden-auto-upgrades`, `#clear` the package blacklist, verify the effective config and the active timers (fatal on hosts) | script, assertions (`unattended-upgrade --dry-run`) |
+| P9 | Mandatory automatic updates: unmask the apt units, `enable --now`, add a last-read `zz-harden-auto-upgrades`, `#clear` the package blacklist, verify the effective config and the active timers (fatal on hosts) | script, assertions (`unattended-upgrade --dry-run`) |
 | P10 | Docs: README config table and controls, EXCEPTIONS compensating controls | docs |
 
 **Acceptance.** All 6 GitHub CI jobs (shellcheck + 5 distro targets) green on

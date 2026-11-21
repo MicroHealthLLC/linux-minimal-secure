@@ -817,9 +817,20 @@ Dpkg::Options {
 };
 EOF
     } | write_file 0644 /etc/apt/apt.conf.d/52unattended-upgrades-harden
-    # apt.conf.d is read in lexical order and the last value wins: images that
-    # ship e.g. 99-disable-periodic would silently turn updates off again.
-    write_file 0644 /etc/apt/apt.conf.d/99zz-harden-auto-upgrades <<'EOF'
+    # apt.conf.d is read in lexical order and the last value wins: images ship
+    # files such as docker-disable-periodic-update (APT::Periodic::Enable "0")
+    # that silently turn updates off. Neutralise every such override (backed
+    # up first), then write our values in a file that sorts last.
+    rm -f /etc/apt/apt.conf.d/99zz-harden-auto-upgrades
+    local f
+    for f in /etc/apt/apt.conf /etc/apt/apt.conf.d/*; do
+        [[ -f $f && $f != */zz-harden-auto-upgrades ]] || continue
+        grep -Eq '^[[:space:]]*APT::Periodic::(Enable|Update-Package-Lists|Download-Upgradeable-Packages|Unattended-Upgrade)[[:space:]]+"?(0|false)"?' "$f" || continue
+        backup_file "$f"
+        sed -i -E 's@^([[:space:]]*APT::Periodic::(Enable|Update-Package-Lists|Download-Upgradeable-Packages|Unattended-Upgrade)[[:space:]]+"?(0|false)"?.*)$@// disabled by harden-and-audit (automatic security updates are mandatory): \1@' "$f"
+        log "automatic security updates: neutralised an override in ${f}"
+    done
+    write_file 0644 /etc/apt/apt.conf.d/zz-harden-auto-upgrades <<'EOF'
 // Managed by harden-and-audit.sh - read last on purpose: automatic security
 // updates are mandatory and must not be overridden by another apt.conf.d file.
 APT::Periodic::Enable "1";
@@ -3104,6 +3115,7 @@ main() {
         shift
     done
 
+    [[ $PROGRESS_INTERVAL =~ ^[1-9][0-9]*$ ]] || { echo "PROGRESS_INTERVAL must be a positive number of seconds" >&2; exit 64; }
     preflight_root
     install -d -m 0700 -o root -g root "$BACKUP_DIR"
     touch "$LOG_FILE"
