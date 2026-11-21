@@ -36,4 +36,12 @@
 
 ## CI results
 
-Filled in once GitHub CI on `integration` finishes.
+| Run | Commit | Result |
+|---|---|---|
+| 44939707227 | `b0de840` | shellcheck failed (Δ1) |
+| 44939881952 | `0bc6b28` | Ubuntu ×3 failed (Δ7). Debian jobs cancelled by a later push |
+| 44940680148, 44940930284, 44941001387 | `995e96a`, `3974cba`, `910c34a` | cancelled: a parallel session pushed AIDE scope commits (`3974cba`, `910c34a`), which were adopted |
+| 44942277328 | `7c70f2e` | 5/6 green. Ubuntu 22.04: timing-dependent progress assertion (scan took 6 s, interval 10 s) |
+| **44943941339** | **`991cb1d`** | **all green**: shellcheck, Debian 12, Debian 13, Ubuntu 22.04, 24.04, 26.04 |
+
+Released as **v1.2.0** (VERSION bump; v1.1.0 was already published and the release workflow never overwrites one).
