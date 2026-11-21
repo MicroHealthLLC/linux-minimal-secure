@@ -2399,6 +2399,9 @@ EOF
     write_file 0644 /etc/logrotate.d/harden-and-audit <<'EOF'
 # Managed by harden-and-audit.sh
 /var/log/harden-and-audit.log /var/log/harden-and-audit-aideinit.log {
+    # Ubuntu's /var/log is group-writable (root:syslog 0775): without "su"
+    # logrotate refuses the stanza when it is evaluated on its own.
+    su root root
     rotate 4
     size 50M
     missingok

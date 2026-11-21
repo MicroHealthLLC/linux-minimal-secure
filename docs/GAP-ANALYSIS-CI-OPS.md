@@ -26,6 +26,9 @@
 | Δ5 | Upstream `6459cbe` (AIDE bulk excludes) landed while this work was in progress | Rebased. The AIDE size estimate subtracts the same excluded paths |
 | Δ6 | `apt-config dump --format` is missing from older apt (jammy) | Effective-value checks use `apt-config shell`, which every apt has |
 
+| Δ7 | Ubuntu images ship `docker-disable-periodic-update` (`APT::Periodic::Enable "0"`), which sorted after `99zz-…` and turned updates off. The new fatal check caught it on all three Ubuntu targets | Overrides that set 0/false are commented out (backed up first), and the file is now `zz-harden-auto-upgrades`. Assertion added |
+| Δ8 | `/etc/logrotate.d/harden-and-audit` was rejected on Ubuntu (`parent directory has insecure permissions`; `/var/log` is `root:syslog 0775`) when evaluated without the global `su root adm` | Added `su root root` to the stanza |
+
 ## Known limits (accepted)
 
 * The AIDE percentage is a cautious estimate: AIDE's other exclusions make the real total smaller, so it reads low and the time left errs long. This is stated in the README and in the log line before AIDE starts.
