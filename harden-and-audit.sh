@@ -213,6 +213,12 @@ run_with_progress() {
         log "${desc}: $(fmt_dur "$el") elapsed${msg:+ - ${msg}}"
     done
     wait "$pid" || rc=$?
+    # Closing line, so even a step shorter than the interval reports its result.
+    el=$(( SECONDS - start ))
+    PROGRESS_ELAPSED=$el
+    msg=""
+    [[ $probe == - ]] || msg=$("$probe" "" 2>/dev/null || true)
+    log "${desc}: completed in $(fmt_dur "$el") (exit ${rc})${msg:+ - ${msg}}"
     return "$rc"
 }
 
@@ -3076,8 +3082,9 @@ aide_estimate_total() {
 # Progress probe: share of AIDE_TOTAL_BYTES that aide has read so far (all
 # aide processes, from /proc/PID/io), time left, and the file now open.
 aide_progress() {
-    local apid f rd=0 r pct cur="" out
-    for apid in $(pgrep -x aide); do
+    local apid f rd=0 r pct cur="" out apids
+    apids=$(pgrep -x aide) || return 0    # finished (closing line) or not started
+    for apid in $apids; do
         r=$(awk '/^rchar:/ { print $2 }' /proc/"$apid"/io 2>/dev/null) || r=0
         rd=$(( rd + ${r:-0} ))
         [[ -n $cur ]] && continue

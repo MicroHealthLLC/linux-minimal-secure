@@ -21,7 +21,7 @@
 |---|---|---|
 | Δ1 | First push failed shellcheck SC1010: a local variable named `done` | Renamed to `ndone`. CI's exact shellcheck command (`v0.11.0 -x --severity=warning`) now runs locally before every push |
 | Δ2 | `PROGRESS_INTERVAL=0` or a non-number caused a division-by-zero in the progress loop | Checked at startup (exit 64) |
-| Δ3 | Nothing in CI proved the progress lines print (P4–P6) | CI runs with `PROGRESS_INTERVAL=10`, and an assertion requires an `OpenSCAP cis_level2_server: … n/N rules (x%)` line |
+| Δ3 | Nothing in CI proved the progress lines print (P4–P6) | Every long step ends with a `completed in …` closing line (a fast scan can finish inside the interval: 6 s on the GitHub jammy runner), and an assertion requires the OpenSCAP closing line with n/N rules |
 | Δ4 | README didn't explain the progress output or its accuracy | New "Progress output" section |
 | Δ5 | Upstream `6459cbe` (AIDE bulk excludes) landed while this work was in progress | Rebased. The AIDE size estimate subtracts the same excluded paths |
 | Δ6 | `apt-config dump --format` is missing from older apt (jammy) | Effective-value checks use `apt-config shell`, which every apt has |
