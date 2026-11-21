@@ -62,6 +62,17 @@ else
     check "unattended-upgrade security origin" bash -c "apt-config dump | grep -q 'label=Debian-Security'"
 fi
 check "apt-daily-upgrade.timer enabled" systemctl is-enabled apt-daily-upgrade.timer
+# Mandatory automatic security updates: effective config, live timers, real run.
+for k in APT::Periodic::Enable APT::Periodic::Update-Package-Lists APT::Periodic::Unattended-Upgrade; do
+    check "effective ${k} = 1" bash -c "eval \"\$(apt-config shell v $k)\"; [[ \$v == 1 ]]"
+done
+check "auto-upgrade settings read last (99zz)"  test -f /etc/apt/apt.conf.d/99zz-harden-auto-upgrades
+for u in apt-daily.timer apt-daily-upgrade.timer; do
+    check "${u} active"     systemctl is-active --quiet "$u"
+    check "${u} not masked" bash -c "[[ \$(systemctl is-enabled $u 2>/dev/null) != masked ]]"
+done
+check "no package blacklisted from security updates" bash -c "! apt-config dump | grep -q '^Unattended-Upgrade::Package-Blacklist:: '"
+check "unattended-upgrade dry run succeeds"     timeout 300 unattended-upgrade --dry-run
 
 echo "== 3. auditd rotation policy (owner exception)"
 A=/etc/audit/auditd.conf
@@ -174,7 +185,7 @@ check "AIDE watches the audit tools in aide.conf" grep -q '^/usr/sbin/auditctl p
 check "AIDE configuration valid" aide --config-check --config /etc/aide/aide.conf
 check "AIDE skips container storage" bash -c "aide --config /etc/aide/aide.conf -p f:/var/lib/containerd/x 2>&1 | grep -q 'negative rule'"
 check "AIDE skips caches" bash -c "aide --config /etc/aide/aide.conf -p f:/var/cache/x 2>&1 | grep -q 'negative rule'"
-check "AIDE still watches system binaries" bash -c "aide --config /etc/aide/aide.conf -p f:/usr/bin/ls 2>&1 | grep -q '^\\[X\\]'"
+check "AIDE still watches system binaries" bash -c "aide --config /etc/aide/aide.conf -p f:/usr/bin/ls 2>&1 | grep -qi '^\\[x\\]'"  # 0.18 prints [X], 0.19 [x]
 if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
     check "AIDE baseline database built" test -s /var/lib/aide/aide.db
 fi
@@ -191,6 +202,26 @@ if [[ $OS == ubuntu ]]; then
     check "TMOUT readonly+exported (POSIX form)" grep -Pzq 'TMOUT=[0-9]+\s+readonly TMOUT\s+export TMOUT' /etc/profile.d/60-harden.sh
     check "/etc/netplan watched by auditd" grep -q '^-w /etc/netplan/ -p wa' /etc/audit/rules.d/52-harden-netplan.rules
 fi
+
+echo "== 5b. bounded logs: hourly rotation + /var/log budget"
+check "logrotate keeps a short local buffer"     grep -Eq '^rotate ([1-9]|1[0-4])$' /etc/logrotate.conf
+check "logrotate size-caps every log"           grep -Eq '^maxsize [0-9]+[kMG]$' /etc/logrotate.conf
+check "logrotate.timer runs hourly"             bash -c "systemctl cat logrotate.timer | grep -qx 'OnCalendar=hourly'"
+check "logrotate.timer enabled"                 systemctl is-enabled --quiet logrotate.timer
+check "budget prune runs after each logrotate"  bash -c "systemctl cat logrotate.service | grep -qx 'ExecStartPost=-/usr/local/sbin/harden-log-budget'"
+check "budget prune script is root-only"        bash -c "[[ \$(stat -c '%a %U' /usr/local/sbin/harden-log-budget) == '700 root' ]]"
+check "own logs rotated"                        logrotate -d /etc/logrotate.d/harden-and-audit
+check "/var/log within budget"                  bash -c "(( \$(du -sxb /var/log | cut -f1) <= \$(numfmt --from=iec 4G) ))"
+# Budget prunes oldest rotated archives only, never live logs or the journal.
+BT=$(mktemp -d /var/log/ci-budget.XXXX)
+head -c 3000000 /dev/zero >"$BT/old.log.1"; touch -d '-9 day' "$BT/old.log.1"
+head -c 1000 /dev/zero >"$BT/live.log"
+USED=$(du -sxb /var/log | cut -f1)
+/usr/local/sbin/harden-log-budget "$(( USED - 1000000 ))" 0 >/dev/null
+check "budget prunes the oldest rotated archive" test ! -e "$BT/old.log.1"
+check "budget never touches a live log"         test -e "$BT/live.log"
+rm -rf "$BT"
+check "step counter total is exact"             bash -c "grep -E '\[STEP [0-9]+/[0-9]+\] ===== done =====' /var/log/harden-and-audit.log | tail -n1 | grep -Eq '\[STEP ([0-9]+)/\1\]'"
 
 echo "== 6. CUDA prerequisites and media/coturn libraries"
 HDR=linux-headers-amd64
