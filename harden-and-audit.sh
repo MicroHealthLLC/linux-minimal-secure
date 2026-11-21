@@ -2380,6 +2380,26 @@ configure_aide_config() {
             echo "/usr/sbin/${t} p+i+n+u+g+s+b+acl+selinux+xattrs+sha512"
         done
     } >>"$aconf"
+    # The vendor catch-all (99_aide_root: "/ 0 Full") checksums every byte
+    # under /, including container layers, VM disks and caches. On a docker/
+    # containerd host that is 100+ GB, so the baseline takes hours and the
+    # daily check never finishes; the content also churns constantly, so it
+    # would only produce noise. Exclude bulk runtime data, not system files.
+    # (Name must match aide.conf's x_include filter: [a-zA-Z0-9_-]+.)
+    write_file 0644 /etc/aide/aide.conf.d/90_harden_bulk_excludes <<'EOF'
+# Managed by harden-and-audit.sh: bulk / volatile data kept out of AIDE.
+# Container and VM storage (images are verified by their runtime digests)
+!/var/lib/(containerd|docker|containers|kubelet|rancher)(/|$)
+!/var/lib/libvirt/images(/|$)
+!/var/lib/snapd/(snaps|cache)(/|$)
+!/home/[^/]+/\.local/share/(docker|containers)(/|$)
+# Caches and scratch space
+!/var/cache(/|$)
+!/var/tmp(/|$)
+!/tmp(/|$)
+!/root/\.cache(/|$)
+!/home/[^/]+/\.cache(/|$)
+EOF
     aide --config-check --config "$aconf" >/dev/null 2>&1 || die "AIDE configuration check failed"
     # Ubuntu's aide-common ships dailyaidecheck.{service,timer}, which the
     # Ubuntu CIS content checks: use it rather than adding a second check.
@@ -2803,7 +2823,8 @@ build_aide_database() {
     fi
     # AIDE >= 0.19 drops to the _aide user via capsh, which needs
     # CAP_SETPCAP/CAP_DAC_READ_SEARCH (absent in unprivileged containers).
-    host_only "aideinit" aideinit -y -f >/dev/null 2>&1
+    # Lowest CPU/IO priority: the baseline still reads every in-scope file.
+    host_only "aideinit" nice -n 19 ionice -c 3 aideinit -y -f >/dev/null 2>&1
     if [[ -f /var/lib/aide/aide.db ]]; then
         chmod 0600 /var/lib/aide/aide.db*
     elif ! in_container; then

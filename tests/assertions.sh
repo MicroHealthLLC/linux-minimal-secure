@@ -172,6 +172,9 @@ check "fail2ban sshd jail active" bash -c "fail2ban-client status sshd"
 
 check "AIDE watches the audit tools in aide.conf" grep -q '^/usr/sbin/auditctl p+i+n+u+g+s+b+acl+selinux+xattrs+sha512$' /etc/aide/aide.conf
 check "AIDE configuration valid" aide --config-check --config /etc/aide/aide.conf
+check "AIDE skips container storage" bash -c "aide --config /etc/aide/aide.conf -p f:/var/lib/containerd/x 2>&1 | grep -q 'negative rule'"
+check "AIDE skips caches" bash -c "aide --config /etc/aide/aide.conf -p f:/var/cache/x 2>&1 | grep -q 'negative rule'"
+check "AIDE still watches system binaries" bash -c "aide --config /etc/aide/aide.conf -p f:/usr/bin/ls 2>&1 | grep -q '^\\[X\\]'"
 if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
     check "AIDE baseline database built" test -s /var/lib/aide/aide.db
 fi
