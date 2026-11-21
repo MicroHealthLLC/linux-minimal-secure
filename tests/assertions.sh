@@ -186,6 +186,8 @@ check "AIDE watches the audit tools in aide.conf" grep -q '^/usr/sbin/auditctl p
 check "AIDE configuration valid" aide --config-check --config /etc/aide/aide.conf
 check "AIDE skips container storage" bash -c "aide --config /etc/aide/aide.conf -p f:/var/lib/containerd/x 2>&1 | grep -q 'negative rule'"
 check "AIDE skips caches" bash -c "aide --config /etc/aide/aide.conf -p f:/var/cache/x 2>&1 | grep -q 'negative rule'"
+check "AIDE skips home repositories" bash -c "aide --config /etc/aide/aide.conf -p f:/root/project/x 2>&1 | grep -q 'negative rule'"
+check "AIDE still watches authorized_keys" bash -c "aide --config /etc/aide/aide.conf -p f:/root/.ssh/authorized_keys 2>&1 | grep -qi '^\\[x\\]'"
 check "AIDE still watches system binaries" bash -c "aide --config /etc/aide/aide.conf -p f:/usr/bin/ls 2>&1 | grep -qi '^\\[x\\]'"  # 0.18 prints [X], 0.19 [x]
 if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
     check "AIDE baseline database built" test -s /var/lib/aide/aide.db

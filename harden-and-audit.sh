@@ -2561,14 +2561,27 @@ configure_aide_config() {
 !/var/lib/(containerd|docker|containers|kubelet|rancher)(/|$)
 !/var/lib/libvirt/images(/|$)
 !/var/lib/snapd/(snaps|cache)(/|$)
-!/home/[^/]+/\.local/share/(docker|containers)(/|$)
 # Caches and scratch space
 !/var/cache(/|$)
 !/var/tmp(/|$)
 !/tmp(/|$)
-!/root/\.cache(/|$)
-!/home/[^/]+/\.cache(/|$)
+# Home directories hold user data (repositories, package caches, app
+# profiles), not the system. Still watched: the shell dotfiles, .ssh,
+# .config/autostart, systemd user units and .local/bin - where something
+# planted would run.
+!/(root|home/[^/]+)/[^.][^/]*(/|$)
+!/(root|home/[^/]+)/\.(cache|npm|pnpm-store|yarn|bun|deno|nvm|pyenv|cargo|rustup|go|gradle|m2|terraform\.d|vscode-server|mozilla|var)(/|$)
+!/(root|home/[^/]+)/\.local/(share|lib|state)(/|$)
+!/(root|home/[^/]+)/\.config/(?!(autostart|systemd)(/|$))[^/]+(/|$)
+# Swap files (contents change with every page out)
+!/(swap\.img|swapfile)$
 EOF
+    # Any other active swap file, wherever it lives.
+    local sw
+    while read -r sw t _; do
+        [[ $t == file && $sw == /* ]] || continue
+        printf '!%s$\n' "$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<<"$sw")"
+    done < <(tail -n +2 /proc/swaps) >>/etc/aide/aide.conf.d/90_harden_bulk_excludes
     aide --config-check --config "$aconf" >/dev/null 2>&1 || die "AIDE configuration check failed"
     # Ubuntu's aide-common ships dailyaidecheck.{service,timer}, which the
     # Ubuntu CIS content checks: use it rather than adding a second check.
