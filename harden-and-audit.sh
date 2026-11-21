@@ -3044,13 +3044,25 @@ AIDE_TOTAL_BYTES=0
 # Minus the bulk data 90_harden_bulk_excludes keeps out of AIDE (same paths,
 # as globs; each du is time-boxed so a huge tree cannot stall the estimate).
 aide_estimate_total() {
-    local total skip=0 d b
+    local total skip=0 d b h
+    local -a dirs=(/var/lib/containerd /var/lib/docker /var/lib/containers /var/lib/kubelet /var/lib/rancher
+                   /var/lib/libvirt/images /var/lib/snapd/snaps /var/lib/snapd/cache /var/cache /var/tmp /tmp
+                   /swap.img /swapfile)
     total=$(df -l -B1 --output=used -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null \
         | awk 'NR > 1 { s += $1 } END { printf "%d\n", s }')
-    for d in /var/lib/containerd /var/lib/docker /var/lib/containers /var/lib/kubelet /var/lib/rancher \
-             /var/lib/libvirt/images /var/lib/snapd/snaps /var/lib/snapd/cache /var/cache /var/tmp /tmp \
-             /root/.cache /home/*/.cache /home/*/.local/share/docker /home/*/.local/share/containers; do
-        [[ -d $d ]] || continue
+    for h in /root /home/*; do
+        [[ -d $h ]] || continue
+        for d in "$h"/[!.]* "$h"/.{cache,npm,pnpm-store,yarn,bun,deno,nvm,pyenv,cargo,rustup,go,gradle,m2,terraform.d,vscode-server,mozilla,var} \
+                 "$h"/.local/{share,lib,state} "$h"/.config/*; do
+            case ${d##*/.config/} in autostart|systemd) [[ $d == */.config/* ]] && continue ;; esac
+            dirs+=("$d")
+        done
+    done
+    while read -r d b _; do
+        [[ $b == file && $d == /* && $d != /swap.img && $d != /swapfile ]] && dirs+=("$d")
+    done < <(tail -n +2 /proc/swaps 2>/dev/null)
+    for d in "${dirs[@]}"; do
+        [[ -e $d ]] || continue
         b=$(timeout 20 du -sxb "$d" 2>/dev/null | cut -f1) || continue
         skip=$(( skip + ${b:-0} ))
     done
