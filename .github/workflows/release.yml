@@ -64,7 +64,8 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           install -m 0755 harden-and-audit.sh dist/harden-and-audit.sh
-          (cd dist && sha256sum harden-and-audit.sh > harden-and-audit.sh.sha256)
+          install -m 0755 tools/build-fips-deb.sh dist/build-fips-deb.sh
+          (cd dist && sha256sum harden-and-audit.sh > harden-and-audit.sh.sha256 && sha256sum build-fips-deb.sh > build-fips-deb.sh.sha256)
           for d in reports/scap-*; do
             v=${d##*/scap-}
             for f in scap-report.html scap-summary.txt scap-report-anssi_bp28_high.html scap-report-stig.html; do
@@ -74,7 +75,7 @@ jobs:
           {
             echo "## harden-and-audit.sh v${{ steps.version.outputs.version }}"
             echo
-            echo "FIPS-ready, CIS Level 2 hardened headless Debian 12 / 13 and Ubuntu 22.04 / 24.04 / 26.04 server transformation with an OpenSCAP self-audit."
+            echo "FIPS-ready, CIS Level 2 hardened headless Debian 12 / 13 and Ubuntu 22.04 / 24.04 / 26.04 server transformation (or GDM workstation, HARDEN_PROFILE=workstation) with an OpenSCAP self-audit."
             echo
             echo "### Install"
             echo '```bash'
@@ -103,4 +104,5 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "harden-and-audit $v" \
             --notes-file dist/RELEASE_NOTES.md \
-            dist/harden-and-audit.sh dist/harden-and-audit.sh.sha256 dist/*-scap-*.html dist/*-scap-*.txt
+            dist/harden-and-audit.sh dist/harden-and-audit.sh.sha256 dist/build-fips-deb.sh dist/build-fips-deb.sh.sha256 \
+            dist/*-scap-*.html dist/*-scap-*.txt

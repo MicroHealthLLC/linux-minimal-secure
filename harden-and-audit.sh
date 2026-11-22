@@ -4,8 +4,9 @@
 #
 # Transforms a stock Debian 12 (bookworm) / 13 (trixie) or Ubuntu 22.04
 # (jammy) / 24.04 (noble) / 26.04 (resolute) installation into a minimal,
-# FIPS-ready, SCAP/CIS-Level-2-hardened headless server, then audits itself
-# with OpenSCAP and writes XML + HTML compliance reports.
+# FIPS-ready, SCAP/CIS-Level-2-hardened headless server (or, with
+# HARDEN_PROFILE=workstation, a graphical workstation with GDM), then audits
+# itself with OpenSCAP and writes XML + HTML compliance reports.
 #
 # Design rules (in priority order):
 #   1. Never lock the operator out. Anti-lockout checks run BEFORE anything
@@ -22,7 +23,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.3.0"
 readonly SCRIPT_NAME="harden-and-audit.sh"
 readonly LOG_FILE="/var/log/harden-and-audit.log"
 readonly STATE_DIR="/var/lib/harden-and-audit"
@@ -42,6 +43,18 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # ----------------------------------------------------------------------------
 # Tunables (override through the environment)
 # ----------------------------------------------------------------------------
+# The host profile and administrative path of the last full run are kept in
+# ${STATE_DIR}/profile.env, so the weekly --scan-only run (and an operator's
+# manual one) scans a workstation with the workstation benchmark without
+# having to repeat the variables. The environment always wins.
+if [[ -r ${STATE_DIR}/profile.env ]]; then
+    [[ -n ${HARDEN_PROFILE:-} ]] || HARDEN_PROFILE=$(sed -n -E 's/^HARDEN_PROFILE=([a-z]+)$/\1/p' "${STATE_DIR}/profile.env" | tail -n1)
+    [[ -n ${ADMIN_ACCESS:-} ]] || ADMIN_ACCESS=$(sed -n -E 's/^ADMIN_ACCESS=([a-z]+)$/\1/p' "${STATE_DIR}/profile.env" | tail -n1)
+fi
+: "${HARDEN_PROFILE:=server}"         # server|workstation (workstation keeps GDM, Wayland, Mesa, PipeWire, BlueZ, NetworkManager)
+: "${ADMIN_ACCESS:=ssh}"              # ssh|none (none: no SSH server; the host is administered by its management agent)
+: "${WORKSTATION_BLUETOOTH:=off}"     # workstation only: off = bluetooth.service disabled (CIS), on = enabled (exception)
+: "${FIPS_PREBUILT_DEB:=}"            # path to a tools/build-fips-deb.sh package: install it instead of building from source
 : "${DEBIAN_MIRROR:=https://deb.debian.org/debian}"
 : "${DEBIAN_SECURITY_MIRROR:=https://security.debian.org/debian-security}"
 : "${UBUNTU_MIRROR:=}"                # empty = keep the configured Ubuntu mirror (cloud/regional), else archive/ports
@@ -82,6 +95,9 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${SSG_URL:=https://github.com/ComplianceAsCode/content/releases/download/v${SSG_VERSION}/scap-security-guide-${SSG_VERSION}.zip}"
 : "${SSG_DOWNLOAD:=1}"               # 0 = offline; use SSG_DATASTREAM or packaged content
 : "${SSG_DATASTREAM:=}"              # explicit path to an ssg-debianNN-ds.xml
+if [[ $HARDEN_PROFILE == workstation ]]; then
+    : "${SCAP_PROFILE:=cis_level2_workstation}"
+fi
 : "${SCAP_PROFILE:=cis_level2_server}"
 : "${SCAP_EXTRA_PROFILES:=}"         # e.g. "anssi_bp28_high standard"
 : "${SCAP_MIN_SCORE:=90}"
@@ -265,6 +281,8 @@ qgrep() { grep "$@" >/dev/null; }
 
 is_ubuntu() { [[ $OS_ID == ubuntu ]]; }
 is_debian() { [[ $OS_ID == debian ]]; }
+is_workstation() { [[ $HARDEN_PROFILE == workstation ]]; }
+ssh_admin() { [[ $ADMIN_ACCESS == ssh ]]; }
 
 pkg_installed() { [[ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null || true)" == installed ]]; }
 
@@ -414,6 +432,14 @@ interactive_users() {
 
 preflight_admin() {
     step "preflight: anti-lockout administrator check"
+    if ! ssh_admin; then
+        # ADMIN_ACCESS=none: there is no SSH server to lock anyone out of.
+        # The host is administered through its management agent (for
+        # TueriDesk, the Tueri Core agent and its access gateway), which
+        # nothing in this script touches. Root stays locked as always.
+        log "ADMIN_ACCESS=none: no SSH administration path is kept (the host is administered by its management agent); SSH preflight skipped"
+        return 0
+    fi
     if [[ $HARDEN_SKIP_ADMIN_CHECK == 1 ]]; then
         warn "HARDEN_SKIP_ADMIN_CHECK=1: root SSH login will be disabled without verifying another administrator exists"
         return 0
@@ -447,6 +473,11 @@ preflight_admin() {
 detect_ssh_ports() {
     step "preflight: detect SSH listening port(s)"
     local p
+    if ! ssh_admin; then
+        SSH_PORTS=()
+        log "ADMIN_ACCESS=none: openssh-server will be removed; no SSH port is opened"
+        return 0
+    fi
     if command -v sshd >/dev/null 2>&1 && install -d -m 0755 /run/sshd && sshd -T >/dev/null 2>&1; then
         mapfile -t SSH_PORTS < <(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -un)
     fi
@@ -526,6 +557,19 @@ purge_graphical() {
     re+='libxft2|libxv1|libxvmc1|libxaw7|libxkbfile1|libxmuu1|libxfont2|libxkbcommon-x11-0|libsm6|libice6|x11proto-.*|'
     re+='libwayland-.*|libgl1.*|libglx.*|libegl.*|libgles.*|libglapi-mesa|libgl1-mesa-dri|mesa-.*|libgbm1|libdrm-.*|'
     re+='libva-x11-.*|libva-drm-.*|libvdpau.*|xkb-data|libepoxy0|libllvm[0-9]+.*)$'
+    if is_workstation; then
+        # A workstation keeps its graphical session: GDM (the one display
+        # manager), GNOME Shell's components, Wayland and Xwayland, Mesa and
+        # the GL/EGL/GBM/DRM libraries, the toolkits and fonts. Only the X.Org
+        # server, legacy X clients, other display managers and full desktop
+        # environments are removed (CIS L2 Workstation keeps package_xorg
+        # out of scope; a Wayland session does not need the X.Org server).
+        re='^(xserver-xorg|xserver-xorg-core|xserver-xorg-legacy|xserver-xorg-input-.*|xserver-xorg-video-.*|xorg|xinit|xterm|xbase-clients|x11-utils|'
+        re+='lightdm.*|sddm.*|xdm|lxdm|slim|nodm|wdm|'
+        re+='task-desktop|task-.*-desktop|kde-.*|plasma-.*|xfce4.*|lxde.*|lxqt.*|cinnamon.*|mate-.*|budgie-.*|openbox.*|'
+        re+='ubuntu-desktop.*|[a-z]+ubuntu-desktop.*)$'
+        log "HARDEN_PROFILE=workstation: GDM, Wayland, Mesa, toolkits and fonts are kept"
+    fi
     local -a candidates
     mapfile -t candidates < <(dpkg-query -W -f='${db:Status-Status} ${Package}\n' 2>/dev/null | awk '$1=="installed"{print $2}' | grep -E "$re" || true)
     if [[ ${#candidates[@]} -eq 0 ]]; then
@@ -540,7 +584,11 @@ purge_graphical() {
     if [[ ${#residual[@]} -gt 0 ]]; then
         dpkg --purge "${residual[@]}" >/dev/null
     fi
-    systemctl set-default multi-user.target >/dev/null
+    if is_workstation && pkg_installed gdm3; then
+        systemctl set-default graphical.target >/dev/null
+    else
+        systemctl set-default multi-user.target >/dev/null
+    fi
 }
 
 purge_insecure_services() {
@@ -552,6 +600,8 @@ purge_insecure_services() {
         kea-dhcp4-server kea-dhcp6-server snmpd squid slapd ldap-utils autofs bluez dnsmasq)
     local -a present=() p
     for p in "${legacy[@]}"; do
+        # A workstation keeps BlueZ (headsets); its service is handled below.
+        if is_workstation && [[ $p == bluez ]]; then continue; fi
         pkg_installed "$p" && present+=("$p")
     done
     if [[ ${#present[@]} -gt 0 ]]; then
@@ -560,8 +610,27 @@ purge_insecure_services() {
         log "no legacy network services installed"
     fi
     # rsync is a common admin tool: keep the client but never run the daemon.
-    disable_service rsync.service bluetooth.service avahi-daemon.service avahi-daemon.socket cups.service \
-        cups.socket rpcbind.service rpcbind.socket nfs-server.service snmpd.service
+    if is_workstation; then
+        disable_service rsync.service avahi-daemon.service avahi-daemon.socket cups.service \
+            cups.socket rpcbind.service rpcbind.socket nfs-server.service snmpd.service
+        # Masked as CIS checks it (service_bluetooth_disabled); a site that
+        # needs headsets sets WORKSTATION_BLUETOOTH=on (or its fleet policy
+        # unmasks it), which CIS then reports as failed.
+        if svc_exists bluetooth.service; then
+            if [[ $WORKSTATION_BLUETOOTH == on ]]; then
+                systemctl unmask bluetooth.service >/dev/null 2>&1 || true
+                systemctl enable bluetooth.service >/dev/null 2>&1 || true
+                warn "WORKSTATION_BLUETOOTH=on: bluetooth.service stays enabled (service_bluetooth_disabled fails; see docs/EXCEPTIONS.md)"
+            else
+                systemctl disable --now bluetooth.service >/dev/null 2>&1 || true
+                systemctl mask bluetooth.service >/dev/null 2>&1 || true
+                log "bluetooth.service disabled and masked (WORKSTATION_BLUETOOTH=on unmasks and enables it)"
+            fi
+        fi
+    else
+        disable_service rsync.service bluetooth.service avahi-daemon.service avahi-daemon.socket cups.service \
+            cups.socket rpcbind.service rpcbind.socket nfs-server.service snmpd.service
+    fi
     # STIG: no Ctrl-Alt-Del reboot, no debug shell.
     systemctl mask ctrl-alt-del.target debug-shell.service >/dev/null 2>&1 || true
     if is_ubuntu; then
@@ -753,6 +822,21 @@ install_base_stack() {
         libpam-pwquality libpam-modules libpam-runtime auditd audispd-plugins unattended-upgrades
         sudo rsyslog rsyslog-gnutls logrotate cron acl vlock apparmor apparmor-utils unzip perl
         procps iproute2 kmod e2fsprogs)
+    if ! ssh_admin; then
+        # ADMIN_ACCESS=none: no SSH server at all (the client stays: git).
+        pkgs=("${pkgs[@]/openssh-server}")
+        mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | awk 'NF')
+        if pkg_installed openssh-server; then
+            systemctl disable --now ssh.socket ssh.service >/dev/null 2>&1 || true
+            apt-get purge -y -q openssh-server openssh-sftp-server
+            log "ADMIN_ACCESS=none: openssh-server removed"
+        fi
+        systemctl mask ssh.service ssh.socket sshd.service >/dev/null 2>&1 || true
+    fi
+    if is_workstation; then
+        # dconf update compiles the GDM and session policy (5.8).
+        pkgs+=(dconf-cli)
+    fi
     local opt
     opt=$(first_available libpam-apparmor) && pkgs+=("$opt")
     if pkg_installed chrony; then
@@ -1313,6 +1397,10 @@ install_fips_provider() {
         log "validated FIPS provider already installed; self-test on load passed (${module})"
         return 0
     fi
+    if [[ -n $FIPS_PREBUILT_DEB ]]; then
+        install_fips_prebuilt "$module" "$fipscnf"
+        return 0
+    fi
     apt_install build-essential perl make gcc curl ca-certificates
     local target
     case $DEB_ARCH in
@@ -1345,6 +1433,37 @@ install_fips_provider() {
     fips_selftest "$module" "$fipscnf" || die "installed FIPS module failed its load-time self-test"
     rm -rf "$build"
     log "FIPS provider installed: ${module}"
+}
+
+# install_fips_prebuilt MODULE FIPSCNF - install the provider from a package
+# made by tools/build-fips-deb.sh (the same Security Policy build, done once
+# instead of on every host). The package must record the SHA-256 of the
+# source tarball it was built from, and it must be the pin this script
+# enforces for its own build; anything else is refused. The module's
+# configuration (its integrity MAC) is generated on this host with
+# `openssl fipsinstall -self_test_onload`, as a source build would, and the
+# load-time self-test (integrity check + KATs) must pass.
+install_fips_prebuilt() {
+    local module=$1 fipscnf=$2 deb=$FIPS_PREBUILT_DEB field
+    [[ -f $deb ]] || die "FIPS_PREBUILT_DEB=${deb} does not exist"
+    field=$(dpkg-deb -f "$deb" X-OpenSSL-Source-SHA256 2>/dev/null || true)
+    [[ $field == "$FIPS_OPENSSL_SHA256" ]] \
+        || die "refusing ${deb}: it records source SHA-256 '${field:-none}', the pinned source is ${FIPS_OPENSSL_SHA256}"
+    field=$(dpkg-deb -f "$deb" X-OpenSSL-FIPS-Version 2>/dev/null || true)
+    [[ $field == "$FIPS_OPENSSL_VERSION" ]] \
+        || die "refusing ${deb}: it records FIPS provider version '${field:-none}', expected ${FIPS_OPENSSL_VERSION}"
+    field=$(dpkg-deb -f "$deb" Architecture 2>/dev/null || true)
+    [[ $field == "$DEB_ARCH" ]] || die "refusing ${deb}: built for '${field:-unknown}', this host is ${DEB_ARCH}"
+    log "installing the prebuilt FIPS provider ${deb##*/} (source sha256 ${FIPS_OPENSSL_SHA256})"
+    dpkg -i "$deb" >/dev/null || die "dpkg -i ${deb} failed"
+    [[ -f $module ]] || die "${deb} did not install ${module}"
+    install -d -m 0755 "${fipscnf%/*}"
+    openssl fipsinstall -module "$module" -out "${fipscnf}.new" -provider_name fips -self_test_onload >/dev/null 2>&1 \
+        || { rm -f "${fipscnf}.new"; die "openssl fipsinstall failed for ${module}"; }
+    chmod 0644 "${fipscnf}.new"
+    mv -f "${fipscnf}.new" "$fipscnf"
+    fips_selftest "$module" "$fipscnf" || die "prebuilt FIPS module failed its load-time self-test"
+    log "FIPS provider installed from package: ${module}"
 }
 
 # tls_loopback_test CONF - full TLS handshake through 127.0.0.1 with CONF as
@@ -1729,6 +1848,11 @@ EOF
 
 configure_sshd() {
     step "5.3 OpenSSH server lockdown (FIPS algorithms)"
+    if ! ssh_admin; then
+        pkg_installed openssh-server && die "ADMIN_ACCESS=none but openssh-server is still installed"
+        log "ADMIN_ACCESS=none: no SSH server is installed; nothing to configure"
+        return 0
+    fi
     local cfg=/etc/ssh/sshd_config
     [[ -f $cfg ]] || die "${cfg} missing"
     backup_file "$cfg"
@@ -2169,7 +2293,110 @@ EOF
     printf 'Authorized use only. All activity may be monitored and reported.\n' | write_file 0644 /etc/motd
     # Dynamic MOTD must not disclose kernel/OS details.
     [[ -f /etc/update-motd.d/10-uname ]] && chmod 0644 /etc/update-motd.d/10-uname
+    if is_workstation; then
+        configure_gdm "$banner"
+    fi
     return 0
+}
+
+# configure_gdm BANNER - the graphical login and session policy of a
+# workstation (CIS L2 Workstation 1.7.x): the banner on the GDM login screen,
+# no user list, no XDMCP, the screen locked after at most 15 idle minutes,
+# no automount or autorun of removable media - each value locked so a user
+# cannot change it. Written as dconf system databases (/etc/dconf/db/*.d),
+# the layout the SSG checks read, then compiled with `dconf update`.
+configure_gdm() {
+    local banner=$1
+    if ! pkg_installed gdm3; then
+        log "HARDEN_PROFILE=workstation: gdm3 is not installed; the GDM and session policy is written for when it is"
+    fi
+    install -d -m 0755 /etc/dconf/profile /etc/dconf/db/gdm.d/locks /etc/dconf/db/local.d/locks
+    write_file 0644 /etc/dconf/profile/gdm <<'EOF'
+user-db:user
+system-db:gdm
+file-db:/usr/share/gdm/greeter-dconf-defaults
+EOF
+    write_file 0644 /etc/dconf/profile/user <<'EOF'
+user-db:user
+system-db:local
+EOF
+    # GVariant string: backslash and single quote escaped, newlines as \n.
+    local text
+    text=$(printf '%s' "$banner" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g" | awk 'BEGIN{ORS=""} NR>1{print "\\n"} {print}')
+    write_file 0644 /etc/dconf/db/gdm.d/00-harden-login-screen <<EOF
+# Managed by ${SCRIPT_NAME}
+[org/gnome/login-screen]
+banner-message-enable=true
+banner-message-text='${text}'
+disable-user-list=true
+EOF
+    write_file 0644 /etc/dconf/db/gdm.d/locks/00-harden-login-screen <<'EOF'
+/org/gnome/login-screen/banner-message-enable
+/org/gnome/login-screen/banner-message-text
+/org/gnome/login-screen/disable-user-list
+EOF
+    write_file 0644 /etc/dconf/db/local.d/00-harden-session <<'EOF'
+# Managed by harden-and-audit.sh
+[org/gnome/desktop/session]
+idle-delay=uint32 900
+
+[org/gnome/desktop/screensaver]
+idle-activation-enabled=true
+lock-enabled=true
+lock-delay=uint32 5
+
+[org/gnome/desktop/media-handling]
+automount=false
+automount-open=false
+autorun-never=true
+EOF
+    write_file 0644 /etc/dconf/db/local.d/locks/00-harden-session <<'EOF'
+/org/gnome/desktop/session/idle-delay
+/org/gnome/desktop/screensaver/idle-activation-enabled
+/org/gnome/desktop/screensaver/lock-enabled
+/org/gnome/desktop/screensaver/lock-delay
+/org/gnome/desktop/media-handling/automount
+/org/gnome/desktop/media-handling/automount-open
+/org/gnome/desktop/media-handling/autorun-never
+EOF
+    # The vendor greeter defaults carry a commented banner; the SSG check
+    # also reads this file, so the same banner is written there.
+    if [[ -d /etc/gdm3 ]]; then
+        local g=/etc/gdm3/greeter.dconf-defaults
+        [[ -f $g ]] || install -m 0644 /dev/null "$g"
+        backup_file "$g"
+        local tmp
+        tmp=$(mktemp "${g}.XXXXXX")
+        awk -v text="$text" '
+            /^[[:space:]]*#?[[:space:]]*(banner-message-enable|banner-message-text|disable-user-list)[[:space:]]*=/ { next }
+            { print }
+            /^\[org\/gnome\/login-screen\]/ { print "banner-message-enable=true"; print "banner-message-text='\''" text "'\''"; print "disable-user-list=true"; done=1 }
+            END { if (!done) { print "[org/gnome/login-screen]"; print "banner-message-enable=true"; print "banner-message-text='\''" text "'\''"; print "disable-user-list=true" } }
+        ' "$g" >"$tmp"
+        chmod 0644 "$tmp"
+        mv -f "$tmp" "$g"
+        # No XDMCP (remote X login).
+        local c=/etc/gdm3/custom.conf
+        [[ -f $c ]] || printf '[daemon]\n\n[security]\n\n[xdmcp]\n' | write_file 0644 "$c"
+        backup_file "$c"
+        tmp=$(mktemp "${c}.XXXXXX")
+        awk '
+            /^\[xdmcp\]/ { print; print "Enable=false"; insec=1; done=1; next }
+            /^\[/ { insec=0 }
+            insec && /^[[:space:]]*#?[[:space:]]*Enable[[:space:]]*=/ { next }
+            { print }
+            END { if (!done) { print ""; print "[xdmcp]"; print "Enable=false" } }
+        ' "$c" >"$tmp"
+        chmod 0644 "$tmp"
+        mv -f "$tmp" "$c"
+    fi
+    if command -v dconf >/dev/null 2>&1; then
+        chmod -R u=rwX,go=rX /etc/dconf/profile /etc/dconf/db
+        (umask 0022 && dconf update)
+        log "GDM banner, user list, XDMCP, screen lock and media policy applied (dconf)"
+    else
+        warn "dconf is not installed: the GDM and session policy is written but not compiled"
+    fi
 }
 
 configure_kernel_modules() {
@@ -2500,6 +2727,27 @@ configure_fail2ban() {
     step "5.15 fail2ban (SSH brute-force protection)"
     local ports
     ports=$(IFS=,; echo "${SSH_PORTS[*]}")
+    if ! ssh_admin; then
+        # No SSH server: the stock sshd jail would watch a service that does
+        # not exist. fail2ban stays installed and running for any jail a
+        # site adds; this file switches the sshd jail off explicitly.
+        write_file 0644 /etc/fail2ban/jail.d/60-harden.local <<EOF
+# Managed by ${SCRIPT_NAME} (ADMIN_ACCESS=none: no SSH server)
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+backend  = systemd
+ignoreip = 127.0.0.1/8 ::1 ${FAIL2BAN_IGNOREIP}
+
+[sshd]
+enabled  = false
+EOF
+        fail2ban-client -t >/dev/null || die "fail2ban configuration test failed"
+        systemctl enable fail2ban.service >/dev/null 2>&1 || true
+        systemctl restart fail2ban.service
+        return 0
+    fi
     write_file 0644 /etc/fail2ban/jail.d/60-harden.local <<EOF
 # Managed by ${SCRIPT_NAME}
 [DEFAULT]
@@ -2736,7 +2984,7 @@ provision_media_coturn_libs() {
     [[ ${#missing[@]} -gt 0 ]] && warn "media libraries unavailable on this release: ${missing[*]}"
     apt_install "${pkgs[@]}"
     apt-mark manual "${pkgs[@]}" >/dev/null
-    if pkg_installed libx11-6 && ! apt-get -s purge libx11-6 2>/dev/null | awk '/^Purg /{print $2}' | qgrep -Ev '^(libx11-6|libx11-xcb1)$'; then
+    if ! is_workstation && pkg_installed libx11-6 && ! apt-get -s purge libx11-6 2>/dev/null | awk '/^Purg /{print $2}' | qgrep -Ev '^(libx11-6|libx11-xcb1)$'; then
         warn "libx11-6 is still installed only because a non-graphical package depends on it"
     fi
     log "installed ${#pkgs[@]} media/coturn runtime libraries"
@@ -3151,6 +3399,9 @@ main() {
     done
 
     [[ $PROGRESS_INTERVAL =~ ^[1-9][0-9]*$ ]] || { echo "PROGRESS_INTERVAL must be a positive number of seconds" >&2; exit 64; }
+    [[ $HARDEN_PROFILE == server || $HARDEN_PROFILE == workstation ]] || { echo "HARDEN_PROFILE must be server or workstation" >&2; exit 64; }
+    [[ $ADMIN_ACCESS == ssh || $ADMIN_ACCESS == none ]] || { echo "ADMIN_ACCESS must be ssh or none" >&2; exit 64; }
+    [[ $WORKSTATION_BLUETOOTH == off || $WORKSTATION_BLUETOOTH == on ]] || { echo "WORKSTATION_BLUETOOTH must be off or on" >&2; exit 64; }
     preflight_root
     install -d -m 0700 -o root -g root "$BACKUP_DIR"
     touch "$LOG_FILE"
@@ -3170,6 +3421,10 @@ main() {
     # harden_file_permissions running twice. tests/assertions.sh checks that
     # the final step number equals this total.
     STEP_TOTAL=$(( $(grep -c '^[[:space:]]*step "' "${BASH_SOURCE[0]}") - 1 + 2 ))
+
+    log "host profile: HARDEN_PROFILE=${HARDEN_PROFILE} ADMIN_ACCESS=${ADMIN_ACCESS} SCAP_PROFILE=${SCAP_PROFILE}"
+    printf 'HARDEN_PROFILE=%s\nADMIN_ACCESS=%s\n' "$HARDEN_PROFILE" "$ADMIN_ACCESS" >"${STATE_DIR}/profile.env"
+    chmod 0600 "${STATE_DIR}/profile.env"
 
     preflight_admin
     detect_ssh_ports

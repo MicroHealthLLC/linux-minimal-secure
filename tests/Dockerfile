@@ -8,6 +8,9 @@
 # prove the purge never takes collateral packages with it.
 ARG BASE_IMAGE=debian:12
 FROM ${BASE_IMAGE}
+# 1 = also seed a Wayland workstation (GDM, Xwayland, Mesa, PipeWire, BlueZ,
+# NetworkManager) for the HARDEN_PROFILE=workstation leg; it must survive.
+ARG SEED_WORKSTATION=0
 
 ENV container=docker \
     DEBIAN_FRONTEND=noninteractive
@@ -38,6 +41,11 @@ RUN set -eux; \
         xserver-xorg-core xauth xterm x11-utils \
         inetutils-telnet rpcbind \
         "${avcodec}"; \
+    if [ "$SEED_WORKSTATION" = 1 ]; then \
+        apt-get install -y --no-install-recommends \
+            gdm3 xwayland libgl1-mesa-dri libegl1 libgbm1 pipewire wireplumber \
+            bluez network-manager fonts-dejavu-core xdg-desktop-portal; \
+    fi; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*; \
     # Docker images forbid service start/stop in maintainer scripts; a server

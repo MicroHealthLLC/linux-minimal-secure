@@ -32,17 +32,29 @@ sysctl_is() { [[ $(eff_sysctl "$1") == "$2" ]]; }
 
 . /etc/os-release
 OS=$ID
-echo "== target: ${PRETTY_NAME}"
+HARDEN_PROFILE=${HARDEN_PROFILE:-server}
+ADMIN_ACCESS=${ADMIN_ACCESS:-ssh}
+WS=0; [[ $HARDEN_PROFILE == workstation ]] && WS=1
+SSH=1; [[ $ADMIN_ACCESS == none ]] && SSH=0
+GATE_PROFILE=cis_level2_server; [[ $WS == 1 ]] && GATE_PROFILE=cis_level2_workstation
+echo "== target: ${PRETTY_NAME} (HARDEN_PROFILE=${HARDEN_PROFILE}, ADMIN_ACCESS=${ADMIN_ACCESS})"
 
 echo "== 1. minimalism"
 check "apt Install-Recommends disabled" bash -c "apt-config dump | grep -Eq 'APT::Install-Recommends \"(0|false)\"'"
 check "apt Install-Suggests disabled"   bash -c "apt-config dump | grep -Eq 'APT::Install-Suggests \"(0|false)\"'"
-for p in xserver-xorg-core xterm xauth x11-utils; do check "graphical package ${p} purged" not_installed "$p"; done
+PURGED=(xserver-xorg-core xterm xauth x11-utils)
+# A workstation keeps xauth: Xwayland's xserver-common depends on it.
+[[ $WS == 1 ]] && PURGED=(xserver-xorg-core xterm x11-utils)
+for p in "${PURGED[@]}"; do check "graphical package ${p} purged" not_installed "$p"; done
 avc=$(dpkg-query -W -f='${Package}\n' 'libavcodec[0-9]*' 2>/dev/null | head -n1)
 check "dependency-aware purge kept non-graphical ${avc:-libavcodec}" installed "${avc:-libavcodec-missing}"
 for p in inetutils-telnet rpcbind; do check "legacy service ${p} purged" not_installed "$p"; done
 check "nothing left listening on the portmapper port 111" bash -c "! ss -Htuln | awk '{print \$5}' | grep -Eq ':111\$'"
-check "default target is multi-user" bash -c "[[ \$(systemctl get-default) == multi-user.target ]]"
+if [[ $WS == 1 ]]; then
+    check "default target is graphical (workstation)" bash -c "[[ \$(systemctl get-default) == graphical.target ]]"
+else
+    check "default target is multi-user" bash -c "[[ \$(systemctl get-default) == multi-user.target ]]"
+fi
 
 echo "== 2. repositories, base stack, unattended upgrades"
 SRC=/etc/apt/sources.list.d/${OS}.sources
@@ -52,7 +64,9 @@ if [[ $OS == ubuntu ]]; then
     check "Ubuntu components main restricted universe multiverse" grep -q '^Components: main restricted universe multiverse$' "$SRC"
     check "no active duplicate official one-line entries" bash -c "! grep -Eq '^[[:space:]]*deb[[:space:]].*ubuntu\.com' /etc/apt/sources.list 2>/dev/null"
 fi
-for p in openssh-server tmux curl git ufw fail2ban libpam-pwquality auditd unattended-upgrades sudo rsyslog aide apparmor; do
+BASE=(tmux curl git ufw fail2ban libpam-pwquality auditd unattended-upgrades sudo rsyslog aide apparmor)
+[[ $SSH == 1 ]] && BASE=(openssh-server "${BASE[@]}")
+for p in "${BASE[@]}"; do
     check "package ${p} installed" installed "$p"
 done
 check "unattended-upgrade enabled daily" bash -c "apt-config dump | grep -q 'APT::Periodic::Unattended-Upgrade \"1\"'"
@@ -142,22 +156,32 @@ if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
     check "runtime net.ipv4.conf.all.accept_redirects = 0" bash -c "[[ \$(sysctl -n net.ipv4.conf.all.accept_redirects) == 0 ]]"
     check "runtime net.ipv4.ip_forward = 0" bash -c "[[ \$(sysctl -n net.ipv4.ip_forward) == 0 ]]"
 fi
-check "sshd config valid"              sshd -t
-check "sshd PermitRootLogin no"        sshd_t 'permitrootlogin no'
-check "sshd X11Forwarding no"          sshd_t 'x11forwarding no'
-check "sshd MaxAuthTries 4"            sshd_t 'maxauthtries 4'
-check "sshd ClientAliveInterval 300"   sshd_t 'clientaliveinterval 300'
-check "sshd ClientAliveCountMax 3"     sshd_t 'clientalivecountmax 3'
-check "sshd FIPS ciphers only"         sshd_t 'ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr'
-check "sshd FIPS MACs only"            sshd_t 'macs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256'
-check "sshd running" systemctl is-active ssh
-check "ANTI-LOCKOUT: sudo admin can still SSH in with a key" \
-    ssh -i /root/ciadmin_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 ciadmin@127.0.0.1 true
-check "root SSH login is rejected" \
-    bash -c "! ssh -i /root/root_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@127.0.0.1 true"
+if [[ $SSH == 1 ]]; then
+    check "sshd config valid"              sshd -t
+    check "sshd PermitRootLogin no"        sshd_t 'permitrootlogin no'
+    check "sshd X11Forwarding no"          sshd_t 'x11forwarding no'
+    check "sshd MaxAuthTries 4"            sshd_t 'maxauthtries 4'
+    check "sshd ClientAliveInterval 300"   sshd_t 'clientaliveinterval 300'
+    check "sshd ClientAliveCountMax 3"     sshd_t 'clientalivecountmax 3'
+    check "sshd FIPS ciphers only"         sshd_t 'ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr'
+    check "sshd FIPS MACs only"            sshd_t 'macs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256'
+    check "sshd running" systemctl is-active ssh
+    check "ANTI-LOCKOUT: sudo admin can still SSH in with a key" \
+        ssh -i /root/ciadmin_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 ciadmin@127.0.0.1 true
+    check "root SSH login is rejected" \
+        bash -c "! ssh -i /root/root_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@127.0.0.1 true"
+else
+    check "ADMIN_ACCESS=none: openssh-server not installed" not_installed openssh-server
+    check "ADMIN_ACCESS=none: nothing listens on port 22" bash -c "! ss -Htln | awk '{print \$4}' | grep -Eq ':22\$'"
+    check "ADMIN_ACCESS=none: ssh units masked" bash -c "[[ \$(systemctl is-enabled ssh.service 2>&1) == masked ]]"
+fi
 check "UFW enabled at boot" bash -c "grep -q '^ENABLED=yes' /etc/ufw/ufw.conf"
 check "UFW default deny incoming" bash -c "grep -q '^DEFAULT_INPUT_POLICY=\"DROP\"' /etc/default/ufw"
-check "UFW SSH allowed" bash -c "grep -Eq -- '--dport 22 -j ACCEPT' /etc/ufw/user.rules"
+if [[ $SSH == 1 ]]; then
+    check "UFW SSH allowed" bash -c "grep -Eq -- '--dport 22 -j ACCEPT' /etc/ufw/user.rules"
+else
+    check "UFW opens no SSH port (ADMIN_ACCESS=none)" bash -c "! grep -Eq -- '--dport 22 -j ACCEPT' /etc/ufw/user.rules"
+fi
 check "UFW does not re-disable martian logging" bash -c "grep -q '^net/ipv4/conf/all/log_martians=1' /etc/ufw/sysctl.conf"
 check "login.defs has no unknown items" bash -c "! chage -l root 2>&1 | grep -q 'configuration error'"
 if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
@@ -180,7 +204,11 @@ if [[ $OS == ubuntu ]]; then
     check "whoopsie not installed" not_installed whoopsie
     check "motd-news disabled" bash -c "[[ ! -f /etc/default/motd-news ]] || grep -q '^ENABLED=0' /etc/default/motd-news"
 fi
-check "fail2ban sshd jail active" bash -c "fail2ban-client status sshd"
+if [[ $SSH == 1 ]]; then
+    check "fail2ban sshd jail active" bash -c "fail2ban-client status sshd"
+else
+    check "fail2ban sshd jail switched off (no SSH server)" grep -Pzq '\[sshd\]\nenabled  = false' /etc/fail2ban/jail.d/60-harden.local
+fi
 
 check "AIDE watches the audit tools in aide.conf" grep -q '^/usr/sbin/auditctl p+i+n+u+g+s+b+acl+selinux+xattrs+sha512$' /etc/aide/aide.conf
 check "AIDE configuration valid" aide --config-check --config /etc/aide/aide.conf
@@ -224,7 +252,7 @@ USED=$(du -sxb /var/log | cut -f1)
 check "budget prunes the oldest rotated archive" test ! -e "$BT/old.log.1"
 check "budget never touches a live log"         test -e "$BT/live.log"
 rm -rf "$BT"
-check "OpenSCAP closing line reports n/N rules"  grep -Eq '\] OpenSCAP cis_level2_server: completed in [0-9hms]+ \(exit [02]\) - [0-9]+/[0-9]+ rules \([0-9]+%\)' /var/log/harden-and-audit.log
+check "OpenSCAP closing line reports n/N rules"  grep -Eq "\] OpenSCAP ${GATE_PROFILE}: completed in [0-9hms]+ \(exit [02]\) - [0-9]+/[0-9]+ rules \([0-9]+%\)" /var/log/harden-and-audit.log
 check "step counter total is exact"             bash -c "grep -E '\[STEP [0-9]+/[0-9]+\] ===== done =====' /var/log/harden-and-audit.log | tail -n1 | grep -Eq '\[STEP ([0-9]+)/\1\]'"
 
 echo "== 6. CUDA prerequisites and media/coturn libraries"
@@ -238,11 +266,41 @@ for r in '^libx264-[0-9]+$' '^libx265-[0-9]+$' '^libvpx[0-9]+' '^libdav1d[0-9]+$
     check "media/coturn lib ${r}" installed_like "$r"
 done
 check "libevent openssl (coturn TLS) present" bash -c "dpkg-query -W -f='\${db:Status-Status}\n' 'libevent-openssl-2.1-7*' | grep -q installed"
-check "no X server present" bash -c "! dpkg-query -W -f='\${db:Status-Status} \${Package}\n' 'xserver-*' 2>/dev/null | grep -q '^installed'"
+if [[ $WS == 1 ]]; then
+    # Xwayland's xserver-common stays; the X.Org server itself must not.
+    check "no X.Org server present" bash -c "! dpkg-query -W -f='\${db:Status-Status} \${Package}\n' 'xserver-xorg*' 2>/dev/null | grep -q '^installed'"
+else
+    check "no X server present" bash -c "! dpkg-query -W -f='\${db:Status-Status} \${Package}\n' 'xserver-*' 2>/dev/null | grep -q '^installed'"
+fi
 
 echo "== 6b. no stray backups inside include directories"
 check "no backup copies inside *.d / grub.d directories" bash -c "! find /etc -path '*.d/*' \( -name '*.pre-harden' -o -name '*.bak' \) | grep -q ."
-check "originals backed up under /var/backups/harden-and-audit" test -f /var/backups/harden-and-audit/etc/ssh/sshd_config
+if [[ $SSH == 1 ]]; then
+    check "originals backed up under /var/backups/harden-and-audit" test -f /var/backups/harden-and-audit/etc/ssh/sshd_config
+else
+    check "originals backed up under /var/backups/harden-and-audit" test -f /var/backups/harden-and-audit/etc/ssl/openssl.cnf
+fi
+
+if [[ $WS == 1 ]]; then
+    echo "== 6c. workstation (HARDEN_PROFILE=workstation)"
+    for p in gdm3 xwayland pipewire wireplumber bluez network-manager libgl1-mesa-dri libgbm1 dconf-cli; do
+        check "workstation package ${p} kept" installed "$p"
+    done
+    check "X.Org server still removed (Wayland session)" not_installed xserver-xorg-core
+    check "xterm removed" not_installed xterm
+    check "GDM banner enabled (dconf)"      grep -q '^banner-message-enable=true' /etc/dconf/db/gdm.d/00-harden-login-screen
+    check "GDM banner is the DoD notice"    grep -q "^banner-message-text='You are accessing a U.S. Government" /etc/dconf/db/gdm.d/00-harden-login-screen
+    check "GDM user list disabled"          grep -q '^disable-user-list=true' /etc/dconf/db/gdm.d/00-harden-login-screen
+    check "GDM login-screen keys locked"    grep -qx '/org/gnome/login-screen/banner-message-text' /etc/dconf/db/gdm.d/locks/00-harden-login-screen
+    check "XDMCP disabled"                  bash -c "awk '/^\\[xdmcp\\]/{x=1;next} /^\\[/{x=0} x && /^Enable=false\$/{f=1} END{exit !f}' /etc/gdm3/custom.conf"
+    check "idle delay 900 s, locked"        bash -c "grep -q '^idle-delay=uint32 900' /etc/dconf/db/local.d/00-harden-session && grep -qx '/org/gnome/desktop/session/idle-delay' /etc/dconf/db/local.d/locks/00-harden-session"
+    check "screen lock enabled, locked"     bash -c "grep -q '^lock-enabled=true' /etc/dconf/db/local.d/00-harden-session && grep -qx '/org/gnome/desktop/screensaver/lock-enabled' /etc/dconf/db/local.d/locks/00-harden-session"
+    check "automount and autorun off"       bash -c "grep -q '^automount=false' /etc/dconf/db/local.d/00-harden-session && grep -q '^autorun-never=true' /etc/dconf/db/local.d/00-harden-session"
+    check "dconf databases compiled"        bash -c "test -s /etc/dconf/db/gdm && test -s /etc/dconf/db/local"
+    check "bluetooth.service masked (WORKSTATION_BLUETOOTH=off)" bash -c "[[ \$(systemctl is-enabled bluetooth.service 2>&1) == masked ]]"
+    check "usb-storage still blacklisted"   grep -q '^install usb-storage /bin/false' /etc/modprobe.d/60-harden-blacklist.conf
+    check "host profile remembered for --scan-only" grep -qx 'HARDEN_PROFILE=workstation' /var/lib/harden-and-audit/profile.env
+fi
 
 echo "== 7. OpenSCAP"
 if [[ $OS == debian ]]; then

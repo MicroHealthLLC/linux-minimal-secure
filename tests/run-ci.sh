@@ -18,6 +18,9 @@
 #   OUT_DIR         artifact directory (default ./artifacts/<distro><ver>)
 #   SCAP_EXTRA      informational profile(s) (default: anssi_bp28_high on
 #                   Debian, stig on Ubuntu)
+#   HARDEN_PROFILE  server (default) | workstation: seeds a GDM/Wayland
+#                   desktop that must survive, gates on CIS L2 Workstation
+#   ADMIN_ACCESS    ssh (default) | none: no SSH server, no anti-lockout probe
 # =============================================================================
 set -Eeuo pipefail
 
@@ -32,7 +35,13 @@ case $DISTRO in
     ubuntu) [[ $VER =~ ^[0-9]+\.[0-9]+$ ]] || usage; DEFAULT_EXTRA=stig ;;
     *) usage ;;
 esac
+HARDEN_PROFILE=${HARDEN_PROFILE:-server}
+ADMIN_ACCESS=${ADMIN_ACCESS:-ssh}
+case $HARDEN_PROFILE in server|workstation) ;; *) usage ;; esac
+case $ADMIN_ACCESS in ssh|none) ;; *) usage ;; esac
 TAG="${DISTRO}${VER/./}"                # debian12, ubuntu2404
+[[ $HARDEN_PROFILE == workstation ]] && TAG+="ws"
+[[ $ADMIN_ACCESS == none ]] && TAG+="-nossh"
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMG="dms-test:${TAG}"
 NAME="dms-ci-${TAG}"
@@ -52,7 +61,9 @@ cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 mkdir -p "$OUT_DIR"
 
 log "building test image ${IMG}"
-docker build --build-arg "BASE_IMAGE=${DISTRO}:${VER}" -t "$IMG" "${REPO}/tests"
+seed=0
+[[ $HARDEN_PROFILE == workstation ]] && seed=1
+docker build --build-arg "BASE_IMAGE=${DISTRO}:${VER}" --build-arg "SEED_WORKSTATION=${seed}" -t "$IMG" "${REPO}/tests"
 
 cleanup
 run_flags=(--detach --name "$NAME" --hostname "ci-${TAG}" --tmpfs /run --tmpfs /run/lock
@@ -61,6 +72,12 @@ if [[ $CI_PRIVILEGED == 1 ]]; then
     run_flags+=(--privileged)
 else
     run_flags+=(--cap-add SYS_ADMIN --cap-add NET_ADMIN --cap-add NET_RAW --security-opt apparmor=unconfined)
+fi
+# Podman (also behind a "docker" shim, whose --version says "docker") only
+# mounts a writable cgroup tree for systemd when asked. Docker never gets the
+# flag: its `version` output does not name Podman.
+if docker version 2>/dev/null | grep -qi podman; then
+    run_flags+=(--systemd=always)
 fi
 log "booting container (privileged=${CI_PRIVILEGED})"
 docker run "${run_flags[@]}" "$IMG" >/dev/null
@@ -79,6 +96,7 @@ docker cp "${REPO}/harden-and-audit.sh" "${NAME}:/src/harden-and-audit.sh"
 docker cp "${REPO}/tests" "${NAME}:/src/tests"
 docker exec "$NAME" chown -R root:root /src
 
+if [[ $ADMIN_ACCESS == ssh ]]; then
 log "seeding SSH key for the sudo administrator (anti-lockout probe)"
 docker exec "$NAME" bash -euo pipefail -c '
     apt-get update -qq >/dev/null
@@ -90,6 +108,7 @@ docker exec "$NAME" bash -euo pipefail -c '
     install -d -m 0700 /root/.ssh
     install -m 0600 /root/root_key.pub /root/.ssh/authorized_keys
 '
+fi
 
 run_script() {
     local label=$1
@@ -98,6 +117,8 @@ run_script() {
     docker exec \
         -e SCAP_EXTRA_PROFILES="${SCAP_EXTRA}" \
         -e SCAP_ENFORCE_MIN=0 \
+        -e HARDEN_PROFILE="${HARDEN_PROFILE}" \
+        -e ADMIN_ACCESS="${ADMIN_ACCESS}" \
         -e AIDE_INIT="${AIDE_INIT:-1}" \
         -e PROGRESS_INTERVAL=10 \
         "$NAME" bash /src/harden-and-audit.sh 2>&1 | tee "${OUT_DIR}/harden-${label}.log"
@@ -130,14 +151,14 @@ if [[ $rc -ne 0 ]]; then
 fi
 
 log "functional assertions"
-docker exec -e CI_PRIVILEGED="$CI_PRIVILEGED" "$NAME" bash /src/tests/assertions.sh 2>&1 | tee "${OUT_DIR}/assertions.log"
+docker exec -e CI_PRIVILEGED="$CI_PRIVILEGED" -e HARDEN_PROFILE="$HARDEN_PROFILE" -e ADMIN_ACCESS="$ADMIN_ACCESS" "$NAME" bash /src/tests/assertions.sh 2>&1 | tee "${OUT_DIR}/assertions.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "functional assertions failed" >&2; exit 1; }
 
 if [[ $RUN_TWICE == 1 ]]; then
     AIDE_INIT=0 run_script second
     collect
     log "functional assertions after second run"
-    docker exec -e CI_PRIVILEGED="$CI_PRIVILEGED" "$NAME" bash /src/tests/assertions.sh 2>&1 | tee "${OUT_DIR}/assertions-second.log"
+    docker exec -e CI_PRIVILEGED="$CI_PRIVILEGED" -e HARDEN_PROFILE="$HARDEN_PROFILE" -e ADMIN_ACCESS="$ADMIN_ACCESS" "$NAME" bash /src/tests/assertions.sh 2>&1 | tee "${OUT_DIR}/assertions-second.log"
     [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "functional assertions failed after second run" >&2; exit 1; }
 fi
 
@@ -154,6 +175,8 @@ case $DISTRO in
     debian) os_label="Debian ${VER}" ;;
     ubuntu) os_label="Ubuntu ${VER}" ;;
 esac
+bench="Server"
+[[ $HARDEN_PROFILE == workstation ]] && bench="Workstation"
 profile_label() {
     case $1 in
         anssi_bp28_high) echo "ANSSI BP-028 High" ;;
@@ -167,13 +190,13 @@ awk -v r="$cis_rate" -v m="$SCAP_MIN_SCORE" 'BEGIN { exit !(r+0 >= m+0) }' && ga
 
 extra_note=""
 {
-    echo "### ${os_label} - harden-and-audit.sh"
+    echo "### ${os_label} - harden-and-audit.sh (HARDEN_PROFILE=${HARDEN_PROFILE}, ADMIN_ACCESS=${ADMIN_ACCESS})"
     echo
     note=$(sed -n 's/^content note:[[:space:]]*//p' "$S")
     [[ -n $note ]] && { echo "> ${note}"; echo; }
     echo "| Profile | Pass | Fail | Pass rate | XCCDF score | Gate (≥ ${SCAP_MIN_SCORE}%) |"
     echo "|---|---|---|---|---|---|"
-    echo "| CIS ${os_label} Level 2 Server | ${cis_pass} | ${cis_fail} | **${cis_rate}%** | ${cis_score} | **${gate}** |"
+    echo "| CIS ${os_label} Level 2 ${bench} | ${cis_pass} | ${cis_fail} | **${cis_rate}%** | ${cis_score} | **${gate}** |"
     for p in $SCAP_EXTRA; do
         E="${OUT_DIR}/scap-summary-${p}.txt"
         if [[ -f $E ]]; then
@@ -194,7 +217,7 @@ cat "${OUT_DIR}/summary.md"
 [[ -n ${GITHUB_STEP_SUMMARY:-} ]] && cat "${OUT_DIR}/summary.md" >>"$GITHUB_STEP_SUMMARY"
 
 if [[ $gate != PASS ]]; then
-    echo "CIS Level 2 Server pass rate ${cis_rate}% is below ${SCAP_MIN_SCORE}%" >&2
+    echo "CIS Level 2 ${bench} pass rate ${cis_rate}% is below ${SCAP_MIN_SCORE}%" >&2
     exit 1
 fi
-log "PASS: CIS L2 Server ${cis_rate}% (XCCDF ${cis_score})${extra_note}"
+log "PASS: CIS L2 ${bench} ${cis_rate}% (XCCDF ${cis_score})${extra_note}"

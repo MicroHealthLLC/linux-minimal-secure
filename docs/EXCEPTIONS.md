@@ -119,3 +119,16 @@ All three releases fail the same core set. It falls into the categories already 
 ### 8.3 `ufw_rules_for_open_ports`: a real defect, fixed
 
 The check requires a UFW rule for every non-loopback listener. Inspection of a hardened 24.04 host showed **rpcbind's socket (port 111) still listening** after the script had purged rpcbind. The package's own "stop" was suppressed (a `policy-rc.d`, present in container images and some image-build pipelines), and the script only disabled units whose unit file still existed. UFW kept blocking the port inbound, but a removed service must not keep a socket open. `disable_service` now also stops a unit that is still active after its unit file is gone, the CI image no longer carries `policy-rc.d`, and an assertion verifies nothing listens on port 111. The fix applies to Debian as well.
+
+## 9. Workstation mode (`HARDEN_PROFILE=workstation`)
+
+The gate is **CIS Ubuntu 24.04 Level 2 – Workstation** (`cis_level2_workstation`). In SSG 0.1.82 it selects the Server profile's rules except `package_gdm_removed`, `package_xorg` and `wireless_disable_interfaces`, so every exception in sections 1–8 applies unchanged. The workstation adds:
+
+| Rule | Why it fails | Compensating control |
+|---|---|---|
+| `dconf_gnome_login_banner_text` | The CIS profile's check accepts exactly the text "Authorized uses only. All activity may be monitored and reported." The GDM login screen shows the same **DoD Notice and Consent banner** as `/etc/issue` (STIG), which that check does not accept. Set `BANNER_FILE` to the CIS sentence if your site requires the CIS wording instead. | The banner is enabled and locked (`dconf_gnome_banner_enabled` passes) |
+| `service_bluetooth_disabled` *(only with `WORKSTATION_BLUETOOTH=on`)* | Bluetooth headsets are needed on some laptops. By default the service is disabled and the rule passes; `on` is the site's documented choice. | BlueZ only pairs with user consent; `usb-storage` stays blacklisted |
+
+| `sshd_limit_user_access` *(only with `ADMIN_ACCESS=none`)* | **SSG content defect:** with `openssh-server` removed there is no `sshd_config` and every other `sshd_*` rule is `notapplicable`, but this one still evaluates and fails because it finds no `AllowUsers`/`AllowGroups` line in a file that does not exist. | There is no SSH server, no listener on port 22 and no UFW rule for it (asserted in CI) |
+
+Measured locally (rootless Podman, unprivileged, Ubuntu 24.04, `HARDEN_PROFILE=workstation ADMIN_ACCESS=none`): **CIS L2 Workstation 93.10%** (432 pass, 32 fail, 43 not applicable; DISA STIG 73.52% informational). The unprivileged run also fails the runtime `sysctl_*` rules of §5, which pass in privileged CI, so CI's figure is higher. Every other failure is one of §1–§5 or the table above.

@@ -1,11 +1,11 @@
 # debian-minimal-secure
 
-`harden-and-audit.sh` is a single, unattended Bash script. It turns a stock **Debian 12 (bookworm)**, **Debian 13 (trixie)**, **Ubuntu 22.04 LTS (jammy)**, **Ubuntu 24.04 LTS (noble)** or **Ubuntu 26.04 LTS (resolute)** install into a minimal, FIPS-ready, CIS Level 2 / STIG-aligned headless server, then audits itself with **OpenSCAP**. It writes a machine-readable XML result and a standalone HTML report. The same script detects the distribution; there is no separate Ubuntu edition.
+`harden-and-audit.sh` is a single, unattended Bash script. It turns a stock **Debian 12 (bookworm)**, **Debian 13 (trixie)**, **Ubuntu 22.04 LTS (jammy)**, **Ubuntu 24.04 LTS (noble)** or **Ubuntu 26.04 LTS (resolute)** install into a minimal, FIPS-ready, CIS Level 2 / STIG-aligned headless server — or, with `HARDEN_PROFILE=workstation`, a graphical workstation with GDM (see [Workstation mode](#workstation-mode)) — then audits itself with **OpenSCAP**. It writes a machine-readable XML result and a standalone HTML report. The same script detects the distribution; there is no separate Ubuntu edition.
 
 | | |
 |---|---|
 | Gate profile | **CIS Level 2 – Server** for the running OS (ComplianceAsCode/SSG 0.1.82). Target pass rate ≥ 90%, enforced in CI on Debian 12, 13 and Ubuntu 22.04, 24.04, 26.04 |
-| Measured in CI | Debian 12: **94.46%** · Debian 13: **95.22%** · Ubuntu 22.04: **94.17%** · Ubuntu 24.04: **95.39%** · Ubuntu 26.04: **95.39%** (every remaining failure is explained in [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md)) |
+| Measured in CI | Debian 12: **94.46%** · Debian 13: **95.22%** · Ubuntu 22.04: **94.17%** · Ubuntu 24.04: **95.39%** · Ubuntu 26.04: **95.39%** · Ubuntu 24.04 workstation (CIS L2 *Workstation*, no SSH): **93.10%** measured locally, unprivileged (every remaining failure is explained in [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md)) |
 | Also reported | Debian: ANSSI BP-028 High. Ubuntu: **DISA STIG** (Canonical Ubuntu 22.04 / 24.04 STIG). Both informational; see [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md) |
 | FIPS | Kernel `fips=1` plus the **NIST CMVP validated OpenSSL 3.1.2 FIPS provider (FIPS 140-3, cert #4985)**, active alongside the default provider |
 | Reports | `/var/log/scap-results.xml`, `/var/log/scap-report.html`, `/var/log/scap-summary.txt` |
@@ -45,6 +45,40 @@ The script is built so you cannot lose access to the server:
 
 The CI proves #3: after hardening, the sudo admin must still log in over SSH with a key, and root must be refused.
 
+## Workstation mode
+
+`HARDEN_PROFILE=workstation` hardens a laptop or desktop that keeps its graphical session (built for TueriDesk, a managed travel laptop image). Everything in this README still applies; the differences are:
+
+| Area | Workstation behaviour |
+|---|---|
+| Gate profile | **CIS Level 2 – Workstation** (`cis_level2_workstation`, the default `SCAP_PROFILE` in this mode). It is the Server profile without `package_gdm_removed`, `package_xorg` and `wireless_disable_interfaces` (SSG 0.1.82, Ubuntu 24.04). Gate ≥ 90%, enforced in CI |
+| Kept | GDM (the one display manager), GNOME Shell's components, Wayland/Xwayland, Mesa and the GL/EGL/GBM/DRM libraries, toolkits and fonts, PipeWire/WirePlumber, BlueZ, NetworkManager (Wi-Fi), xdg-desktop-portal. Default target `graphical.target` when GDM is installed |
+| Still removed | The X.Org server and legacy X clients (`xserver-xorg*`, `xorg`, `xinit`, `xterm`, `x11-utils`; `xauth` and `xserver-common` stay as Xwayland's dependencies), every other display manager, full desktop environments (KDE, Xfce, LXDE/LXQt, Cinnamon, MATE, Budgie, Openbox, `ubuntu-desktop`), and every legacy network service as on a server |
+| GDM and session policy | dconf system databases with locks: the login banner (the same banner as `/etc/issue`), no user list, XDMCP off, idle delay 900 s, screen lock on after 5 s, no automount or autorun of removable media. `usb-storage` stays blacklisted |
+| Bluetooth | BlueZ is installed; `bluetooth.service` is **disabled and masked**, as the CIS check requires. `WORKSTATION_BLUETOOTH=on` unmasks and enables it and `service_bluetooth_disabled` then fails (documented exception) |
+| Weekly scan | The profile of the last full run is kept in `/var/lib/harden-and-audit/profile.env`, so `--scan-only` and `scap-audit.timer` scan a workstation with the workstation benchmark |
+
+### No SSH server: `ADMIN_ACCESS=none`
+
+A fleet laptop has no SSH administrator: it is administered by its management agent (TueriDesk: the Tueri Core agent and its access gateway). `ADMIN_ACCESS=none`:
+
+* skips the anti-lockout administrator preflight (there is no SSH session to lose),
+* **removes `openssh-server`** and masks `ssh.service` / `ssh.socket` (the client stays for git),
+* opens no SSH port in UFW and switches fail2ban's sshd jail off,
+* leaves root locked, as always.
+
+The anti-lockout guarantees below are about SSH; with `ADMIN_ACCESS=none` the guarantee is the management agent's, which nothing in this script stops, firewalls or changes. Do not use it on a host you administer over SSH.
+
+### Prebuilt FIPS provider: `FIPS_PREBUILT_DEB`
+
+Building OpenSSL on every laptop is slow. `tools/build-fips-deb.sh` performs the same Security Policy build once (pinned source, `Configure enable-fips`, `make install_fips`) and packages the module as `openssl-fips-provider_3.1.2-1_<arch>.deb`. Its control file records `X-OpenSSL-FIPS-Version` and `X-OpenSSL-Source-SHA256`. With `FIPS_PREBUILT_DEB=/path/to.deb` the script refuses a package whose recorded source SHA-256, version or architecture differs from its own pin, installs it, generates the module configuration on the host with `openssl fipsinstall -self_test_onload`, and requires the load-time self-test (integrity check and KATs) to pass before `openssl.cnf` is validated and activated exactly as after a source build.
+
+```bash
+sudo HARDEN_PROFILE=workstation ADMIN_ACCESS=none \
+     FIPS_PREBUILT_DEB=/var/cache/openssl-fips-provider_3.1.2-1_amd64.deb \
+     bash harden-and-audit.sh
+```
+
 ## What the script does
 
 | Area | Implementation |
@@ -71,7 +105,11 @@ The CI proves #3: after hardening, the sudo admin must still log in over SSH wit
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SCAP_PROFILE` | `cis_level2_server` | Gate profile |
+| `HARDEN_PROFILE` | `server` | `workstation` keeps the GDM/Wayland desktop and gates on CIS L2 Workstation ([Workstation mode](#workstation-mode)) |
+| `ADMIN_ACCESS` | `ssh` | `none` = no SSH server, no SSH preflight (host administered by its management agent) |
+| `WORKSTATION_BLUETOOTH` | `off` | Workstation only: `on` keeps `bluetooth.service` enabled (CIS exception) |
+| `FIPS_PREBUILT_DEB` | *(empty)* | Install the FIPS provider from a `tools/build-fips-deb.sh` package (pin-checked) instead of building it |
+| `SCAP_PROFILE` | `cis_level2_server` (`cis_level2_workstation` with `HARDEN_PROFILE=workstation`) | Gate profile |
 | `SCAP_EXTRA_PROFILES` | *(empty)* | Additional profiles, e.g. `anssi_bp28_high standard` |
 | `SCAP_MIN_SCORE` / `SCAP_ENFORCE_MIN` | `90` / `1` | Exit 3 when the gate profile's pass rate is below the threshold |
 | `SSG_DOWNLOAD` / `SSG_DATASTREAM` | `1` / *(empty)* | Offline/air-gapped: set `SSG_DOWNLOAD=0` and point `SSG_DATASTREAM` at a staged `ssg-debian12-ds.xml` / `ssg-ubuntu2404-ds.xml` |
@@ -119,11 +157,11 @@ AIDE's percentage compares data read against disk space in use, minus the bulk p
 
 * **`integration`** is the default branch. Every push and PR runs [`ci.yml`](.github/workflows/ci.yml):
   1. `bash -n` + ShellCheck.
-  2. A Debian 12 / 13 and Ubuntu 22.04 / 24.04 / 26.04 matrix. The script runs inside a systemd-PID-1 container that looks like a netinst server (kernel, GRUB, an admin user, seeded GUI/legacy packages). The container markers are removed so OpenSCAP scores the full *machine* ruleset rather than skipping it as "container". Ubuntu 26.04 runs on its default uutils (Rust) coreutils.
+  2. A Debian 12 / 13 and Ubuntu 22.04 / 24.04 / 26.04 matrix, plus an Ubuntu 24.04 **workstation** leg (`HARDEN_PROFILE=workstation ADMIN_ACCESS=none`, a seeded GDM/Wayland desktop that must survive, gated on CIS L2 Workstation). The script runs inside a systemd-PID-1 container that looks like a netinst server (kernel, GRUB, an admin user, seeded GUI/legacy packages). The container markers are removed so OpenSCAP scores the full *machine* ruleset rather than skipping it as "container". Ubuntu 26.04 runs on its default uutils (Rust) coreutils.
   3. `tests/assertions.sh` verifies every requirement functionally (auditd policy, FIPS provider, SSH key login still works, root refused, purge, libraries, reports …).
   4. The script runs a **second time** to prove idempotence.
   5. **Gate:** the CIS L2 Server pass rate must be ≥ 90%. The XML/HTML/summary reports are uploaded as build artifacts, and the score table is posted to the job summary.
-* **`main`** is the release line. A merge to `main` re-runs the full CI and then [`release.yml`](.github/workflows/release.yml) publishes `v<VERSION>` with `harden-and-audit.sh`, its `.sha256`, and the CI compliance reports. Bump `VERSION` and `SCRIPT_VERSION` together to cut a new release.
+* **`main`** is the release line. A merge to `main` re-runs the full CI and then [`release.yml`](.github/workflows/release.yml) publishes `v<VERSION>` with `harden-and-audit.sh`, `build-fips-deb.sh`, their `.sha256` files, and the CI compliance reports. Bump `VERSION` and `SCRIPT_VERSION` together to cut a new release.
 
 Run the same test locally (Docker required). The local mode never uses `--privileged`, so your workstation's kernel is untouched:
 
@@ -133,6 +171,7 @@ tests/run-ci.sh debian 13
 tests/run-ci.sh ubuntu 22.04
 tests/run-ci.sh ubuntu 24.04
 tests/run-ci.sh ubuntu 26.04
+HARDEN_PROFILE=workstation ADMIN_ACCESS=none tests/run-ci.sh ubuntu 24.04
 ```
 
 ## Documentation

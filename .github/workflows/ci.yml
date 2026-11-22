@@ -4,7 +4,9 @@
 # is reused by the release workflow on main. Each Debian / Ubuntu release is
 # hardened inside a systemd-booted container that OpenSCAP evaluates as a real
 # machine, then gated on CIS Level 2 Server >= 90%. ANSSI BP-028 High
-# (Debian) and the DISA STIG (Ubuntu) are reported for information.
+# (Debian) and the DISA STIG (Ubuntu) are reported for information. The
+# workstation leg (HARDEN_PROFILE=workstation, ADMIN_ACCESS=none) seeds a
+# GDM/Wayland desktop that must survive and gates on CIS Level 2 Workstation.
 name: ci
 
 on:
@@ -32,14 +34,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: bash syntax
         run: |
-          for f in harden-and-audit.sh tests/*.sh; do bash -n "$f"; done
+          for f in harden-and-audit.sh tests/*.sh tools/*.sh; do bash -n "$f"; done
       - name: shellcheck
         run: |
           docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.11.0 \
-            -x --severity=warning harden-and-audit.sh tests/run-ci.sh tests/assertions.sh tests/container-init.sh
+            -x --severity=warning harden-and-audit.sh tests/run-ci.sh tests/assertions.sh tests/container-init.sh tools/build-fips-deb.sh
 
   harden-and-scan:
-    name: ${{ matrix.distro }} ${{ matrix.version }} - harden + SCAP
+    name: ${{ matrix.distro }} ${{ matrix.version }} ${{ matrix.profile || 'server' }} - harden + SCAP
     needs: lint
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -52,12 +54,15 @@ jobs:
           - { distro: ubuntu, version: "22.04", tag: ubuntu2204 }
           - { distro: ubuntu, version: "24.04", tag: ubuntu2404 }
           - { distro: ubuntu, version: "26.04", tag: ubuntu2604 }
+          - { distro: ubuntu, version: "24.04", tag: ubuntu2404ws-nossh, profile: workstation, admin: none }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: harden, assert, re-run (idempotence), scan, gate
         env:
           CI_PRIVILEGED: "1"
+          HARDEN_PROFILE: ${{ matrix.profile || 'server' }}
+          ADMIN_ACCESS: ${{ matrix.admin || 'ssh' }}
           SCAP_MIN_SCORE: "90"
           OUT_DIR: ${{ github.workspace }}/artifacts/${{ matrix.tag }}
         run: tests/run-ci.sh "${{ matrix.distro }}" "${{ matrix.version }}"
