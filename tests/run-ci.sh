@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tests/run-ci.sh <debian|ubuntu> <version>     e.g. debian 12, ubuntu 24.04
+# tests/run-ci.sh <distro> <version>   e.g. debian 12, ubuntu 24.04, rocky 9,
+#                                       almalinux 10, centos 9 (CentOS Stream)
 # tests/run-ci.sh <12|13>                         (shorthand for debian)
 #
-# End-to-end test of harden-and-audit.sh inside a systemd-booted Debian or
-# Ubuntu container that looks like a netinst server to OpenSCAP:
+# End-to-end test of harden-and-audit.sh inside a systemd-booted container
+# that looks like a minimal server install to OpenSCAP:
 #   1. build + boot the test image          4. functional assertions
 #   2. seed an SSH key for the admin         5. second run (idempotence)
 #   3. run the hardening script              6. SCAP score gate + artifacts
@@ -17,19 +18,31 @@
 #   RUN_TWICE       1 = re-run the script to prove idempotence (default 1)
 #   OUT_DIR         artifact directory (default ./artifacts/<distro><ver>)
 #   SCAP_EXTRA      informational profile(s) (default: anssi_bp28_high on
-#                   Debian, stig on Ubuntu)
+#                   Debian, stig on Ubuntu and the RHEL family)
 # =============================================================================
 set -Eeuo pipefail
 
-usage() { echo "usage: tests/run-ci.sh <debian|ubuntu> <version>   (or: tests/run-ci.sh <12|13>)" >&2; exit 64; }
+usage() { echo "usage: tests/run-ci.sh <debian|ubuntu|rocky|almalinux|centos> <version>   (or: tests/run-ci.sh <12|13>)" >&2; exit 64; }
 case $# in
     1) DISTRO=debian; VER=$1 ;;
     2) DISTRO=$1; VER=$2 ;;
     *) usage ;;
 esac
+FAMILY=deb
+DOCKERFILE=Dockerfile
+BASE_IMAGE="${DISTRO}:${VER}"
 case $DISTRO in
     debian) [[ $VER =~ ^[0-9]+$ ]] || usage; DEFAULT_EXTRA=anssi_bp28_high ;;
     ubuntu) [[ $VER =~ ^[0-9]+\.[0-9]+$ ]] || usage; DEFAULT_EXTRA=stig ;;
+    rocky|almalinux|centos)
+        [[ $VER =~ ^[0-9]+$ ]] || usage
+        FAMILY=rhel; DOCKERFILE=Dockerfile.el; DEFAULT_EXTRA=stig
+        case $DISTRO in
+            rocky)     BASE_IMAGE="rockylinux/rockylinux:${VER}" ;;
+            almalinux) BASE_IMAGE="almalinux:${VER}" ;;
+            centos)    BASE_IMAGE="quay.io/centos/centos:stream${VER}" ;;
+        esac
+        ;;
     *) usage ;;
 esac
 TAG="${DISTRO}${VER/./}"                # debian12, ubuntu2404
@@ -52,7 +65,7 @@ cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 mkdir -p "$OUT_DIR"
 
 log "building test image ${IMG}"
-docker build --build-arg "BASE_IMAGE=${DISTRO}:${VER}" -t "$IMG" "${REPO}/tests"
+docker build --build-arg "BASE_IMAGE=${BASE_IMAGE}" -f "${REPO}/tests/${DOCKERFILE}" -t "$IMG" "${REPO}/tests"
 
 cleanup
 run_flags=(--detach --name "$NAME" --hostname "ci-${TAG}" --tmpfs /run --tmpfs /run/lock
@@ -60,7 +73,9 @@ run_flags=(--detach --name "$NAME" --hostname "ci-${TAG}" --tmpfs /run --tmpfs /
 if [[ $CI_PRIVILEGED == 1 ]]; then
     run_flags+=(--privileged)
 else
-    run_flags+=(--cap-add SYS_ADMIN --cap-add NET_ADMIN --cap-add NET_RAW --security-opt apparmor=unconfined)
+    # DAC_READ_SEARCH: EL's unix_chkpwd keeps only this capability to read the
+    # 0000 shadow file; without it PAM's account phase denies every login.
+    run_flags+=(--cap-add SYS_ADMIN --cap-add NET_ADMIN --cap-add NET_RAW --cap-add DAC_READ_SEARCH --security-opt apparmor=unconfined)
 fi
 log "booting container (privileged=${CI_PRIVILEGED})"
 docker run "${run_flags[@]}" "$IMG" >/dev/null
@@ -80,9 +95,13 @@ docker cp "${REPO}/tests" "${NAME}:/src/tests"
 docker exec "$NAME" chown -R root:root /src
 
 log "seeding SSH key for the sudo administrator (anti-lockout probe)"
-docker exec "$NAME" bash -euo pipefail -c '
-    apt-get update -qq >/dev/null
-    apt-get install -y -qq --no-install-recommends openssh-client >/dev/null
+docker exec -e FAMILY="$FAMILY" "$NAME" bash -euo pipefail -c '
+    if [ "$FAMILY" = rhel ]; then
+        dnf -y -q install openssh-clients >/dev/null
+    else
+        apt-get update -qq >/dev/null
+        apt-get install -y -qq --no-install-recommends openssh-client >/dev/null
+    fi
     install -d -m 0700 -o ciadmin -g ciadmin /home/ciadmin/.ssh
     ssh-keygen -q -t ecdsa -b 384 -N "" -f /root/ciadmin_key
     install -m 0600 -o ciadmin -g ciadmin /root/ciadmin_key.pub /home/ciadmin/.ssh/authorized_keys
@@ -151,8 +170,11 @@ cis_score=$(field xccdf_score "$S")
 cis_pass=$(field pass "$S")
 cis_fail=$(field fail "$S")
 case $DISTRO in
-    debian) os_label="Debian ${VER}" ;;
-    ubuntu) os_label="Ubuntu ${VER}" ;;
+    debian)    os_label="Debian ${VER}" ;;
+    ubuntu)    os_label="Ubuntu ${VER}" ;;
+    rocky)     os_label="Rocky Linux ${VER}" ;;
+    almalinux) os_label="AlmaLinux ${VER}" ;;
+    centos)    os_label="CentOS Stream ${VER}" ;;
 esac
 profile_label() {
     case $1 in

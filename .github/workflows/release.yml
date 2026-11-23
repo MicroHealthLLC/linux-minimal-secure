@@ -2,7 +2,8 @@
 #
 # Every push to main re-runs the full CI matrix; if it passes, the script is
 # published as a GitHub Release (tag v<VERSION>) with its SHA-256 checksum
-# and the CI compliance reports for Debian 12/13 and Ubuntu 22.04/24.04/26.04.
+# and the CI compliance reports for Debian 12/13, Ubuntu 22.04/24.04/26.04,
+# Rocky Linux and AlmaLinux 8/9/10 and CentOS Stream 9/10.
 # A VERSION that is already released is skipped, never overwritten.
 name: release
 
@@ -72,9 +73,9 @@ jobs:
             done
           done
           {
-            echo "## harden-and-audit.sh v${{ steps.version.outputs.version }}"
+            echo "## linux-minimal-secure (harden-and-audit.sh) v${{ steps.version.outputs.version }}"
             echo
-            echo "FIPS-ready, CIS Level 2 hardened headless Debian 12 / 13 and Ubuntu 22.04 / 24.04 / 26.04 server transformation with an OpenSCAP self-audit."
+            echo "FIPS-ready, CIS Level 2 hardened headless server transformation with an OpenSCAP self-audit. The distribution is detected: Debian 12 / 13, Ubuntu 22.04 / 24.04 / 26.04, and the RHEL family (RHEL, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux 8 / 9 / 10)."
             echo
             echo "### Install"
             echo '```bash'
@@ -101,6 +102,6 @@ jobs:
           v=v${{ steps.version.outputs.version }}
           gh release create "$v" \
             --target "$GITHUB_SHA" \
-            --title "harden-and-audit $v" \
+            --title "linux-minimal-secure $v" \
             --notes-file dist/RELEASE_NOTES.md \
             dist/harden-and-audit.sh dist/harden-and-audit.sh.sha256 dist/*-scap-*.html dist/*-scap-*.txt
