@@ -223,6 +223,22 @@ if ! ssh -i /root/ciadmin_key -o BatchMode=yes -o StrictHostKeyChecking=no -o Us
     journalctl -u sshd -u ssh --no-pager -n 12 2>/dev/null | sed 's/^/    /'
     tail -n 8 /var/log/secure /var/log/auth.log 2>/dev/null | sed 's/^/    /'
     getenforce 2>/dev/null | sed 's/^/    selinux: /'
+    if rhel; then
+        echo "    --- unix_chkpwd as root: rc $(/usr/sbin/unix_chkpwd ciadmin chkexpiry >/dev/null 2>&1; echo $?)"
+        stat -c '    shadow: %U:%G %a' /etc/shadow; lsattr /etc/shadow 2>&1 | sed 's/^/    /'
+        dnf -y -q install strace >/dev/null 2>&1 && strace -f -e trace=openat,capset,prctl /usr/sbin/unix_chkpwd ciadmin chkexpiry 2>&1 | grep -E 'shadow|capset|prctl' | sed 's/^/    strace: /'
+        sp=$(systemctl show -p MainPID --value sshd); grep -E '^Cap(Bnd|Eff)' "/proc/${sp}/status" 2>/dev/null | sed 's/^/    sshd /'
+        cat /proc/sys/kernel/cap_last_cap | sed 's/^/    cap_last_cap: /'
+        for kv in fs.protected_regular=0 fs.protected_fifos=0 fs.suid_dumpable=1 kernel.yama.ptrace_scope=0 \
+                  kernel.dmesg_restrict=0 kernel.kptr_restrict=0 kernel.perf_event_paranoid=2 vm.mmap_min_addr=4096; do
+            old=$(sysctl -n "${kv%%=*}" 2>/dev/null)
+            sysctl -q -w "$kv" >/dev/null 2>&1 || continue
+            if ssh -i /root/ciadmin_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 ciadmin@127.0.0.1 true >/dev/null 2>&1; then
+                echo "    >>> login works after sysctl ${kv} (was ${old})"
+            fi
+            sysctl -q -w "${kv%%=*}=${old}" >/dev/null 2>&1
+        done
+    fi
 fi
 check "root SSH login is rejected" \
     bash -c "! ssh -i /root/root_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@127.0.0.1 true"

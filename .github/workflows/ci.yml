@@ -28,10 +28,19 @@ concurrency:
 
 jobs:
   lint:
-    name: shellcheck
+    name: shellcheck + security
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0          # full history for the secret scan
+      - name: secret scan (gitleaks, full history)
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" zricethezav/gitleaks:v8.21.2 git /repo --no-banner --redact
+      - name: workflow security audit (zizmor)
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" -w /repo ghcr.io/zizmorcore/zizmor:1.5.2 --offline .github/workflows
       - name: bash syntax
         run: |
           for f in harden-and-audit.sh tests/*.sh; do bash -n "$f"; done
@@ -64,6 +73,8 @@ jobs:
           - { distro: centos,    version: "10", tag: centos10 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: harden, assert, re-run (idempotence), scan, gate
         env:

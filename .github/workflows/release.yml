@@ -33,6 +33,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: read and verify version
         id: version
@@ -61,6 +62,8 @@ jobs:
 
       - name: build release assets
         if: steps.version.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -73,14 +76,14 @@ jobs:
             done
           done
           {
-            echo "## linux-minimal-secure (harden-and-audit.sh) v${{ steps.version.outputs.version }}"
+            echo "## linux-minimal-secure (harden-and-audit.sh) v${VERSION}"
             echo
             echo "FIPS-ready, CIS Level 2 hardened headless server transformation with an OpenSCAP self-audit. The distribution is detected: Debian 12 / 13, Ubuntu 22.04 / 24.04 / 26.04, and the RHEL family (RHEL, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux 8 / 9 / 10)."
             echo
             echo "### Install"
             echo '```bash'
-            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${{ steps.version.outputs.version }}/harden-and-audit.sh"
-            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${{ steps.version.outputs.version }}/harden-and-audit.sh.sha256"
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/harden-and-audit.sh"
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/harden-and-audit.sh.sha256"
             echo "sha256sum -c harden-and-audit.sh.sha256 && sudo bash harden-and-audit.sh"
             echo '```'
             echo
@@ -97,9 +100,10 @@ jobs:
         if: steps.version.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          v=v${{ steps.version.outputs.version }}
+          v=v${VERSION}
           gh release create "$v" \
             --target "$GITHUB_SHA" \
             --title "linux-minimal-secure $v" \
