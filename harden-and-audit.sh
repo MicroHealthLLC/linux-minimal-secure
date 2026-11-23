@@ -56,7 +56,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${PASS_WARN_AGE:=7}"
 : "${ACCOUNT_INACTIVE_DAYS:=45}"
 : "${SHELL_TMOUT:=900}"
-: "${SSH_LOGLEVEL:=INFO}"            # INFO satisfies CIS/SSG; VERBOSE also logs key fingerprints
+: "${SSH_LOGLEVEL:=}"                # empty = INFO (Debian family CIS) / VERBOSE (EL CIS: logs key fingerprints)
 : "${FAILLOCK_DENY:=4}"
 : "${FAILLOCK_UNLOCK_TIME:=900}"
 : "${ALLOW_CONTAINERS:=0}"           # 1 keeps overlayfs + IPv4 forwarding for Docker/Podman hosts
@@ -542,6 +542,9 @@ preflight_os() {
     esac
     if [[ -z $SCAP_PROFILE ]]; then
         if is_rhel; then SCAP_PROFILE=cis; else SCAP_PROFILE=cis_level2_server; fi
+    fi
+    if [[ -z $SSH_LOGLEVEL ]]; then
+        if is_rhel; then SSH_LOGLEVEL=VERBOSE; else SSH_LOGLEVEL=INFO; fi
     fi
     if is_rhel; then
         case $(uname -m) in
@@ -1036,6 +1039,10 @@ install_base_stack_rhel() {
         audit rsyslog rsyslog-gnutls logrotate cronie acl unzip perl procps-ng iproute kmod e2fsprogs chrony
         dnf-automatic sudo policycoreutils policycoreutils-python-utils selinux-policy-targeted
         crypto-policies-scripts authselect grubby python3-systemd) opt
+    # CIS EL: systemd-journal-remote available, a local-only MTA (postfix).
+    for opt in systemd-journal-remote postfix; do
+        pkg_candidate "$opt" && pkgs+=("$opt")
+    done
     # EL9+ images ship curl-minimal, which conflicts with curl: keep either.
     pkg_installed curl-minimal || pkg_installed curl || pkgs+=(curl)
     # audit 4 (EL10) splits augenrules' default rules into audit-rules.
@@ -1380,6 +1387,14 @@ done)
 -a always,exit -F path=/usr/bin/chacl -F perm=x -F auid>=${uid} -F auid!=unset -k perm_chng
 -a always,exit -F path=/usr/sbin/usermod -F perm=x -F auid>=${uid} -F auid!=unset -k usermod
 EOF
+    # EL content checks the syscall form of every watch, for both ABIs:
+    # "-a always,exit -F arch=b64 -F path=/etc/passwd -F perm=wa -k identity"
+    # (dir= with a trailing slash for directories).
+    if is_rhel; then
+        install -d -m 0755 /etc/sysconfig/network-scripts
+        install -d -m 0755 /var/run/faillock
+        audit_watches_to_syscall ${rules_dir}/50-harden.rules
+    fi
     # Syscalls added in Linux 6.6 (fchmodat2) / 3.15 (renameat2): emitted only
     # for the architectures whose syscall table the installed audit userspace
     # knows (fchmodat2 is unknown before audit 4.x, e.g. Ubuntu 22.04/24.04).
@@ -1455,6 +1470,25 @@ EOF
     else
         systemctl start auditd.service
     fi
+}
+
+# audit_watches_to_syscall FILE - rewrite "-w PATH -p PERM -k KEY" lines.
+audit_watches_to_syscall() {
+    local file=$1 tmp line path perm key field
+    tmp=$(mktemp)
+    while IFS= read -r line; do
+        if [[ $line =~ ^-w[[:space:]]+([^[:space:]]+)[[:space:]]+-p[[:space:]]+([rwxa]+)[[:space:]]+-k[[:space:]]+([^[:space:]]+) ]]; then
+            path=${BASH_REMATCH[1]}; perm=${BASH_REMATCH[2]}; key=${BASH_REMATCH[3]}
+            field=path
+            if [[ $path == */ || -d $path ]]; then field=dir; path=${path%/}/; fi
+            echo "-a always,exit -F arch=b64 -F ${field}=${path} -F perm=${perm} -k ${key}"
+            echo "-a always,exit -F arch=b32 -F ${field}=${path} -F perm=${perm} -k ${key}"
+        else
+            printf '%s\n' "$line"
+        fi
+    done <"$file" >"$tmp"
+    cat "$tmp" >"$file"
+    rm -f "$tmp"
 }
 
 # ============================================================================
@@ -2195,6 +2229,9 @@ configure_sshd() {
     [[ $SSH_DISABLE_PASSWORD == 1 ]] && pwauth="PasswordAuthentication no"
     # Debian family: explicit FIPS algorithms. RHEL family: the system crypto
     # policy (FIPS) governs sshd; CIS fails sshd_config overrides of it.
+    # EL CIS: one unanswered keepalive (300 s) ends the session; Debian/Ubuntu CIS: 3.
+    local alive_max=3
+    is_rhel && alive_max=1
     local crypto=""
     if is_deb; then
         crypto='Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
@@ -2219,7 +2256,7 @@ MaxSessions 10
 MaxStartups 10:30:60
 LoginGraceTime 60
 ClientAliveInterval 300
-ClientAliveCountMax 3
+ClientAliveCountMax ${alive_max}
 HostbasedAuthentication no
 IgnoreRhosts yes
 PermitEmptyPasswords no
@@ -2270,7 +2307,11 @@ EOF
     fi
     mv -f "$tmp" "$cfg"
     # Host keys
-    for f in /etc/ssh/ssh_host_*_key; do chown root:root "$f"; chmod 0600 "$f"; done
+    if is_rhel && getent group ssh_keys >/dev/null; then
+        for f in /etc/ssh/ssh_host_*_key; do chown root:ssh_keys "$f"; chmod 0640 "$f"; done
+    else
+        for f in /etc/ssh/ssh_host_*_key; do chown root:root "$f"; chmod 0600 "$f"; done
+    fi
     for f in /etc/ssh/ssh_host_*_key.pub; do chown root:root "$f"; chmod 0644 "$f"; done
     if is_rhel; then
         # Keys cleared by the crypto policy above stay out of sshd_config.d too.
@@ -2369,8 +2410,13 @@ configure_firewalld() {
     done
     # Loopback: trusted on lo, spoofed 127.0.0.0/8 / ::1 from elsewhere dropped.
     fw --zone=trusted --add-interface=lo 2>/dev/null || true
-    fw --zone="$zone" --add-rich-rule='rule family="ipv4" source address="127.0.0.1" destination not address="127.0.0.1" drop' 2>/dev/null || true
-    fw --zone="$zone" --add-rich-rule='rule family="ipv6" source address="::1" destination not address="::1" drop' 2>/dev/null || true
+    local zr
+    for zr in trusted "$zone"; do
+        fw --zone="$zr" --add-rich-rule='rule family="ipv4" source address="127.0.0.1" destination not address="127.0.0.1" drop' 2>/dev/null || true
+        fw --zone="$zr" --add-rich-rule='rule family="ipv6" source address="::1" destination not address="::1" drop' 2>/dev/null || true
+    done
+    # firewalld drives nftables itself: a second ruleset service would conflict (CIS).
+    systemctl disable --now nftables.service >/dev/null 2>&1 || true
     if [[ $FIREWALL_OUTBOUND_POLICY == deny ]]; then
         local r
         fw --get-policies 2>/dev/null | qgrep -w harden-egress || fw --new-policy=harden-egress
@@ -2495,7 +2541,10 @@ configure_authselect() {
     fi
     for f in system-auth password-auth; do
         [[ -f ${prof}/${f} ]] || continue
-        sed -i -E '/pam_pwhistory\.so/ { /remember=/! s/(pam_pwhistory\.so)/\1 remember=24 enforce_for_root/ }' "${prof}/${f}"
+        # EL9+: pwhistory.conf carries remember/enforce_for_root (CIS checks it there).
+        if (( OS_MAJOR == 8 )); then
+            sed -i -E '/pam_pwhistory\.so/ { /remember=/! s/(pam_pwhistory\.so)/\1 remember=24 enforce_for_root/ }' "${prof}/${f}"
+        fi
         sed -i -E 's/[[:space:]]nullok\b//g' "${prof}/${f}"
     done
     local -a feats=()
@@ -2629,8 +2678,18 @@ configure_login_defs() {
     done < /etc/shadow
 
     # Interactive shells: umask 027, idle timeout.
-    if is_ubuntu || is_rhel; then
-        # The Ubuntu and EL CIS checks expect the POSIX three-line form.
+    if is_rhel; then
+        # The EL CIS check expects "typeset -xr TMOUT=<n>".
+        write_file 0644 /etc/profile.d/60-harden.sh <<EOF
+# Managed by ${SCRIPT_NAME}
+umask 027
+# Idle shell timeout (read-only, exported); skip if already set (re-sourcing).
+if [ -z "\${TMOUT:-}" ]; then
+    typeset -xr TMOUT=${SHELL_TMOUT}
+fi
+EOF
+    elif is_ubuntu; then
+        # The Ubuntu CIS check expects the POSIX three-line form.
         write_file 0644 /etc/profile.d/60-harden.sh <<EOF
 # Managed by ${SCRIPT_NAME}
 umask 027
@@ -2651,6 +2710,11 @@ if [ -n "\${BASH_VERSION:-}" ] && [ -z "\${TMOUT:-}" ]; then
     declare -xr TMOUT=${SHELL_TMOUT}
 fi
 EOF
+    fi
+    if is_rhel && [[ -f /etc/bashrc ]]; then
+        # EL CIS checks every umask in /etc/bashrc (inside its if/else).
+        backup_file /etc/bashrc
+        sed -i -E 's/^([^#]*\bumask)[[:space:]]+[0-7]+/\1 027/' /etc/bashrc
     fi
     for f in /etc/profile /etc/bash.bashrc /etc/bashrc; do
         [[ -f $f ]] || continue
@@ -3342,6 +3406,17 @@ configure_aide_config() {
     aide --config-check --config "$aconf" >/dev/null 2>&1 || die "AIDE configuration check failed"
     # Ubuntu's aide-common ships dailyaidecheck.{service,timer}, which the
     # Ubuntu CIS content checks: use it rather than adding a second check.
+    if is_rhel; then
+        # EL CIS (aide_periodic_cron_checking) checks /etc/crontab.
+        systemctl disable --now aidecheck.timer aidecheck.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/aidecheck.service /etc/systemd/system/aidecheck.timer
+        systemctl daemon-reload
+        backup_file /etc/crontab
+        sed -i '\#/usr/sbin/aide --check#d' /etc/crontab
+        echo "05 4 * * * root /usr/sbin/aide --check" >>/etc/crontab
+        log "AIDE: daily check from /etc/crontab"
+        return 0
+    fi
     if is_ubuntu && systemctl cat dailyaidecheck.timer >/dev/null 2>&1; then
         systemctl disable --now aidecheck.timer aidecheck.service >/dev/null 2>&1 || true
         rm -f /etc/systemd/system/aidecheck.service /etc/systemd/system/aidecheck.timer

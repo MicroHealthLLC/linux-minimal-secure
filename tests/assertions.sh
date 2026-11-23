@@ -206,7 +206,12 @@ check "sshd PermitRootLogin no"        sshd_t 'permitrootlogin no'
 check "sshd X11Forwarding no"          sshd_t 'x11forwarding no'
 check "sshd MaxAuthTries 4"            sshd_t 'maxauthtries 4'
 check "sshd ClientAliveInterval 300"   sshd_t 'clientaliveinterval 300'
+if rhel; then
+check "sshd ClientAliveCountMax 1"     sshd_t 'clientalivecountmax 1'
+check "sshd LogLevel VERBOSE"          sshd_t 'loglevel verbose'
+else
 check "sshd ClientAliveCountMax 3"     sshd_t 'clientalivecountmax 3'
+fi
 if deb; then
 check "sshd FIPS ciphers only"         sshd_t 'ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr'
 check "sshd FIPS MACs only"            sshd_t 'macs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256'
@@ -224,6 +229,7 @@ if ! ssh -i /root/ciadmin_key -o BatchMode=yes -o StrictHostKeyChecking=no -o Us
     tail -n 8 /var/log/secure /var/log/auth.log 2>/dev/null | sed 's/^/    /'
     getenforce 2>/dev/null | sed 's/^/    selinux: /'
     if rhel; then
+        dmesg 2>/dev/null | grep -i 'apparmor="DENIED"' | tail -3 | sed 's/^/    host LSM: /'
         echo "    --- unix_chkpwd as root: rc $(/usr/sbin/unix_chkpwd ciadmin chkexpiry >/dev/null 2>&1; echo $?)"
         stat -c '    shadow: %U:%G %a' /etc/shadow; lsattr /etc/shadow 2>&1 | sed 's/^/    /'
         dnf -y -q install strace >/dev/null 2>&1 && strace -f -e trace=openat,capset,prctl /usr/sbin/unix_chkpwd ciadmin chkexpiry 2>&1 | grep -E 'shadow|capset|prctl' | sed 's/^/    strace: /'
@@ -247,7 +253,8 @@ check "firewalld enabled at boot"      systemctl is-enabled --quiet firewalld
 check "firewalld default zone public"  bash -c "grep -q '^DefaultZone=public' /etc/firewalld/firewalld.conf"
 check "firewalld: SSH allowed (permanent)" bash -c "grep -q '<service name=\"ssh\"/>' /etc/firewalld/zones/public.xml"
 check "firewalld: cockpit not open"    bash -c "! grep -q '<service name=\"cockpit\"/>' /etc/firewalld/zones/public.xml"
-check "firewalld: loopback anti-spoofing rule" bash -c "grep -q 'source address=\"127.0.0.1\"' /etc/firewalld/zones/public.xml"
+check "firewalld: loopback anti-spoofing rule (trusted zone)" bash -c "grep -q 'source address=\"127.0.0.1\"' /etc/firewalld/zones/trusted.xml"
+check "nftables.service not enabled beside firewalld" bash -c "! systemctl is-enabled --quiet nftables.service"
 if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
     check "firewalld running" systemctl is-active --quiet firewalld
     check "firewalld runtime allows SSH" bash -c "firewall-cmd --list-services | grep -qw ssh"
@@ -314,20 +321,28 @@ fi
 # Ubuntu 24.04+ aide-common ships dailyaidecheck.timer (used as is). Debian
 # (whose Debian CIS content checks aidecheck) and Ubuntu 22.04 (cron job
 # only) get the script's aidecheck units.
-if [[ $OS == ubuntu && ( -f /usr/lib/systemd/system/dailyaidecheck.timer || -f /lib/systemd/system/dailyaidecheck.timer ) ]]; then
+if rhel; then
+    :   # EL: /etc/crontab (asserted above)
+elif [[ $OS == ubuntu && ( -f /usr/lib/systemd/system/dailyaidecheck.timer || -f /lib/systemd/system/dailyaidecheck.timer ) ]]; then
     check "vendor dailyaidecheck.timer enabled" systemctl is-enabled dailyaidecheck.timer
     check "no duplicate aidecheck.timer" bash -c "! systemctl cat aidecheck.timer >/dev/null 2>&1"
 else
     check "aidecheck.service and timer enabled" bash -c "systemctl is-enabled aidecheck.service && systemctl is-enabled aidecheck.timer"
 fi
-if [[ $OS == ubuntu ]] || rhel; then
+if [[ $OS == ubuntu ]]; then
     check "TMOUT readonly+exported (POSIX form)" grep -Pzq 'TMOUT=[0-9]+\s+readonly TMOUT\s+export TMOUT' /etc/profile.d/60-harden.sh
+fi
+if rhel; then
+    check "TMOUT readonly+exported (typeset -xr)" grep -Eq '^[[:space:]]*typeset -xr TMOUT=[0-9]+' /etc/profile.d/60-harden.sh
+    check "every umask in /etc/bashrc is 027" bash -c "! grep -E '^[^#]*\\bumask[[:space:]]+[0-7]+' /etc/bashrc | grep -vq 'umask 027'"
+    check "audit watches in syscall form (EL content)" grep -q -- '-a always,exit -F arch=b64 -F path=/etc/passwd -F perm=wa' /etc/audit/rules.d/50-harden.rules
+    check "AIDE daily check in /etc/crontab" grep -q '/usr/sbin/aide --check' /etc/crontab
 fi
 if [[ $OS == ubuntu ]]; then
     check "/etc/netplan watched by auditd" grep -q '^-w /etc/netplan/ -p wa' /etc/audit/rules.d/52-harden-netplan.rules
 fi
 if rhel; then
-    check "SELinux policy changes audited" grep -q '^-w /etc/selinux/ -p wa -k MAC-policy' /etc/audit/rules.d/50-harden.rules
+    check "SELinux policy changes audited" grep -q -- '-F dir=/etc/selinux/ -F perm=wa -k MAC-policy' /etc/audit/rules.d/50-harden.rules
     check "no AppArmor watches on EL" bash -c "! grep -q apparmor /etc/audit/rules.d/50-harden.rules"
 fi
 

@@ -77,6 +77,15 @@ else
     # 0000 shadow file; without it PAM's account phase denies every login.
     run_flags+=(--cap-add SYS_ADMIN --cap-add NET_ADMIN --cap-add NET_RAW --cap-add DAC_READ_SEARCH --security-opt apparmor=unconfined)
 fi
+# Ubuntu runners load an AppArmor profile for unix_chkpwd that attaches BY
+# PATH, also to the EL helper inside a privileged container, and lacks what
+# EL's 0000 shadow file needs (PAM's account phase then denies every SSH
+# login). A real EL host has no AppArmor: unload the profile on the
+# ephemeral CI runner only.
+if [[ $FAMILY == rhel && $CI_PRIVILEGED == 1 && ${GITHUB_ACTIONS:-} == true && -f /etc/apparmor.d/unix-chkpwd ]]; then
+    sudo apparmor_parser -R /etc/apparmor.d/unix-chkpwd 2>/dev/null || true
+    log "unloaded the runner's AppArmor unix-chkpwd profile (EL test only)"
+fi
 log "booting container (privileged=${CI_PRIVILEGED})"
 docker run "${run_flags[@]}" "$IMG" >/dev/null
 
