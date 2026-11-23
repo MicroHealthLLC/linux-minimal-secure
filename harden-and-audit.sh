@@ -6,7 +6,10 @@
 # SCAP/CIS-Level-2-hardened headless server, then audits itself with OpenSCAP
 # and writes XML + HTML compliance reports. The distribution is detected:
 #   Debian family: Debian 12 (bookworm) / 13 (trixie), Ubuntu 22.04 / 24.04 / 26.04
-#   RHEL family:   RHEL, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux 8 / 9 / 10
+#   RHEL family:   RHEL, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux 8 / 9 / 10,
+#                  Fedora 41+ (server and desktop)
+# Desktops (a display manager is installed) keep their graphical session,
+# printing, Bluetooth, USB storage and network discovery: DESKTOP_MODE.
 #
 # Design rules (in priority order):
 #   1. Never lock the operator out. Anti-lockout checks run BEFORE anything
@@ -23,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly SCRIPT_VERSION="2.0.1"
+readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_NAME="harden-and-audit.sh"
 readonly LOG_FILE="/var/log/harden-and-audit.log"
 readonly STATE_DIR="/var/lib/harden-and-audit"
@@ -65,6 +68,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${UFW_EXTRA_OUT:=}"               # extra egress rules for deny mode, e.g. "514/tcp 636/tcp"
 : "${FIREWALL_OUTBOUND_POLICY:=${UFW_OUTBOUND_POLICY}}"  # generic name (UFW and firewalld)
 : "${FIREWALL_EXTRA_OUT:=${UFW_EXTRA_OUT}}"
+: "${DESKTOP_MODE:=auto}"           # auto|0|1 - 1 keeps the desktop experience (auto: a display manager is installed)
 : "${EPEL_ENABLE:=1}"                # RHEL family: EPEL provides fail2ban, dkms and some media libraries
 : "${FAIL2BAN_IGNOREIP:=}"           # space separated CIDRs never banned (jump hosts)
 : "${SSH_DISABLE_PASSWORD:=0}"       # 1 forces key-only SSH (only if every admin has a key)
@@ -109,6 +113,8 @@ OS_NAME=""          # "Debian 12", "Ubuntu 24.04", "Rocky Linux 9.6"
 SSG_PRODUCT=""      # debian12, ubuntu2404, rl9, almalinux9, cs10, rhel9 ...
 DEB_ARCH=""         # amd64 | arm64 ... (dpkg names, also used on the RHEL family)
 ADMIN_GROUP=sudo    # sudo (Debian family) | wheel (RHEL family)
+DESKTOP=0           # 1 = desktop mode (resolved from DESKTOP_MODE in preflight)
+DNF5=0              # 1 = dnf is dnf5 (Fedora 41+)
 SSH_UNIT=ssh        # ssh (Debian family) | sshd (RHEL family)
 SSH_PORTS=()
 KEEP_RA=0
@@ -157,8 +163,9 @@ usage() {
     cat <<'EOF'
 Usage: harden-and-audit.sh [--scan-only] [--help] [--version]
 
-  (no option)   Harden this host (Debian 12/13, Ubuntu 22.04/24.04/26.04, or
-                RHEL / CentOS Stream / Rocky / AlmaLinux / Oracle Linux 8-10),
+  (no option)   Harden this host (Debian 12/13, Ubuntu 22.04/24.04/26.04,
+                RHEL / CentOS Stream / Rocky / AlmaLinux / Oracle Linux 8-10,
+                or Fedora 41+; desktops keep their desktop experience),
                 then run the OpenSCAP audit.
   --scan-only   Only run the OpenSCAP audit and regenerate the reports.
   --version     Print the script version.
@@ -278,6 +285,18 @@ qgrep() { grep "$@" >/dev/null; }
 is_ubuntu() { [[ $OS_ID == ubuntu ]]; }
 is_debian() { [[ $OS_ID == debian ]]; }
 is_rhel()   { [[ $OS_FAMILY == rhel ]]; }
+is_fedora() { [[ $OS_ID == fedora ]]; }
+is_desktop() { [[ $DESKTOP == 1 ]]; }
+
+# A display manager (GDM, SDDM, LightDM, ...) is installed or configured.
+desktop_detected() {
+    local p
+    [[ -e /etc/systemd/system/display-manager.service ]] && return 0
+    for p in gdm gdm3 sddm lightdm lxdm xdm slim greetd; do
+        pkg_installed "$p" && return 0
+    done
+    return 1
+}
 is_deb()    { [[ $OS_FAMILY == deb ]]; }
 
 # --- package layer (dpkg/apt on the Debian family, rpm/dnf on the RHEL family)
@@ -295,7 +314,8 @@ DNF_NAMES=""
 dnf_names() {
     if [[ -z $DNF_NAMES || ! -s $DNF_NAMES ]]; then
         DNF_NAMES=${CACHE_DIR}/dnf-names
-        dnf -q repoquery --qf '%{name}' 2>/dev/null | sort -u >"$DNF_NAMES" || true
+        # dnf5 needs the newline in --qf; dnf4 adds one (blank lines dropped).
+        dnf -q repoquery --qf '%{name}\n' 2>/dev/null | awk 'NF' | sort -u >"$DNF_NAMES" || true
         rpm -qa --qf '%{NAME}\n' >>"$DNF_NAMES" 2>/dev/null || true
         sort -u -o "$DNF_NAMES" "$DNF_NAMES"
     fi
@@ -347,7 +367,11 @@ pkg_refresh() {
 }
 
 pkg_mark_manual() {
-    if is_rhel; then dnf -q -y mark install "$@" >/dev/null 2>&1 || true; else apt-mark manual "$@" >/dev/null; fi
+    if is_rhel; then
+        if [[ $DNF5 == 1 ]]; then dnf -q -y mark user "$@" >/dev/null 2>&1 || true; else dnf -q -y mark install "$@" >/dev/null 2>&1 || true; fi
+    else
+        apt-mark manual "$@" >/dev/null
+    fi
 }
 
 # first_available PKG... - print the first package that has an apt candidate.
@@ -493,12 +517,12 @@ preflight_os() {
     [[ -n $OS_MAJOR && $OS_MAJOR =~ ^[0-9]+$ ]] || die "cannot determine the ${OS_ID} release"
     case $OS_ID in
         debian|ubuntu) OS_FAMILY=deb ;;
-        rhel|centos|rocky|almalinux|ol) OS_FAMILY=rhel ;;
+        rhel|centos|rocky|almalinux|ol|fedora) OS_FAMILY=rhel ;;
         *)
             if [[ " ${ID_LIKE:-} " == *" rhel "* ]]; then
                 OS_FAMILY=rhel
             else
-                die "unsupported distribution '${OS_ID}' (Debian 12/13, Ubuntu 22.04/24.04/26.04, or RHEL/CentOS Stream/Rocky/AlmaLinux/Oracle Linux 8-10 required)"
+                die "unsupported distribution '${OS_ID}' (Debian 12/13, Ubuntu 22.04/24.04/26.04, RHEL/CentOS Stream/Rocky/AlmaLinux/Oracle Linux 8-10 or Fedora 41+ required)"
             fi
             ;;
     esac
@@ -525,8 +549,12 @@ preflight_os() {
             # Empty NTP_SERVERS keeps the vendor chrony sources (NTS on 25.10+).
             ;;
         *)
-            # RHEL family (ID allow-list or ID_LIKE=rhel).
-            (( OS_MAJOR >= 8 )) || die "${NAME:-$OS_ID} ${OS_VERSION} is not supported (release 8 or newer required)"
+            # RHEL family (ID allow-list or ID_LIKE=rhel), Fedora.
+            if [[ $OS_ID == fedora ]]; then
+                (( OS_MAJOR >= 41 )) || die "Fedora ${OS_VERSION} is not supported (Fedora 41 or newer required)"
+            else
+                (( OS_MAJOR >= 8 )) || die "${NAME:-$OS_ID} ${OS_VERSION} is not supported (release 8 or newer required)"
+            fi
             OS_NUM=$OS_MAJOR
             OS_NAME="${NAME:-$OS_ID} ${OS_VERSION}"
             case $OS_ID in
@@ -534,14 +562,27 @@ preflight_os() {
                 almalinux) SSG_PRODUCT="almalinux${OS_MAJOR}" ;;
                 centos)    SSG_PRODUCT="cs${OS_MAJOR}" ;;
                 ol)        SSG_PRODUCT="ol${OS_MAJOR}" ;;
+                fedora)    SSG_PRODUCT="fedora" ;;
                 *)         SSG_PRODUCT="rhel${OS_MAJOR}" ;;
             esac
             ADMIN_GROUP=wheel
             SSH_UNIT=sshd
             ;;
     esac
+    case $DESKTOP_MODE in
+        1) DESKTOP=1 ;;
+        0) DESKTOP=0 ;;
+        *) if desktop_detected; then DESKTOP=1; fi ;;
+    esac
+    if is_rhel && dnf --version 2>/dev/null | head -n1 | qgrep -i dnf5; then DNF5=1; fi
     if [[ -z $SCAP_PROFILE ]]; then
-        if is_rhel; then SCAP_PROFILE=cis; else SCAP_PROFILE=cis_level2_server; fi
+        if is_desktop; then
+            if is_rhel; then SCAP_PROFILE=cis_workstation_l2; else SCAP_PROFILE=cis_level2_workstation; fi
+        elif is_rhel; then
+            SCAP_PROFILE=cis
+        else
+            SCAP_PROFILE=cis_level2_server
+        fi
     fi
     if [[ -z $SSH_LOGLEVEL ]]; then
         if is_rhel; then SSH_LOGLEVEL=VERBOSE; else SSH_LOGLEVEL=INFO; fi
@@ -555,7 +596,10 @@ preflight_os() {
     fi
     UID_MIN_VALUE=$(awk '/^[[:space:]]*UID_MIN[[:space:]]/{print $2}' /etc/login.defs 2>/dev/null || true)
     UID_MIN_VALUE=${UID_MIN_VALUE:-1000}
-    log "${OS_NAME}${OS_CODENAME:+ (${OS_CODENAME})} ${DEB_ARCH}, ${OS_FAMILY} family; container=$(in_container && echo yes || echo no)"
+    log "${OS_NAME}${OS_CODENAME:+ (${OS_CODENAME})} ${DEB_ARCH}, ${OS_FAMILY} family; container=$(in_container && echo yes || echo no); desktop=$(is_desktop && echo yes || echo no)"
+    if is_desktop; then
+        log "desktop mode: the graphical session, printing, Bluetooth, USB storage, network discovery and toolbox/podman stay (DESKTOP_MODE=0 hardens it as a server)"
+    fi
 }
 
 # Interactive accounts that may log in (UID >= UID_MIN, real shell, not locked).
@@ -693,6 +737,10 @@ configure_dnf_minimal() {
 
 purge_graphical() {
     step "1.2 purge graphical stack (display managers, desktops, X11, Wayland, Mesa)"
+    if is_desktop; then
+        log "desktop mode: graphical stack and graphical.target kept"
+        return 0
+    fi
     local re='^(xserver-.*|xorg|xorg-.*|x11-.*|xinit|xauth|xterm|xwayland|weston|xbase-clients|xfonts-.*|'
     re+='gdm3|lightdm.*|sddm.*|xdm|lxdm|slim|nodm|wdm|'
     re+='task-desktop|task-.*-desktop|gnome-.*|gnome|kde-.*|plasma-.*|xfce4.*|lxde.*|lxqt.*|cinnamon.*|mate-.*|budgie-.*|openbox.*|'
@@ -751,6 +799,8 @@ purge_insecure_services() {
     fi
     local -a present=() p
     for p in "${legacy[@]}"; do
+        # Desktops print, discover printers/shares and use Bluetooth devices.
+        if is_desktop && [[ $p =~ ^(cups.*|avahi.*|bluez)$ ]]; then continue; fi
         pkg_installed "$p" && present+=("$p")
     done
     if [[ ${#present[@]} -gt 0 ]]; then
@@ -759,8 +809,12 @@ purge_insecure_services() {
         log "no legacy network services installed"
     fi
     # rsync is a common admin tool: keep the client but never run the daemon.
-    disable_service rsync.service bluetooth.service avahi-daemon.service avahi-daemon.socket cups.service \
-        cups.socket rpcbind.service rpcbind.socket nfs-server.service snmpd.service
+    if is_desktop; then
+        disable_service rsync.service rpcbind.service rpcbind.socket nfs-server.service snmpd.service
+    else
+        disable_service rsync.service bluetooth.service avahi-daemon.service avahi-daemon.socket cups.service \
+            cups.socket rpcbind.service rpcbind.socket nfs-server.service snmpd.service
+    fi
     # STIG: no Ctrl-Alt-Del reboot, no debug shell.
     systemctl mask ctrl-alt-del.target debug-shell.service >/dev/null 2>&1 || true
     if is_ubuntu; then
@@ -973,6 +1027,14 @@ EOF
 # fail2ban, dkms and media libraries the vendor does not ship.
 configure_repositories_rhel() {
     step "2.1 official EL repositories (BaseOS, AppStream, CRB) + EPEL"
+    if is_fedora; then
+        [[ -n $(dnf -q repolist --enabled 2>/dev/null | awk 'NR > 1') ]] \
+            || die "no package repository is enabled: configure the Fedora repositories; automatic security updates are mandatory"
+        log "Fedora: fedora + updates repositories (fail2ban, dkms and the media libraries are in Fedora itself)"
+        configure_dnf_minimal
+        pkg_refresh
+        return 0
+    fi
     if [[ $OS_ID == rhel ]] && command -v subscription-manager >/dev/null 2>&1; then
         if ! subscription-manager status >/dev/null 2>&1; then
             warn "this RHEL host is not registered with subscription-manager: only repositories configured locally are available"
@@ -1035,9 +1097,11 @@ install_base_stack() {
 }
 
 install_base_stack_rhel() {
+    local auto=dnf-automatic
+    [[ $DNF5 == 1 ]] && auto=dnf5-plugin-automatic
     local -a pkgs=(openssh-server openssh-clients tmux kbd git firewalld nftables libpwquality pam
         audit rsyslog rsyslog-gnutls logrotate cronie acl unzip perl procps-ng iproute kmod e2fsprogs chrony
-        dnf-automatic sudo policycoreutils policycoreutils-python-utils selinux-policy-targeted
+        "$auto" sudo policycoreutils policycoreutils-python-utils selinux-policy-targeted
         crypto-policies-scripts authselect grubby python3-systemd) opt
     # CIS EL: systemd-journal-remote available (its listener stays masked, see
     # configure_logging), a local-only MTA (postfix).
@@ -1048,7 +1112,7 @@ install_base_stack_rhel() {
     pkg_installed curl-minimal || pkg_installed curl || pkgs+=(curl)
     # audit 4 (EL10) splits augenrules' default rules into audit-rules.
     opt=$(first_available audit-rules) && pkgs+=("$opt")
-    if [[ $EPEL_ENABLE == 1 ]]; then
+    if [[ $EPEL_ENABLE == 1 ]] || is_fedora; then
         for opt in fail2ban-server fail2ban-firewalld fail2ban-systemd; do
             pkg_candidate "$opt" && pkgs+=("$opt")
         done
@@ -1168,7 +1232,12 @@ EOF
 # except on CentOS Stream, which publishes no errata (security-only would
 # never install anything there).
 configure_dnf_automatic() {
-    local type=security conf=/etc/dnf/automatic.conf u
+    local type=security conf=/etc/dnf/automatic.conf u timer=dnf-automatic.timer
+    # dnf5 (Fedora 41+): dnf5-automatic.timer, and the plugin's own config path too.
+    if [[ $DNF5 == 1 ]]; then
+        timer=dnf5-automatic.timer
+        systemctl cat "$timer" >/dev/null 2>&1 || timer=dnf-automatic.timer
+    fi
     if [[ $OS_ID == centos ]]; then
         type=default
         log "CentOS Stream publishes no security errata: dnf-automatic applies all updates"
@@ -1199,22 +1268,27 @@ email_host = localhost
 [base]
 debuglevel = 1
 EOF
+    if [[ $DNF5 == 1 ]]; then
+        install -d -m 0755 /etc/dnf/dnf5-plugins
+        write_file 0644 /etc/dnf/dnf5-plugins/automatic.conf <"$conf"
+    fi
     # The timer must run: unmask (golden images mask it), enable, start.
-    for u in dnf-automatic.timer dnf-automatic.service; do
+    for u in "$timer" "${timer%.timer}.service"; do
         systemctl unmask "$u" >/dev/null 2>&1 || true
     done
     # The other dnf-automatic timers would race the managed one.
     systemctl disable --now dnf-automatic-notifyonly.timer dnf-automatic-download.timer dnf-automatic-install.timer >/dev/null 2>&1 || true
-    systemctl enable --now dnf-automatic.timer >/dev/null 2>&1 || true
+    [[ $timer == dnf-automatic.timer ]] || systemctl disable --now dnf-automatic.timer >/dev/null 2>&1 || true
+    systemctl enable --now "$timer" >/dev/null 2>&1 || true
     grep -Eq '^apply_updates[[:space:]]*=[[:space:]]*yes$' "$conf" || die "automatic updates are mandatory but apply_updates is not yes in ${conf}"
-    if ! systemctl is-enabled --quiet dnf-automatic.timer 2>/dev/null || ! systemctl is-active --quiet dnf-automatic.timer 2>/dev/null; then
-        in_container || die "automatic security updates are mandatory but dnf-automatic.timer is not enabled and active"
-        warn "container: dnf-automatic.timer is not active here (it is enforced on a real host)"
+    if ! systemctl is-enabled --quiet "$timer" 2>/dev/null || ! systemctl is-active --quiet "$timer" 2>/dev/null; then
+        in_container || die "automatic security updates are mandatory but ${timer} is not enabled and active"
+        warn "container: ${timer} is not active here (it is enforced on a real host)"
     fi
     if grep -Eq '^[[:space:]]*(exclude|excludepkgs)[[:space:]]*=' /etc/dnf/dnf.conf; then
         warn "/etc/dnf/dnf.conf excludes packages from every update (review: $(grep -E '^[[:space:]]*(exclude|excludepkgs)[[:space:]]*=' /etc/dnf/dnf.conf | tr '\n' ' '))"
     fi
-    log "automatic updates: dnf-automatic.timer active, upgrade_type=${type}, apply_updates=yes"
+    log "automatic updates: ${timer} active, upgrade_type=${type}, apply_updates=yes"
 }
 
 # ============================================================================
@@ -1536,11 +1610,20 @@ configure_grub() {
     backup_file /etc/default/grub
     # GRUB_CMDLINE_LINUX applies to every boot entry, including recovery;
     # fips=1 is also put in the default (non-recovery) string, as required.
-    local -a kargs=("${KARGS_COMMON[@]}" apparmor=1 security=apparmor)
-    grub_set_args GRUB_CMDLINE_LINUX_DEFAULT fips=1
+    local -a kargs
+    mapfile -t kargs < <(kargs_for_host)
+    kargs+=(apparmor=1 security=apparmor)
+    if kernel_fips_ok; then
+        grub_set_args GRUB_CMDLINE_LINUX_DEFAULT fips=1
+    else
+        log "desktop mode: kernel FIPS mode (fips=1) not set (it breaks Wi-Fi/Bluetooth algorithms); user-space FIPS provider stays"
+        sed -i -E 's/(^GRUB_CMDLINE_LINUX(_DEFAULT)?="[^"]*)\bfips=1\b ?/\1/' /etc/default/grub
+    fi
     grub_set_args GRUB_CMDLINE_LINUX "${kargs[@]}"
-    grep -E '^GRUB_CMDLINE_LINUX=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to GRUB_CMDLINE_LINUX"
-    grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to GRUB_CMDLINE_LINUX_DEFAULT"
+    if kernel_fips_ok; then
+        grep -E '^GRUB_CMDLINE_LINUX=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to GRUB_CMDLINE_LINUX"
+        grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to GRUB_CMDLINE_LINUX_DEFAULT"
+    fi
     # Drop-ins are sourced after /etc/default/grub. Cloud images replace the
     # command line there (e.g. Ubuntu's 50-cloudimg-settings.cfg sets
     # GRUB_CMDLINE_LINUX_DEFAULT); re-append the hardening arguments last.
@@ -1554,7 +1637,7 @@ configure_grub() {
                 && ! grep -Eq "^[[:space:]]*(export[[:space:]]+)?${var}=.*\\\$\\{?${var}([^_A-Z]|\$)" "$d"; then
                 log "${d} replaces ${var}; hardening arguments are re-applied by ${dropin}"
                 if [[ $var == GRUB_CMDLINE_LINUX_DEFAULT ]]; then
-                    lines+=("${var}=\"\${${var}} fips=1\"")
+                    kernel_fips_ok && lines+=("${var}=\"\${${var}} fips=1\"")
                 else
                     lines+=("${var}=\"\${${var}} ${kargs[*]}\"")
                 fi
@@ -1644,10 +1727,30 @@ EOF
 KARGS_COMMON=(fips=1 audit=1 audit_backlog_limit=8192 slab_nomerge=yes pti=on page_alloc.shuffle=1
     vsyscall=none init_on_alloc=1 spectre_v2=on spec_store_bypass_disable=seccomp rng_core.default_quality=500)
 
+# Kernel FIPS mode (fips=1) only where the distribution supports it and it
+# cannot take the machine down: Fedora does not support FIPS mode (missing
+# HMACs/dracut module can stop the boot), and on desktops kernel FIPS mode
+# breaks Wi-Fi/Bluetooth algorithms. User-space FIPS stays in both cases.
+kernel_fips_ok() {
+    is_fedora && return 1
+    is_deb && is_desktop && return 1
+    return 0
+}
+# kargs_for_host - KARGS_COMMON without fips=1 where kernel_fips_ok says no.
+kargs_for_host() {
+    local a
+    for a in "${KARGS_COMMON[@]}"; do
+        [[ $a == fips=1 ]] && ! kernel_fips_ok && continue
+        printf '%s\n' "$a"
+    done
+}
+
 # RHEL family: grubby edits every installed kernel's BLS entry; GRUB_CMDLINE_LINUX
 # in /etc/default/grub carries the arguments to kernels installed later.
 configure_grub_rhel() {
-    local -a kargs=("${KARGS_COMMON[@]}")
+    local -a kargs
+    mapfile -t kargs < <(kargs_for_host)
+    kernel_fips_ok || log "kernel FIPS mode (fips=1) not set on this host: $(is_fedora && echo 'Fedora does not support it' || echo 'desktop')"
     # FIPS with a separate /boot: the initramfs verifies the kernel HMAC there.
     local bootdev
     if findmnt -n /boot >/dev/null 2>&1; then
@@ -1659,7 +1762,11 @@ configure_grub_rhel() {
         grub_set_args GRUB_CMDLINE_LINUX "${kargs[@]}"
         # A disabled SELinux on the command line would defeat the MAC control.
         sed -i -E 's/(^GRUB_CMDLINE_LINUX="[^"]*)\b(selinux|enforcing)=0\b ?/\1/g' /etc/default/grub
-        grep -E '^GRUB_CMDLINE_LINUX=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to GRUB_CMDLINE_LINUX"
+        if kernel_fips_ok; then
+            grep -E '^GRUB_CMDLINE_LINUX=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to GRUB_CMDLINE_LINUX"
+        else
+            sed -i -E 's/(^GRUB_CMDLINE_LINUX="[^"]*)\bfips=1\b ?/\1/' /etc/default/grub
+        fi
     else
         warn "/etc/default/grub missing: kernel arguments are applied with grubby only"
     fi
@@ -1803,9 +1910,21 @@ install_fips_provider() {
 # RHEL family: the distribution's own FIPS module (its OpenSSL is built to
 # load it when the kernel runs in FIPS mode). A second, self-built provider
 # is never stacked on it.
+# Crypto policy for the host: FIPS, except Fedora desktops (Fedora has no
+# FIPS validation; DEFAULT:NO-SHA1 is the CIS policy and keeps browsing/Wi-Fi).
+crypto_policy_for_host() {
+    if is_fedora && is_desktop; then echo "DEFAULT:NO-SHA1"; else echo FIPS; fi
+}
+
 enable_fips_rhel() {
     if [[ $(cat /proc/sys/crypto/fips_enabled 2>/dev/null) == 1 ]]; then
         log "kernel already in FIPS mode"
+    fi
+    if is_fedora; then
+        # No fips-mode-setup, no kernel FIPS mode on Fedora: the policy only.
+        update-crypto-policies --set "$(crypto_policy_for_host)" >/dev/null
+        log "Fedora: system crypto policy $(crypto_policy_for_host) (Fedora does not support kernel FIPS mode)"
+        return 0
     fi
     if in_container; then
         update-crypto-policies --set FIPS >/dev/null
@@ -1850,7 +1969,7 @@ configure_openssl_fips() {
     if is_rhel; then
         local pol
         pol=$(update-crypto-policies --show 2>/dev/null || true)
-        [[ $pol == FIPS* ]] || die "system crypto policy is '${pol}', expected FIPS"
+        [[ $pol == "$(crypto_policy_for_host)"* ]] || die "system crypto policy is '${pol}', expected $(crypto_policy_for_host)"
         if command -v sshd >/dev/null 2>&1; then
             sshd_test >/dev/null 2>&1 || die "sshd rejects its configuration under the FIPS crypto policy"
         fi
@@ -2162,8 +2281,7 @@ net.ipv6.conf.all.autoconf = ${ra}
 net.ipv6.conf.default.autoconf = ${ra}
 net.ipv6.conf.all.router_solicitations = 0
 net.ipv6.conf.default.router_solicitations = 0
-net.ipv6.conf.all.max_addresses = 1
-net.ipv6.conf.default.max_addresses = 1
+$(is_desktop || printf 'net.ipv6.conf.all.max_addresses = 1\nnet.ipv6.conf.default.max_addresses = 1\n')
 
 # --- Kernel self-protection
 kernel.randomize_va_space = 2
@@ -2326,6 +2444,11 @@ EOF
             sed -i -E 's/^([[:space:]]*(Ciphers|MACs|KexAlgorithms)[[:space:]].*)/# overridden by '"${MARK}"' (system crypto policy): \1/I' "$f"
         done
     fi
+    if is_desktop && ! systemctl is-enabled --quiet "${SSH_UNIT}.service" 2>/dev/null \
+        && ! systemctl is-active --quiet "${SSH_UNIT}.service" 2>/dev/null && ! systemctl is-active --quiet ssh.socket 2>/dev/null; then
+        log "desktop mode: sshd was not enabled - configuration hardened, service left off"
+        return 0
+    fi
     systemctl enable "${SSH_UNIT}.service" >/dev/null 2>&1 || true
     if systemctl is-active --quiet "${SSH_UNIT}.service"; then
         systemctl reload "${SSH_UNIT}.service"
@@ -2358,6 +2481,8 @@ configure_ufw() {
     for p in "${SSH_PORTS[@]}"; do
         ufw allow in "${p}/tcp" comment 'SSH (harden-and-audit)' >/dev/null
     done
+    # Desktops discover printers and shares over mDNS.
+    is_desktop && ufw allow in 5353/udp comment 'mDNS (desktop, harden-and-audit)' >/dev/null
     ufw allow in on lo >/dev/null
     ufw allow out on lo >/dev/null
     ufw deny in from 127.0.0.0/8 >/dev/null
@@ -2392,15 +2517,20 @@ configure_firewalld() {
         host_only "start firewalld" systemctl start firewalld.service
     fi
     local zone=public p svc online=0
+    # Desktops keep their default zone (FedoraWorkstation, ...) and its services
+    # (mDNS, KDE Connect, ...); only SSH and the loopback rules are ensured.
+    if is_desktop; then
+        zone=$(firewall-cmd --get-default-zone 2>/dev/null || firewall-offline-cmd --get-default-zone 2>/dev/null || echo public)
+    fi
     systemctl is-active --quiet firewalld.service && online=1
     # fw: permanent configuration, through the daemon or (not running, e.g.
     # no netfilter in a container) firewall-offline-cmd on the same files.
     if [[ $online == 1 ]]; then
         fw() { firewall-cmd --permanent -q "$@"; }
-        firewall-cmd -q --set-default-zone="$zone"
+        is_desktop || firewall-cmd -q --set-default-zone="$zone"
     else
         fw() { firewall-offline-cmd -q "$@"; }
-        firewall-offline-cmd -q --set-default-zone="$zone"
+        is_desktop || firewall-offline-cmd -q --set-default-zone="$zone"
     fi
     # SSH first, before anything is removed - never cut the session.
     for p in "${SSH_PORTS[@]}"; do
@@ -2412,6 +2542,7 @@ configure_firewalld() {
     else
         read -r -a listed <<<"$(firewall-offline-cmd --zone="$zone" --list-services 2>/dev/null)"
     fi
+    is_desktop && listed=()
     for svc in "${listed[@]}"; do
         case $svc in ssh|dhcpv6-client) ;; *) fw --zone="$zone" --remove-service="$svc"; log "firewalld: closed ${svc} in zone ${zone}" ;; esac
     done
@@ -2556,7 +2687,13 @@ configure_authselect() {
         sed -i -E 's/[[:space:]]nullok\b//g' "${prof}/${f}"
     done
     local -a feats=()
-    for feat in with-faillock with-pwhistory without-nullok; do
+    local -a wantfeat=(with-faillock with-pwhistory without-nullok)
+    # Keep what the host already uses (fingerprint, smartcard, mkhomedir,
+    # gnome-keyring, ...): dropping it would break desktop logins.
+    while read -r feat; do
+        [[ $feat == with-* || $feat == without-* ]] && wantfeat+=("$feat")
+    done < <(authselect current 2>/dev/null | awk '/^- /{print $2}')
+    for feat in $(printf '%s\n' "${wantfeat[@]}" | awk '!seen[$0]++'); do
         authselect list-features "custom/harden" 2>/dev/null | qgrep -Fx "$feat" && feats+=("$feat")
     done
     backup_file /etc/pam.d/system-auth
@@ -2659,9 +2796,12 @@ configure_login_defs() {
     set_kv "$f" PASS_MIN_DAYS "$PASS_MIN_DAYS" $'\t'
     set_kv "$f" PASS_WARN_AGE "$PASS_WARN_AGE" $'\t'
     set_kv "$f" UMASK 027 $'\t\t'
-    if is_rhel; then
+    if is_rhel && ! is_fedora; then
         # EL CIS: SHA512 (matches the authselect profiles' pam_unix hashing).
         set_kv "$f" ENCRYPT_METHOD SHA512 ' '
+    elif is_fedora; then
+        # Fedora's authselect profiles hash with yescrypt.
+        set_kv "$f" ENCRYPT_METHOD YESCRYPT ' '
     else
         set_kv "$f" ENCRYPT_METHOD YESCRYPT ' '
         set_kv "$f" LOGIN_RETRIES 3 $'\t\t'
@@ -2685,8 +2825,14 @@ configure_login_defs() {
         chage --maxdays "$PASS_MAX_DAYS" --mindays "$PASS_MIN_DAYS" --warndays "$PASS_WARN_AGE" --inactive "$ACCOUNT_INACTIVE_DAYS" "$u"
     done < /etc/shadow
 
-    # Interactive shells: umask 027, idle timeout.
-    if is_rhel; then
+    # Interactive shells: umask 027, idle timeout. Desktops: no TMOUT (it would
+    # close idle terminal tabs); the desktop's own screen lock covers idleness.
+    if is_desktop; then
+        write_file 0644 /etc/profile.d/60-harden.sh <<EOF
+# Managed by ${SCRIPT_NAME} (desktop mode: no shell TMOUT, the screen lock covers idle sessions)
+umask 027
+EOF
+    elif is_rhel; then
         # The EL CIS check expects "typeset -xr TMOUT=<n>".
         write_file 0644 /etc/profile.d/60-harden.sh <<EOF
 # Managed by ${SCRIPT_NAME}
@@ -2857,8 +3003,10 @@ EOF
 
 configure_kernel_modules() {
     step "5.9 disable unneeded filesystems, protocols and USB storage"
-    local -a mods=(cramfs freevxfs hfs hfsplus jffs2 udf usb-storage dccp rds sctp tipc atm can firewire-core firewire-ohci)
-    [[ $ALLOW_CONTAINERS != 1 ]] && mods+=(overlay overlayfs)
+    local -a mods=(cramfs freevxfs hfs hfsplus jffs2 udf dccp rds sctp tipc atm can firewire-core firewire-ohci)
+    # Desktops keep USB drives and overlay (toolbox / podman / flatpak builders).
+    is_desktop || mods+=(usb-storage)
+    [[ $ALLOW_CONTAINERS != 1 ]] && ! is_desktop && mods+=(overlay overlayfs)
     # Ubuntu and EL CIS also disable squashfs, which every snap is mounted
     # from: only where snapd is absent.
     if is_ubuntu || is_rhel; then
@@ -2876,7 +3024,7 @@ configure_kernel_modules() {
             echo "blacklist ${m}"
         done
     } | write_file 0644 /etc/modprobe.d/60-harden-blacklist.conf
-    if [[ $ALLOW_CONTAINERS != 1 ]]; then
+    if [[ $ALLOW_CONTAINERS != 1 ]] && ! is_desktop; then
         log "overlayfs disabled (set ALLOW_CONTAINERS=1 on Docker/Podman hosts)"
     fi
 }
@@ -2885,16 +3033,19 @@ configure_mounts() {
     step "5.10 /tmp, /var/tmp, /dev/shm: nodev,nosuid,noexec"
     backup_file /etc/fstab
     local opts="nodev,nosuid,noexec"
+    # /tmp on desktops: nodev,nosuid only (AppImages, IDEs and installers run from it).
+    local tmpopts=$opts
+    is_desktop && tmpopts="nodev,nosuid"
     # /tmp
     if grep -Eq '^[^#[:space:]]+[[:space:]]+/tmp[[:space:]]' /etc/fstab; then
-        awk -v o="$opts" '$2=="/tmp" && $1 !~ /^#/ { n=split(o,a,","); for (i=1;i<=n;i++) if ($4 !~ "(^|,)"a[i]"(,|$)") $4=$4","a[i] } {print}' /etc/fstab >/etc/fstab.tmp
+        awk -v o="$tmpopts" '$2=="/tmp" && $1 !~ /^#/ { n=split(o,a,","); for (i=1;i<=n;i++) if ($4 !~ "(^|,)"a[i]"(,|$)") $4=$4","a[i] } {print}' /etc/fstab >/etc/fstab.tmp
         cat /etc/fstab.tmp >/etc/fstab && rm -f /etc/fstab.tmp
     else
         local unit=/usr/lib/systemd/system/tmp.mount
         [[ -f $unit ]] || unit=/usr/share/systemd/tmp.mount
         if [[ -f $unit ]]; then
-            write_file 0644 /etc/systemd/system/tmp.mount <<'EOF'
-# Managed by harden-and-audit.sh
+            write_file 0644 /etc/systemd/system/tmp.mount <<EOF
+# Managed by ${SCRIPT_NAME}
 [Unit]
 Description=Temporary Directory /tmp (hardened)
 Documentation=https://systemd.io/TEMPORARY_DIRECTORIES
@@ -2908,7 +3059,7 @@ After=swap.target
 What=tmpfs
 Where=/tmp
 Type=tmpfs
-Options=mode=1777,strictatime,nosuid,nodev,noexec,size=50%%,nr_inodes=1m
+Options=mode=1777,strictatime,${tmpopts},size=50%%,nr_inodes=1m
 
 [Install]
 WantedBy=local-fs.target
@@ -2943,7 +3094,7 @@ EOF
     fi
     host_only "remount /var/tmp" mount -o remount,bind,"$opts" /var/tmp
     if findmnt -n /tmp >/dev/null; then
-        host_only "remount /tmp" mount -o remount,"$opts" /tmp
+        host_only "remount /tmp" mount -o remount,"$tmpopts" /tmp
     elif [[ -n $(find /tmp -mindepth 1 -maxdepth 2 -type s 2>/dev/null) ]]; then
         warn "/tmp holds live sockets (e.g. tmux): the hardened tmpfs /tmp activates at next boot"
     else
@@ -3484,7 +3635,7 @@ provision_cuda_prereqs() {
         local -a el=(gcc make kernel-devel kernel-headers elfutils-libelf-devel pkgconf-pkg-config)
         pkg_candidate dkms && el+=(dkms)
         dnf_install "${el[@]}"
-        pkg_candidate dkms || warn "dkms is not available (it comes from EPEL; EPEL_ENABLE=${EPEL_ENABLE})"
+        pkg_candidate dkms || warn "dkms is not available$(is_fedora || echo " (it comes from EPEL; EPEL_ENABLE=${EPEL_ENABLE})")"
         if pkg_candidate "kernel-devel-$(uname -r)" || dnf -q list --available "kernel-devel-$(uname -r)" >/dev/null 2>&1; then
             dnf_install "kernel-devel-$(uname -r)"
         else

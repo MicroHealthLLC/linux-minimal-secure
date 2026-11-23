@@ -50,7 +50,7 @@ jobs:
             -x --severity=warning harden-and-audit.sh tests/run-ci.sh tests/assertions.sh tests/container-init.sh
 
   harden-and-scan:
-    name: ${{ matrix.distro }} ${{ matrix.version }} - harden + SCAP
+    name: ${{ matrix.distro }} ${{ matrix.version }} ${{ matrix.variant }} - harden + SCAP
     needs: lint
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -71,6 +71,9 @@ jobs:
           - { distro: almalinux, version: "10", tag: almalinux10 }
           - { distro: centos,    version: "9",  tag: centos9 }
           - { distro: centos,    version: "10", tag: centos10 }
+          - { distro: fedora,    version: "44", tag: fedora44 }
+          - { distro: fedora,    version: "45", tag: fedora45 }
+          - { distro: fedora,    version: "45", tag: fedora45desktop, variant: desktop }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -81,7 +84,7 @@ jobs:
           CI_PRIVILEGED: "1"
           SCAP_MIN_SCORE: "90"
           OUT_DIR: ${{ github.workspace }}/artifacts/${{ matrix.tag }}
-        run: tests/run-ci.sh "${{ matrix.distro }}" "${{ matrix.version }}"
+        run: tests/run-ci.sh "${{ matrix.distro }}" "${{ matrix.version }}" ${{ matrix.variant }}
 
       - name: upload SCAP reports and logs
         if: always()
