@@ -1,10 +1,12 @@
-# CI for harden-and-audit.sh
+# CI for linux-minimal-secure (harden-and-audit.sh)
 #
 # Runs on every push / PR to the integration branch (the default branch), and
-# is reused by the release workflow on main. Each Debian / Ubuntu release is
-# hardened inside a systemd-booted container that OpenSCAP evaluates as a real
-# machine, then gated on CIS Level 2 Server >= 90%. ANSSI BP-028 High
-# (Debian) and the DISA STIG (Ubuntu) are reported for information.
+# is reused by the release workflow on main. Each Debian / Ubuntu / RHEL-family
+# release is hardened inside a systemd-booted container that OpenSCAP
+# evaluates as a real machine, then gated on CIS Level 2 Server >= 90%.
+# ANSSI BP-028 High (Debian) and the DISA STIG (Ubuntu, RHEL family) are
+# reported for information. RHEL itself needs a subscription; its code path is
+# the one Rocky Linux, AlmaLinux and CentOS Stream exercise.
 name: ci
 
 on:
@@ -26,10 +28,19 @@ concurrency:
 
 jobs:
   lint:
-    name: shellcheck
+    name: shellcheck + security
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0          # full history for the secret scan
+      - name: secret scan (gitleaks, full history)
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" zricethezav/gitleaks:v8.21.2 git /repo --no-banner --redact
+      - name: workflow security audit (zizmor)
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" -w /repo ghcr.io/zizmorcore/zizmor:1.5.2 --offline .github/workflows
       - name: bash syntax
         run: |
           for f in harden-and-audit.sh tests/*.sh; do bash -n "$f"; done
@@ -52,8 +63,18 @@ jobs:
           - { distro: ubuntu, version: "22.04", tag: ubuntu2204 }
           - { distro: ubuntu, version: "24.04", tag: ubuntu2404 }
           - { distro: ubuntu, version: "26.04", tag: ubuntu2604 }
+          - { distro: rocky,     version: "8",  tag: rocky8 }
+          - { distro: rocky,     version: "9",  tag: rocky9 }
+          - { distro: rocky,     version: "10", tag: rocky10 }
+          - { distro: almalinux, version: "8",  tag: almalinux8 }
+          - { distro: almalinux, version: "9",  tag: almalinux9 }
+          - { distro: almalinux, version: "10", tag: almalinux10 }
+          - { distro: centos,    version: "9",  tag: centos9 }
+          - { distro: centos,    version: "10", tag: centos10 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: harden, assert, re-run (idempotence), scan, gate
         env:

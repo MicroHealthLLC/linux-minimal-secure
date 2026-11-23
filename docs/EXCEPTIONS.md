@@ -119,3 +119,23 @@ All three releases fail the same core set. It falls into the categories already 
 ### 8.3 `ufw_rules_for_open_ports`: a real defect, fixed
 
 The check requires a UFW rule for every non-loopback listener. Inspection of a hardened 24.04 host showed **rpcbind's socket (port 111) still listening** after the script had purged rpcbind. The package's own "stop" was suppressed (a `policy-rc.d`, present in container images and some image-build pipelines), and the script only disabled units whose unit file still existed. UFW kept blocking the port inbound, but a removed service must not keep a socket open. `disable_service` now also stops a unit that is still active after its unit file is gone, the CI image no longer carries `policy-rc.d`, and an assertion verifies nothing listens on port 111. The fix applies to Debian as well.
+
+## 9. RHEL family (RHEL, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux)
+
+### 9.1 Platform decisions
+
+| Decision | Reason |
+|---|---|
+| **FIPS: the distribution's module**, not the self-built OpenSSL 3.1.2 provider | The EL OpenSSL is built to load its own FIPS provider when the kernel runs in FIPS mode (`fips-mode-setup --enable` on 8/9; crypto policy `FIPS` + `fips=1` on 10, which removed `fips-mode-setup`). Stacking a second provider on it is unsupported. Red Hat's module is CMVP-validated for RHEL; rebuilds carry their own validation status (check the vendor's certificate before claiming FIPS 140-3 on a rebuild) |
+| **SSH algorithms from the crypto policy** | CIS EL (`configure_ssh_crypto_policy`) fails any `Ciphers`/`MACs`/`KexAlgorithms` override in `sshd_config`. Under policy `FIPS`, sshd offers FIPS-approved algorithms only (asserted in CI) |
+| **SELinux permissive first on hosts that booted with it disabled** | Enforcing an unlabelled filesystem can stop services, SSH included, at the next boot (anti-lockout). The script sets `permissive` + `/.autorelabel`, and the next run after that reboot sets `enforcing`. `selinux_state` fails until then |
+| **EPEL** is enabled by default (`EPEL_ENABLE=1`) | fail2ban and dkms (mandated) ship only in EPEL. EPEL packages are GPG-signed by the Fedora project and gpgcheck stays on. `EPEL_ENABLE=0` keeps vendor repositories only; fail2ban and dkms are then reported as missing |
+| **x264 / x265 not installed** (and usrsctp on EL10) | They exist only in RPM Fusion (third party, patent-encumbered codecs), which is not enabled. Reported as unavailable media libraries |
+| **CentOS Stream: dnf-automatic applies all updates** | Stream publishes no security errata, so `upgrade_type = security` would never install anything. Automatic updates are mandatory, so Stream gets `default` |
+| **Packaged SCAP content** (`scap-security-guide`) instead of the pinned upstream SSG | Each vendor ships content matched to its platform CPE and packages (`ssg-rl*`, `ssg-almalinux*`, `ssg-cs*`, `ssg-rhel*`, `ssg-ol*`). Upstream RHEL content marks every rule "notapplicable" on a rebuild |
+| **No `dnf autoremove`** after the graphical purge | Installer-placed packages are often marked as dependencies; autoremove could remove real services |
+| **RHEL in CI** | Needs a subscription. The rebuilds take the same code path; RHEL adds only the subscription check and EPEL bootstrap from the Fedora project |
+
+### 9.2 Rules expected to fail in CI containers
+
+As on Debian/Ubuntu (§5), rules that need a booted kernel, a real bootloader or host-global state (kernel FIPS mode, `grub2_*` arguments in BLS entries, SELinux runtime state, auditd/chronyd/firewalld service state in an unprivileged run, separate partitions) fail inside the CI container and pass on a real host or VM. The CI job summary of each EL target lists the failing rules.

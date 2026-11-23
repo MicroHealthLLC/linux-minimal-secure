@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# harden-and-audit.sh
+# harden-and-audit.sh - linux-minimal-secure
 #
-# Transforms a stock Debian 12 (bookworm) / 13 (trixie) or Ubuntu 22.04
-# (jammy) / 24.04 (noble) / 26.04 (resolute) installation into a minimal,
-# FIPS-ready, SCAP/CIS-Level-2-hardened headless server, then audits itself
-# with OpenSCAP and writes XML + HTML compliance reports.
+# Transforms a stock server installation into a minimal, FIPS-ready,
+# SCAP/CIS-Level-2-hardened headless server, then audits itself with OpenSCAP
+# and writes XML + HTML compliance reports. The distribution is detected:
+#   Debian family: Debian 12 (bookworm) / 13 (trixie), Ubuntu 22.04 / 24.04 / 26.04
+#   RHEL family:   RHEL, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux 8 / 9 / 10
 #
 # Design rules (in priority order):
 #   1. Never lock the operator out. Anti-lockout checks run BEFORE anything
@@ -17,12 +18,12 @@
 #      once under /var/backups/harden-and-audit/<original path>.
 #
 # Usage:   sudo ./harden-and-audit.sh [--scan-only] [--help] [--version]
-# Docs:    README.md, docs/EXCEPTIONS.md, docs/PLAN-UBUNTU.md
+# Docs:    README.md, docs/EXCEPTIONS.md, docs/PLAN-UBUNTU.md, docs/PLAN-RHEL.md
 # =============================================================================
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="2.0.0"
 readonly SCRIPT_NAME="harden-and-audit.sh"
 readonly LOG_FILE="/var/log/harden-and-audit.log"
 readonly STATE_DIR="/var/lib/harden-and-audit"
@@ -55,13 +56,16 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${PASS_WARN_AGE:=7}"
 : "${ACCOUNT_INACTIVE_DAYS:=45}"
 : "${SHELL_TMOUT:=900}"
-: "${SSH_LOGLEVEL:=INFO}"            # INFO satisfies CIS/SSG; VERBOSE also logs key fingerprints
+: "${SSH_LOGLEVEL:=}"                # empty = INFO (Debian family CIS) / VERBOSE (EL CIS: logs key fingerprints)
 : "${FAILLOCK_DENY:=4}"
 : "${FAILLOCK_UNLOCK_TIME:=900}"
 : "${ALLOW_CONTAINERS:=0}"           # 1 keeps overlayfs + IPv4 forwarding for Docker/Podman hosts
 : "${KEEP_IPV6_RA:=auto}"            # auto|0|1 - keep IPv6 router advertisements (SLAAC)
 : "${UFW_OUTBOUND_POLICY:=allow}"    # allow|deny (deny adds an explicit egress allow-list)
 : "${UFW_EXTRA_OUT:=}"               # extra egress rules for deny mode, e.g. "514/tcp 636/tcp"
+: "${FIREWALL_OUTBOUND_POLICY:=${UFW_OUTBOUND_POLICY}}"  # generic name (UFW and firewalld)
+: "${FIREWALL_EXTRA_OUT:=${UFW_EXTRA_OUT}}"
+: "${EPEL_ENABLE:=1}"                # RHEL family: EPEL provides fail2ban, dkms and some media libraries
 : "${FAIL2BAN_IGNOREIP:=}"           # space separated CIDRs never banned (jump hosts)
 : "${SSH_DISABLE_PASSWORD:=0}"       # 1 forces key-only SSH (only if every admin has a key)
 : "${ENABLE_GRUB_PASSWORD:=1}"
@@ -81,8 +85,8 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${SSG_SHA512:=1caea418f0a5aaef7025e1655ca45a80942ea87ee832b943644ba6f9991b14a6ac5b35dddcd04b754e1fc8fbdee7b7f394507d24b123e821cca0354dc4e03cfd}"
 : "${SSG_URL:=https://github.com/ComplianceAsCode/content/releases/download/v${SSG_VERSION}/scap-security-guide-${SSG_VERSION}.zip}"
 : "${SSG_DOWNLOAD:=1}"               # 0 = offline; use SSG_DATASTREAM or packaged content
-: "${SSG_DATASTREAM:=}"              # explicit path to an ssg-debianNN-ds.xml
-: "${SCAP_PROFILE:=cis_level2_server}"
+: "${SSG_DATASTREAM:=}"              # explicit path to an ssg-<product>-ds.xml
+: "${SCAP_PROFILE:=}"                # empty = cis_level2_server (Debian/Ubuntu) or cis (RHEL family: CIS L2 Server)
 : "${SCAP_EXTRA_PROFILES:=}"         # e.g. "anssi_bp28_high standard"
 : "${SCAP_MIN_SCORE:=90}"
 : "${SCAP_ENFORCE_MIN:=1}"           # non-zero exit when the gate profile scores below SCAP_MIN_SCORE
@@ -95,14 +99,17 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Runtime state
 # ----------------------------------------------------------------------------
 CURRENT_STEP="startup"
-OS_ID=""            # debian | ubuntu
-OS_VERSION=""       # 12, 13, 22.04, 24.04, 26.04 ...
-OS_CODENAME=""
-OS_MAJOR=""         # Debian 12/13; Ubuntu 22/24/26
-OS_NUM=0            # comparable number: Debian 12 -> 12, Ubuntu 24.04 -> 2404
-OS_NAME=""          # "Debian 12", "Ubuntu 24.04"
-SSG_PRODUCT=""      # debian12, ubuntu2404 ...
-DEB_ARCH=""
+OS_ID=""            # debian | ubuntu | rhel | centos | rocky | almalinux | ol
+OS_FAMILY=""        # deb | rhel
+OS_VERSION=""       # 12, 13, 22.04, 24.04, 26.04, 8.10, 9.6, 10 ...
+OS_CODENAME=""      # Debian/Ubuntu only
+OS_MAJOR=""         # Debian 12/13; Ubuntu 22/24/26; EL 8/9/10
+OS_NUM=0            # comparable number: Debian 12 -> 12, Ubuntu 24.04 -> 2404, EL 9 -> 9
+OS_NAME=""          # "Debian 12", "Ubuntu 24.04", "Rocky Linux 9.6"
+SSG_PRODUCT=""      # debian12, ubuntu2404, rl9, almalinux9, cs10, rhel9 ...
+DEB_ARCH=""         # amd64 | arm64 ... (dpkg names, also used on the RHEL family)
+ADMIN_GROUP=sudo    # sudo (Debian family) | wheel (RHEL family)
+SSH_UNIT=ssh        # ssh (Debian family) | sshd (RHEL family)
 SSH_PORTS=()
 KEEP_RA=0
 UID_MIN_VALUE=1000
@@ -150,7 +157,8 @@ usage() {
     cat <<'EOF'
 Usage: harden-and-audit.sh [--scan-only] [--help] [--version]
 
-  (no option)   Harden this Debian 12/13 or Ubuntu 22.04/24.04/26.04 host,
+  (no option)   Harden this host (Debian 12/13, Ubuntu 22.04/24.04/26.04, or
+                RHEL / CentOS Stream / Rocky / AlmaLinux / Oracle Linux 8-10),
                 then run the OpenSCAP audit.
   --scan-only   Only run the OpenSCAP audit and regenerate the reports.
   --version     Print the script version.
@@ -169,6 +177,10 @@ in_container() { systemd-detect-virt --container --quiet 2>/dev/null; }
 # exists once ssh.service has started (RuntimeDirectory=sshd).
 sshd_test() {
     install -d -m 0755 -o root -g root /run/sshd
+    # EL creates host keys on the first sshd.service start (sshd-keygen@);
+    # until then "sshd -t" fails with "no hostkeys available".
+    local k=(/etc/ssh/ssh_host_*_key)
+    [[ ${#k[@]} -gt 0 ]] || ssh-keygen -A >/dev/null
     sshd -t "$@"
 }
 
@@ -265,13 +277,77 @@ qgrep() { grep "$@" >/dev/null; }
 
 is_ubuntu() { [[ $OS_ID == ubuntu ]]; }
 is_debian() { [[ $OS_ID == debian ]]; }
+is_rhel()   { [[ $OS_FAMILY == rhel ]]; }
+is_deb()    { [[ $OS_FAMILY == deb ]]; }
 
-pkg_installed() { [[ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null || true)" == installed ]]; }
+# --- package layer (dpkg/apt on the Debian family, rpm/dnf on the RHEL family)
+pkg_installed() {
+    if is_rhel; then
+        rpm -q --quiet "$1" 2>/dev/null
+    else
+        [[ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null || true)" == installed ]]
+    fi
+}
+
+# Names of every package dnf can install, cached per repository state (one
+# repoquery instead of one per package: ~60 lookups for the media libraries).
+DNF_NAMES=""
+dnf_names() {
+    if [[ -z $DNF_NAMES || ! -s $DNF_NAMES ]]; then
+        DNF_NAMES=${CACHE_DIR}/dnf-names
+        dnf -q repoquery --qf '%{name}' 2>/dev/null | sort -u >"$DNF_NAMES" || true
+        rpm -qa --qf '%{NAME}\n' >>"$DNF_NAMES" 2>/dev/null || true
+        sort -u -o "$DNF_NAMES" "$DNF_NAMES"
+    fi
+    cat "$DNF_NAMES"
+}
 
 pkg_candidate() {
+    if is_rhel; then
+        dnf_names | qgrep -Fx -- "$1"
+        return
+    fi
     local c
     c=$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')
     [[ -n $c && $c != "(none)" ]]
+}
+
+# Every installable package name (for "~REGEX" lookups).
+pkg_all_names() {
+    if is_rhel; then dnf_names; else apt-cache pkgnames 2>/dev/null; fi
+}
+
+# Installed package names, one per line.
+pkg_list_installed() {
+    if is_rhel; then
+        rpm -qa --qf '%{NAME}\n' 2>/dev/null | sort -u
+    else
+        dpkg-query -W -f='${db:Status-Status} ${Package}\n' 2>/dev/null | awk '$1=="installed"{print $2}'
+    fi
+}
+
+dnf_install() {
+    dnf -y -q --setopt=install_weak_deps=False install "$@"
+}
+
+# pkg_install PKG... - install with the family's package manager.
+pkg_install() {
+    if is_rhel; then dnf_install "$@"; else apt_install "$@"; fi
+}
+
+# pkg_refresh - refresh repository metadata.
+pkg_refresh() {
+    if is_rhel; then
+        DNF_NAMES=""
+        rm -f "${CACHE_DIR}/dnf-names"
+        dnf -q -y makecache >/dev/null
+    else
+        apt_update
+    fi
+}
+
+pkg_mark_manual() {
+    if is_rhel; then dnf -q -y mark install "$@" >/dev/null 2>&1 || true; else apt-mark manual "$@" >/dev/null; fi
 }
 
 # first_available PKG... - print the first package that has an apt candidate.
@@ -279,6 +355,14 @@ pkg_candidate() {
 # sort) with a candidate wins - this tracks soname bumps across releases.
 first_available() {
     local p m
+    # An alternative that is already installed wins (EL images ship
+    # libcurl-minimal, which conflicts with libcurl).
+    for p in "$@"; do
+        if [[ $p != "~"* ]] && pkg_installed "$p"; then
+            printf '%s\n' "$p"
+            return 0
+        fi
+    done
     for p in "$@"; do
         if [[ $p == "~"* ]]; then
             while read -r m; do
@@ -286,7 +370,7 @@ first_available() {
                     printf '%s\n' "$m"
                     return 0
                 fi
-            done < <(apt-cache pkgnames 2>/dev/null | grep -E "${p#\~}" | sort -rV || true)
+            done < <(pkg_all_names | grep -E "${p#\~}" | sort -rV || true)
         elif pkg_candidate "$p"; then
             printf '%s\n' "$p"
             return 0
@@ -310,6 +394,10 @@ safe_purge() {
     local -a wanted=("$@") keep=() removed=()
     local pkg
     [[ ${#wanted[@]} -eq 0 ]] && return 0
+    if is_rhel; then
+        safe_purge_rpm "${wanted[@]}"
+        return 0
+    fi
     local set=" ${wanted[*]} "
     mapfile -t removed < <(apt-get -s purge "${wanted[@]}" 2>/dev/null | awk '/^Purg /{print $2}')
     local collateral=0
@@ -336,6 +424,32 @@ safe_purge() {
     if [[ ${#keep[@]} -gt 0 ]]; then
         log "purging: ${keep[*]}"
         apt-get purge -y -q "${keep[@]}"
+    fi
+}
+
+# RHEL family: "rpm -e --test" fails whenever a package outside the set
+# requires one of the targets, which is exactly the collateral check.
+safe_purge_rpm() {
+    local -a wanted=("$@") keep=()
+    local pkg
+    if rpm -e --test "${wanted[@]}" >/dev/null 2>&1; then
+        keep=("${wanted[@]}")
+    else
+        for pkg in "${wanted[@]}"; do
+            if rpm -e --test "$pkg" >/dev/null 2>&1; then
+                keep+=("$pkg")
+            else
+                log "keeping ${pkg}: removing it would also remove non-target packages"
+            fi
+        done
+        # Packages that only depend on each other (xterm + its libs) pass as a set.
+        if [[ ${#keep[@]} -gt 0 ]] && ! rpm -e --test "${keep[@]}" >/dev/null 2>&1; then
+            keep=()
+        fi
+    fi
+    if [[ ${#keep[@]} -gt 0 ]]; then
+        log "removing: ${keep[*]}"
+        dnf -y -q remove "${keep[@]}" >/dev/null
     fi
 }
 
@@ -377,7 +491,20 @@ preflight_os() {
     OS_MAJOR=${OS_VERSION%%.*}
     OS_CODENAME=${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}
     [[ -n $OS_MAJOR && $OS_MAJOR =~ ^[0-9]+$ ]] || die "cannot determine the ${OS_ID} release"
-    [[ -n $OS_CODENAME ]] || die "cannot determine the ${OS_ID} codename"
+    case $OS_ID in
+        debian|ubuntu) OS_FAMILY=deb ;;
+        rhel|centos|rocky|almalinux|ol) OS_FAMILY=rhel ;;
+        *)
+            if [[ " ${ID_LIKE:-} " == *" rhel "* ]]; then
+                OS_FAMILY=rhel
+            else
+                die "unsupported distribution '${OS_ID}' (Debian 12/13, Ubuntu 22.04/24.04/26.04, or RHEL/CentOS Stream/Rocky/AlmaLinux/Oracle Linux 8-10 required)"
+            fi
+            ;;
+    esac
+    if is_deb; then
+        [[ -n $OS_CODENAME ]] || die "cannot determine the ${OS_ID} codename"
+    fi
     case $OS_ID in
         debian)
             (( OS_MAJOR >= 12 )) || die "Debian ${OS_MAJOR} is not supported (Debian 12 or newer required)"
@@ -398,13 +525,37 @@ preflight_os() {
             # Empty NTP_SERVERS keeps the vendor chrony sources (NTS on 25.10+).
             ;;
         *)
-            die "unsupported distribution '${OS_ID}' (Debian 12/13 or Ubuntu 22.04/24.04/26.04 required)"
+            # RHEL family (ID allow-list or ID_LIKE=rhel).
+            (( OS_MAJOR >= 8 )) || die "${NAME:-$OS_ID} ${OS_VERSION} is not supported (release 8 or newer required)"
+            OS_NUM=$OS_MAJOR
+            OS_NAME="${NAME:-$OS_ID} ${OS_VERSION}"
+            case $OS_ID in
+                rocky)     SSG_PRODUCT="rl${OS_MAJOR}" ;;
+                almalinux) SSG_PRODUCT="almalinux${OS_MAJOR}" ;;
+                centos)    SSG_PRODUCT="cs${OS_MAJOR}" ;;
+                ol)        SSG_PRODUCT="ol${OS_MAJOR}" ;;
+                *)         SSG_PRODUCT="rhel${OS_MAJOR}" ;;
+            esac
+            ADMIN_GROUP=wheel
+            SSH_UNIT=sshd
             ;;
     esac
-    DEB_ARCH=$(dpkg --print-architecture)
+    if [[ -z $SCAP_PROFILE ]]; then
+        if is_rhel; then SCAP_PROFILE=cis; else SCAP_PROFILE=cis_level2_server; fi
+    fi
+    if [[ -z $SSH_LOGLEVEL ]]; then
+        if is_rhel; then SSH_LOGLEVEL=VERBOSE; else SSH_LOGLEVEL=INFO; fi
+    fi
+    if is_rhel; then
+        case $(uname -m) in
+            x86_64) DEB_ARCH=amd64 ;; aarch64) DEB_ARCH=arm64 ;; *) DEB_ARCH=$(uname -m) ;;
+        esac
+    else
+        DEB_ARCH=$(dpkg --print-architecture)
+    fi
     UID_MIN_VALUE=$(awk '/^[[:space:]]*UID_MIN[[:space:]]/{print $2}' /etc/login.defs 2>/dev/null || true)
     UID_MIN_VALUE=${UID_MIN_VALUE:-1000}
-    log "${OS_NAME} (${OS_CODENAME}) ${DEB_ARCH}; container=$(in_container && echo yes || echo no)"
+    log "${OS_NAME}${OS_CODENAME:+ (${OS_CODENAME})} ${DEB_ARCH}, ${OS_FAMILY} family; container=$(in_container && echo yes || echo no)"
 }
 
 # Interactive accounts that may log in (UID >= UID_MIN, real shell, not locked).
@@ -420,7 +571,7 @@ preflight_admin() {
     fi
     local u home hash ok=0
     local -a members
-    IFS=',' read -r -a members <<<"$(getent group sudo | cut -d: -f4)"
+    IFS=',' read -r -a members <<<"$(getent group "$ADMIN_GROUP" | cut -d: -f4)"
     for u in "${members[@]}"; do
         [[ -z $u ]] && continue
         id "$u" >/dev/null 2>&1 || continue
@@ -428,18 +579,18 @@ preflight_admin() {
         home=$(getent passwd "$u" | cut -d: -f6)
         hash=$(getent shadow "$u" | cut -d: -f2)
         if [[ -s ${home}/.ssh/authorized_keys || $hash == \$* ]]; then
-            log "administrator '${u}' (sudo group, has $( [[ -s ${home}/.ssh/authorized_keys ]] && echo 'SSH key' || echo 'password')) will retain access"
+            log "administrator '${u}' (${ADMIN_GROUP} group, has $( [[ -s ${home}/.ssh/authorized_keys ]] && echo 'SSH key' || echo 'password')) will retain access"
             ok=1
         fi
     done
     if [[ $ok -ne 1 ]]; then
-        die "no non-root member of group 'sudo' with an SSH key or password exists. Root SSH login is about to be disabled, which would lock you out. Create one first, e.g.: adduser admin && usermod -aG sudo admin"
+        die "no non-root member of group '${ADMIN_GROUP}' with an SSH key or password exists. Root SSH login is about to be disabled, which would lock you out. Create one first, e.g.: useradd -m admin && passwd admin && usermod -aG ${ADMIN_GROUP} admin"
     fi
     if [[ $SSH_DISABLE_PASSWORD == 1 ]]; then
         for u in "${members[@]}"; do
             [[ -z $u ]] && continue
             home=$(getent passwd "$u" | cut -d: -f6)
-            [[ -s ${home}/.ssh/authorized_keys ]] || die "SSH_DISABLE_PASSWORD=1 but sudo user '${u}' has no authorized_keys"
+            [[ -s ${home}/.ssh/authorized_keys ]] || die "SSH_DISABLE_PASSWORD=1 but ${ADMIN_GROUP} user '${u}' has no authorized_keys"
         done
     fi
 }
@@ -498,7 +649,11 @@ preflight_ipv6() {
 # 1. System minimalism
 # ============================================================================
 configure_apt_minimal() {
-    step "1.1 apt: never install recommends/suggests"
+    step "1.1 package manager: no recommended/weak dependencies, signatures enforced"
+    if is_rhel; then
+        configure_dnf_minimal
+        return 0
+    fi
     write_file 0644 /etc/apt/apt.conf.d/90-harden-no-recommends <<'EOF'
 // Managed by harden-and-audit.sh - keep the package footprint minimal.
 APT::Install-Recommends "0";
@@ -514,6 +669,28 @@ APT::ExtractTemplates::TempDir "/var/cache/harden-and-audit/apt-tmp";
 EOF
 }
 
+# dnf.conf [main]: no weak dependencies, signature checks everywhere (CIS),
+# and every configured repository keeps gpgcheck on.
+configure_dnf_minimal() {
+    local conf=/etc/dnf/dnf.conf kv f
+    backup_file "$conf"
+    grep -q '^\[main\]' "$conf" || printf '[main]\n' >>"$conf"
+    for kv in install_weak_deps=False gpgcheck=1 localpkg_gpgcheck=1 repo_gpgcheck=0 clean_requirements_on_remove=True skip_if_unavailable=False; do
+        # repo_gpgcheck=0: vendor repositories sign packages, not metadata;
+        # 1 would make every mirror without signed metadata unusable.
+        [[ ${kv%%=*} == repo_gpgcheck ]] && continue
+        sed -i -E "/^[[:space:]]*${kv%%=*}[[:space:]]*=/d" "$conf"
+        sed -i "/^\[main\]/a ${kv}" "$conf"
+    done
+    for f in /etc/yum.repos.d/*.repo; do
+        if grep -Eq '^[[:space:]]*gpgcheck[[:space:]]*=[[:space:]]*0' "$f"; then
+            backup_file "$f"
+            sed -i -E 's/^([[:space:]]*gpgcheck[[:space:]]*=[[:space:]]*)0/\11/' "$f"
+            warn "gpgcheck was off in ${f}: turned on (unsigned packages from it will now be refused)"
+        fi
+    done
+}
+
 purge_graphical() {
     step "1.2 purge graphical stack (display managers, desktops, X11, Wayland, Mesa)"
     local re='^(xserver-.*|xorg|xorg-.*|x11-.*|xinit|xauth|xterm|xwayland|weston|xbase-clients|xfonts-.*|'
@@ -526,13 +703,30 @@ purge_graphical() {
     re+='libxft2|libxv1|libxvmc1|libxaw7|libxkbfile1|libxmuu1|libxfont2|libxkbcommon-x11-0|libsm6|libice6|x11proto-.*|'
     re+='libwayland-.*|libgl1.*|libglx.*|libegl.*|libgles.*|libglapi-mesa|libgl1-mesa-dri|mesa-.*|libgbm1|libdrm-.*|'
     re+='libva-x11-.*|libva-drm-.*|libvdpau.*|xkb-data|libepoxy0|libllvm[0-9]+.*)$'
+    if is_rhel; then
+        # RPM names: X servers/clients, display managers, desktops, toolkits,
+        # X11/Wayland/Mesa client libraries.
+        re='^(xorg-x11-server-.*|xorg-x11-xinit.*|xorg-x11-xauth|xorg-x11-apps|xorg-x11-utils|xorg-x11-fonts-.*|xterm.*|xwayland.*|'
+        re+='gdm|lightdm.*|sddm.*|xdm|gnome-.*|kde-.*|plasma-.*|xfce4-.*|lxde-.*|lxqt-.*|cinnamon.*|mate-.*|'
+        re+='gtk2|gtk3|gtk4|qt5-qtbase-gui|qt6-qtbase-gui|'
+        re+='libX11|libX11-common|libX11-xcb|libxcb|libXau|libXdmcp|libXext|libXrender|libXfixes|libXi|libXrandr|libXinerama|libXcursor|'
+        re+='libXcomposite|libXdamage|libXtst|libXt|libXmu|libXpm|libxkbcommon.*|libxshmfence|libXxf86vm|libXScrnSaver|'
+        re+='libXft|libXv|libXaw|libxkbfile|libXfont2|libSM|libICE|xkeyboard-config|'
+        re+='libwayland-.*|libglvnd.*|mesa-.*|libdrm|libva|libvdpau|libepoxy|llvm-libs)$'
+    fi
     local -a candidates
-    mapfile -t candidates < <(dpkg-query -W -f='${db:Status-Status} ${Package}\n' 2>/dev/null | awk '$1=="installed"{print $2}' | grep -E "$re" || true)
+    mapfile -t candidates < <(pkg_list_installed | grep -E "$re" || true)
     if [[ ${#candidates[@]} -eq 0 ]]; then
         log "no graphical packages installed"
     else
         log "graphical candidates: ${candidates[*]}"
         safe_purge "${candidates[@]}"
+    fi
+    if is_rhel; then
+        # No "dnf autoremove": installer-placed packages are often marked as
+        # dependencies, and autoremove would take real services with it.
+        systemctl set-default multi-user.target >/dev/null
+        return 0
     fi
     apt-get autoremove --purge -y -q
     local -a residual
@@ -550,6 +744,11 @@ purge_insecure_services() {
         xinetd openbsd-inetd inetutils-inetd nis ypserv ypbind yp-tools ftp tnftp inetutils-ftp inetutils-ftpd vsftpd
         avahi-daemon avahi-autoipd cups cups-daemon cups-browsed rpcbind nfs-kernel-server isc-dhcp-server
         kea-dhcp4-server kea-dhcp6-server snmpd squid slapd ldap-utils autofs bluez dnsmasq)
+    if is_rhel; then
+        legacy=(telnet telnet-server rsh rsh-server talk talk-server tftp tftp-server xinetd ypserv ypbind ftp vsftpd
+            avahi avahi-autoipd cups rpcbind dhcp-server net-snmp squid openldap-servers openldap-clients autofs bluez
+            dnsmasq nfs-utils)
+    fi
     local -a present=() p
     for p in "${legacy[@]}"; do
         pkg_installed "$p" && present+=("$p")
@@ -567,12 +766,30 @@ purge_insecure_services() {
     if is_ubuntu; then
         purge_ubuntu_telemetry
     fi
+    if is_rhel; then
+        purge_rhel_extras
+    fi
     local srv
-    for srv in apache2 nginx bind9 samba dovecot-core squid vsftpd slapd; do
+    local -a servers=(apache2 nginx bind9 samba dovecot-core squid vsftpd slapd)
+    is_rhel && servers=(httpd nginx bind samba dovecot squid vsftpd openldap-servers)
+    for srv in "${servers[@]}"; do
         if pkg_installed "$srv"; then
             warn "application server '${srv}' is installed and was left in place; CIS expects it removed if not required"
         fi
     done
+}
+
+# RHEL family (CIS): crash reporting (abrt), SELinux troubleshooting daemons
+# that run as root (setroubleshoot) and the MLS translation service.
+purge_rhel_extras() {
+    local -a present=()
+    local p
+    while read -r p; do present+=("$p"); done < <(pkg_list_installed | grep -E '^(abrt.*|setroubleshoot.*|mcstrans)$' || true)
+    if [[ ${#present[@]} -gt 0 ]]; then
+        safe_purge "${present[@]}"
+    fi
+    disable_service abrtd.service abrt-journal-core.service abrt-oops.service mcstransd.service
+    return 0
 }
 
 # Ubuntu: crash reporting and telemetry. apport also replaces the kernel's
@@ -612,6 +829,10 @@ purge_ubuntu_telemetry() {
 configure_repositories() {
     if is_ubuntu; then
         configure_repositories_ubuntu
+        return 0
+    fi
+    if is_rhel; then
+        configure_repositories_rhel
         return 0
     fi
     step "2.1 official Debian repositories (stable, -updates, -security)"
@@ -747,8 +968,56 @@ EOF
     apt_update
 }
 
+# RHEL family: vendor BaseOS/AppStream stay as configured (often a regional
+# or private mirror). CRB/PowerTools and EPEL are enabled: EPEL provides
+# fail2ban, dkms and media libraries the vendor does not ship.
+configure_repositories_rhel() {
+    step "2.1 official EL repositories (BaseOS, AppStream, CRB) + EPEL"
+    if [[ $OS_ID == rhel ]] && command -v subscription-manager >/dev/null 2>&1; then
+        if ! subscription-manager status >/dev/null 2>&1; then
+            warn "this RHEL host is not registered with subscription-manager: only repositories configured locally are available"
+        fi
+    fi
+    if [[ -z $(dnf -q repolist --enabled 2>/dev/null | awk 'NR > 1') ]]; then
+        die "no package repository is enabled: register the host (subscription-manager register) or configure a mirror; automatic security updates are mandatory"
+    fi
+    dnf_install dnf-plugins-core
+    if [[ $EPEL_ENABLE == 1 ]]; then
+        local crb="" id
+        for id in crb powertools PowerTools codeready-builder-for-rhel-${OS_MAJOR}-$(uname -m)-rpms; do
+            if dnf -q repolist --all 2>/dev/null | awk '{print $1}' | qgrep -Fx "$id"; then
+                crb=$id
+                break
+            fi
+        done
+        if [[ -n $crb ]]; then
+            dnf config-manager --set-enabled "$crb" >/dev/null 2>&1 || warn "could not enable the ${crb} repository"
+        elif [[ $OS_ID == rhel ]] && command -v subscription-manager >/dev/null 2>&1; then
+            subscription-manager repos --enable "codeready-builder-for-rhel-${OS_MAJOR}-$(uname -m)-rpms" >/dev/null 2>&1 \
+                || warn "could not enable CodeReady Builder (some EPEL packages need it)"
+        fi
+        if ! pkg_installed epel-release; then
+            if [[ $OS_ID == rhel || $OS_ID == ol ]] && ! dnf -q list --available epel-release >/dev/null 2>&1; then
+                rpm --import "https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-${OS_MAJOR}"
+                dnf_install "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${OS_MAJOR}.noarch.rpm"
+            else
+                dnf_install epel-release
+            fi
+        fi
+        log "EPEL enabled (set EPEL_ENABLE=0 to stay on vendor repositories only)"
+    else
+        warn "EPEL_ENABLE=0: fail2ban, dkms and some media libraries are not available from vendor repositories"
+    fi
+    configure_dnf_minimal
+    pkg_refresh
+}
+
 install_base_stack() {
     step "2.2 install the hardened base server stack"
+    if is_rhel; then
+        install_base_stack_rhel
+        return 0
+    fi
     local -a pkgs=(openssh-server openssh-client tmux curl git ufw iptables fail2ban python3-systemd
         libpam-pwquality libpam-modules libpam-runtime auditd audispd-plugins unattended-upgrades
         sudo rsyslog rsyslog-gnutls logrotate cron acl vlock apparmor apparmor-utils unzip perl
@@ -765,11 +1034,39 @@ install_base_stack() {
     apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade
 }
 
+install_base_stack_rhel() {
+    local -a pkgs=(openssh-server openssh-clients tmux kbd git firewalld nftables libpwquality pam
+        audit rsyslog rsyslog-gnutls logrotate cronie acl unzip perl procps-ng iproute kmod e2fsprogs chrony
+        dnf-automatic sudo policycoreutils policycoreutils-python-utils selinux-policy-targeted
+        crypto-policies-scripts authselect grubby python3-systemd) opt
+    # CIS EL: systemd-journal-remote available (its listener stays masked, see
+    # configure_logging), a local-only MTA (postfix).
+    for opt in systemd-journal-remote postfix; do
+        pkg_candidate "$opt" && pkgs+=("$opt")
+    done
+    # EL9+ images ship curl-minimal, which conflicts with curl: keep either.
+    pkg_installed curl-minimal || pkg_installed curl || pkgs+=(curl)
+    # audit 4 (EL10) splits augenrules' default rules into audit-rules.
+    opt=$(first_available audit-rules) && pkgs+=("$opt")
+    if [[ $EPEL_ENABLE == 1 ]]; then
+        for opt in fail2ban-server fail2ban-firewalld fail2ban-systemd; do
+            pkg_candidate "$opt" && pkgs+=("$opt")
+        done
+    fi
+    dnf_install "${pkgs[@]}"
+    log "installing pending updates"
+    dnf -y -q upgrade --refresh >/dev/null
+}
+
 configure_unattended_upgrades() {
     step "2.3 unattended security upgrades (daily, mandatory)"
     # Owner policy: automatic distro security updates are NOT optional. There
     # is deliberately no opt-out variable, and the run fails on a real host if
     # they are not effectively enabled (masked timers, overriding apt.conf.d).
+    if is_rhel; then
+        configure_dnf_automatic
+        return 0
+    fi
     write_file 0644 /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 // Managed by harden-and-audit.sh
 APT::Periodic::Enable "1";
@@ -865,6 +1162,59 @@ EOF
         fi
     done
     log "automatic security updates: enabled (apt-daily + apt-daily-upgrade timers active, security origins only)"
+}
+
+# RHEL family: dnf-automatic applies updates daily. Security errata only,
+# except on CentOS Stream, which publishes no errata (security-only would
+# never install anything there).
+configure_dnf_automatic() {
+    local type=security conf=/etc/dnf/automatic.conf u
+    if [[ $OS_ID == centos ]]; then
+        type=default
+        log "CentOS Stream publishes no security errata: dnf-automatic applies all updates"
+    fi
+    write_file 0644 "$conf" <<EOF
+# Managed by ${SCRIPT_NAME} - automatic updates are mandatory (owner policy).
+[commands]
+upgrade_type = ${type}
+random_sleep = 0
+network_online_timeout = 60
+download_updates = yes
+apply_updates = yes
+reboot = never
+
+[emitters]
+emit_via = stdio
+system_name = $(hostname)
+
+[email]
+email_from = root@localhost
+email_to = root
+email_host = localhost
+
+[command]
+
+[command_email]
+
+[base]
+debuglevel = 1
+EOF
+    # The timer must run: unmask (golden images mask it), enable, start.
+    for u in dnf-automatic.timer dnf-automatic.service; do
+        systemctl unmask "$u" >/dev/null 2>&1 || true
+    done
+    # The other dnf-automatic timers would race the managed one.
+    systemctl disable --now dnf-automatic-notifyonly.timer dnf-automatic-download.timer dnf-automatic-install.timer >/dev/null 2>&1 || true
+    systemctl enable --now dnf-automatic.timer >/dev/null 2>&1 || true
+    grep -Eq '^apply_updates[[:space:]]*=[[:space:]]*yes$' "$conf" || die "automatic updates are mandatory but apply_updates is not yes in ${conf}"
+    if ! systemctl is-enabled --quiet dnf-automatic.timer 2>/dev/null || ! systemctl is-active --quiet dnf-automatic.timer 2>/dev/null; then
+        in_container || die "automatic security updates are mandatory but dnf-automatic.timer is not enabled and active"
+        warn "container: dnf-automatic.timer is not active here (it is enforced on a real host)"
+    fi
+    if grep -Eq '^[[:space:]]*(exclude|excludepkgs)[[:space:]]*=' /etc/dnf/dnf.conf; then
+        warn "/etc/dnf/dnf.conf excludes packages from every update (review: $(grep -E '^[[:space:]]*(exclude|excludepkgs)[[:space:]]*=' /etc/dnf/dnf.conf | tr '\n' ' '))"
+    fi
+    log "automatic updates: dnf-automatic.timer active, upgrade_type=${type}, apply_updates=yes"
 }
 
 # ============================================================================
@@ -976,12 +1326,14 @@ EOF
 -w /etc/hosts -p wa -k system-locale
 -w /etc/hostname -p wa -k system-locale
 -w /etc/networks -p wa -k system-locale
--w /etc/network/ -p wa -k system-locale
--w /etc/NetworkManager -p wa -k system-locale
+$(for d in /etc/network/ /etc/NetworkManager /etc/sysconfig/network /etc/sysconfig/network-scripts; do
+    if [[ -e $d ]]; then echo "-w ${d} -p wa -k system-locale"; fi
+done)
 
-## --- Mandatory access control (AppArmor)
--w /etc/apparmor -p wa -k MAC-policy
--w /etc/apparmor.d -p wa -k MAC-policy
+## --- Mandatory access control (AppArmor / SELinux)
+$(for d in /etc/apparmor /etc/apparmor.d /etc/selinux/ /usr/share/selinux/; do
+    if [[ -e $d ]]; then echo "-w ${d} -p wa -k MAC-policy"; fi
+done)
 
 ## --- Login / logout and sessions
 -w /var/log/lastlog -p wa -k logins
@@ -1036,6 +1388,14 @@ EOF
 -a always,exit -F path=/usr/bin/chacl -F perm=x -F auid>=${uid} -F auid!=unset -k perm_chng
 -a always,exit -F path=/usr/sbin/usermod -F perm=x -F auid>=${uid} -F auid!=unset -k usermod
 EOF
+    # EL content checks the syscall form of every watch, for both ABIs:
+    # "-a always,exit -F arch=b64 -F path=/etc/passwd -F perm=wa -k identity"
+    # (dir= with a trailing slash for directories).
+    if is_rhel; then
+        install -d -m 0755 /etc/sysconfig/network-scripts
+        install -d -m 0755 /var/run/faillock
+        audit_watches_to_syscall ${rules_dir}/50-harden.rules
+    fi
     # Syscalls added in Linux 6.6 (fchmodat2) / 3.15 (renameat2): emitted only
     # for the architectures whose syscall table the installed audit userspace
     # knows (fchmodat2 is unknown before audit 4.x, e.g. Ubuntu 22.04/24.04).
@@ -1055,8 +1415,8 @@ EOF
             fi
         done
     done
-    # Ubuntu CIS also audits extended-attribute changes made as root (auid=0).
-    if is_ubuntu; then
+    # Ubuntu and EL CIS also audit extended-attribute changes made as root (auid=0).
+    if is_ubuntu || is_rhel; then
         newrules+=("-a always,exit -F arch=b64 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid=0 -k perm_mod"
                    "-a always,exit -F arch=b32 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid=0 -k perm_mod")
     fi
@@ -1113,6 +1473,28 @@ EOF
     fi
 }
 
+# audit_watches_to_syscall FILE - add the syscall form next to every
+# "-w PATH -p PERM -k KEY" line. The EL content checks some watches as -w
+# (/etc/selinux/, /etc/hosts) and others as "-F path=" (even directories such
+# as /etc/NetworkManager) or "-F dir=.../" (/etc/pam.d/): a trailing slash in
+# the source rule selects dir=. Both forms audit the same writes.
+audit_watches_to_syscall() {
+    local file=$1 tmp line path perm key field
+    tmp=$(mktemp)
+    while IFS= read -r line; do
+        printf '%s\n' "$line"
+        if [[ $line =~ ^-w[[:space:]]+([^[:space:]]+)[[:space:]]+-p[[:space:]]+([rwxa]+)[[:space:]]+-k[[:space:]]+([^[:space:]]+) ]]; then
+            path=${BASH_REMATCH[1]}; perm=${BASH_REMATCH[2]}; key=${BASH_REMATCH[3]}
+            field=path
+            [[ $path == */ ]] && field=dir
+            echo "-a always,exit -F arch=b64 -F ${field}=${path} -F perm=${perm} -k ${key}"
+            echo "-a always,exit -F arch=b32 -F ${field}=${path} -F perm=${perm} -k ${key}"
+        fi
+    done <"$file" >"$tmp"
+    cat "$tmp" >"$file"
+    rm -f "$tmp"
+}
+
 # ============================================================================
 # 4. FIPS cryptography
 # ============================================================================
@@ -1139,7 +1521,11 @@ grub_set_args() {
 }
 
 configure_grub() {
-    step "4.1 kernel command line: fips=1, audit, AppArmor, memory hardening"
+    step "4.1 kernel command line: fips=1, audit, MAC, memory hardening"
+    if is_rhel; then
+        configure_grub_rhel
+        return 0
+    fi
     if [[ ! -f /etc/default/grub ]]; then
         warn "GRUB is not installed (/etc/default/grub missing): kernel arguments (fips=1, audit=1, ...) must be set in this host's bootloader manually"
         return 0
@@ -1147,9 +1533,7 @@ configure_grub() {
     backup_file /etc/default/grub
     # GRUB_CMDLINE_LINUX applies to every boot entry, including recovery;
     # fips=1 is also put in the default (non-recovery) string, as required.
-    local -a kargs=(fips=1 audit=1 audit_backlog_limit=8192 apparmor=1 security=apparmor
-        slab_nomerge=yes pti=on page_alloc.shuffle=1 vsyscall=none init_on_alloc=1
-        spectre_v2=on spec_store_bypass_disable=seccomp rng_core.default_quality=500)
+    local -a kargs=("${KARGS_COMMON[@]}" apparmor=1 security=apparmor)
     grub_set_args GRUB_CMDLINE_LINUX_DEFAULT fips=1
     grub_set_args GRUB_CMDLINE_LINUX "${kargs[@]}"
     grep -E '^GRUB_CMDLINE_LINUX=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to GRUB_CMDLINE_LINUX"
@@ -1252,6 +1636,67 @@ EOF
     done
 }
 
+# Kernel arguments shared by both families (the Debian family adds AppArmor;
+# on the RHEL family "security=apparmor" would switch SELinux off).
+KARGS_COMMON=(fips=1 audit=1 audit_backlog_limit=8192 slab_nomerge=yes pti=on page_alloc.shuffle=1
+    vsyscall=none init_on_alloc=1 spectre_v2=on spec_store_bypass_disable=seccomp rng_core.default_quality=500)
+
+# RHEL family: grubby edits every installed kernel's BLS entry; GRUB_CMDLINE_LINUX
+# in /etc/default/grub carries the arguments to kernels installed later.
+configure_grub_rhel() {
+    local -a kargs=("${KARGS_COMMON[@]}")
+    # FIPS with a separate /boot: the initramfs verifies the kernel HMAC there.
+    local bootdev
+    if findmnt -n /boot >/dev/null 2>&1; then
+        bootdev=$(findmnt -n -o UUID /boot 2>/dev/null || true)
+        [[ -n $bootdev ]] && kargs+=("boot=UUID=${bootdev}")
+    fi
+    if [[ -f /etc/default/grub ]]; then
+        backup_file /etc/default/grub
+        grub_set_args GRUB_CMDLINE_LINUX "${kargs[@]}"
+        # A disabled SELinux on the command line would defeat the MAC control.
+        sed -i -E 's/(^GRUB_CMDLINE_LINUX="[^"]*)\b(selinux|enforcing)=0\b ?/\1/g' /etc/default/grub
+        grep -E '^GRUB_CMDLINE_LINUX=' /etc/default/grub | qgrep 'fips=1' || die "fips=1 was not written to GRUB_CMDLINE_LINUX"
+    else
+        warn "/etc/default/grub missing: kernel arguments are applied with grubby only"
+    fi
+    if command -v grubby >/dev/null 2>&1; then
+        host_only "grubby: add kernel arguments" grubby --update-kernel=ALL --args="${kargs[*]}"
+        host_only "grubby: remove selinux=0/enforcing=0" grubby --update-kernel=ALL --remove-args="selinux enforcing"
+    fi
+    if [[ $ENABLE_GRUB_PASSWORD == 1 && -d /boot/grub2 ]]; then
+        # What grub2-setpassword writes: only editing and the GRUB shell need
+        # it; EL menu entries are unrestricted, so normal boots do not.
+        local hash=$GRUB_PASSWORD_PBKDF2 pw
+        if [[ -z $hash && -f ${STATE_DIR}/grub.pbkdf2 ]]; then
+            hash=$(cat "${STATE_DIR}/grub.pbkdf2")
+        fi
+        if [[ -z $hash ]]; then
+            pw=$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)
+            hash=$(printf '%s\n%s\n' "$pw" "$pw" | grub2-mkpasswd-pbkdf2 2>/dev/null | awk '/grub\.pbkdf2/ {print $NF}')
+            [[ $hash == grub.pbkdf2.* ]] || die "could not generate GRUB password hash"
+            umask 077
+            printf 'GRUB superuser: root\nGRUB password:  %s\n(Editing boot entries requires this; normal boots do not.)\n' "$pw" >/root/grub-superuser-password.txt
+            umask 022
+            chmod 0400 /root/grub-superuser-password.txt
+            warn "generated a GRUB superuser password: /root/grub-superuser-password.txt (store it in your vault and delete the file)"
+        fi
+        printf '%s\n' "$hash" >"${STATE_DIR}/grub.pbkdf2"
+        chmod 0600 "${STATE_DIR}/grub.pbkdf2"
+        printf 'GRUB2_PASSWORD=%s\n' "$hash" | write_file 0600 /boot/grub2/user.cfg
+    fi
+    local cfg
+    if [[ -f /boot/grub2/grub.cfg ]] && command -v grub2-mkconfig >/dev/null 2>&1; then
+        host_only "grub2-mkconfig" grub2-mkconfig -o /boot/grub2/grub.cfg
+    fi
+    for cfg in /boot/grub2/grub.cfg /boot/grub2/user.cfg /boot/grub2/grubenv /boot/efi/EFI/*/grub.cfg /boot/efi/EFI/*/user.cfg; do
+        if [[ -f $cfg && $cfg != /boot/efi/* ]]; then
+            chown root:root "$cfg"
+            chmod 0600 "$cfg"
+        fi
+    done
+}
+
 # fips_selftest MODULE FIPSCNF - load the provider in isolation. Loading runs
 # the module's integrity check and known-answer self-tests (FIPS 140-3
 # "self-test on load"); success proves the installed module is intact.
@@ -1301,7 +1746,12 @@ sys.exit(0 if ok else 1)'; then
 }
 
 install_fips_provider() {
-    step "4.2 build & install the validated OpenSSL ${FIPS_OPENSSL_VERSION} FIPS provider"
+    step "4.2 FIPS 140 cryptographic module"
+    if is_rhel; then
+        enable_fips_rhel
+        return 0
+    fi
+    log "building the validated OpenSSL ${FIPS_OPENSSL_VERSION} FIPS provider (FIPS 140-3 cert #4985)"
     if ubuntu_pro_fips_active; then
         log "Ubuntu Pro FIPS is enabled: Canonical's certified OpenSSL FIPS provider is kept; the ${FIPS_OPENSSL_VERSION} build is skipped"
         return 0
@@ -1347,6 +1797,28 @@ install_fips_provider() {
     log "FIPS provider installed: ${module}"
 }
 
+# RHEL family: the distribution's own FIPS module (its OpenSSL is built to
+# load it when the kernel runs in FIPS mode). A second, self-built provider
+# is never stacked on it.
+enable_fips_rhel() {
+    if [[ $(cat /proc/sys/crypto/fips_enabled 2>/dev/null) == 1 ]]; then
+        log "kernel already in FIPS mode"
+    fi
+    if in_container; then
+        update-crypto-policies --set FIPS >/dev/null
+        warn "container: kernel FIPS mode is host-global; crypto policy FIPS set, fips=1 applies on a real host"
+        return 0
+    fi
+    if command -v fips-mode-setup >/dev/null 2>&1; then
+        # EL8/9: crypto policy FIPS, dracut-fips (EL8), fips=1 (+ boot=) on every kernel.
+        fips-mode-setup --enable >/dev/null || die "fips-mode-setup --enable failed"
+    else
+        # EL10 removed fips-mode-setup: policy here, fips=1 by configure_grub.
+        update-crypto-policies --set FIPS >/dev/null
+    fi
+    log "FIPS mode configured (distribution module); active after reboot"
+}
+
 # tls_loopback_test CONF - full TLS handshake through 127.0.0.1 with CONF as
 # the system OpenSSL configuration (catches provider/algorithm mismatches
 # that would otherwise break curl, git and every other TLS client).
@@ -1371,7 +1843,17 @@ tls_loopback_test() {
 }
 
 configure_openssl_fips() {
-    step "4.3 OpenSSL: activate the FIPS provider alongside the default provider"
+    step "4.3 system cryptography: FIPS provider / crypto policy"
+    if is_rhel; then
+        local pol
+        pol=$(update-crypto-policies --show 2>/dev/null || true)
+        [[ $pol == FIPS* ]] || die "system crypto policy is '${pol}', expected FIPS"
+        if command -v sshd >/dev/null 2>&1; then
+            sshd_test >/dev/null 2>&1 || die "sshd rejects its configuration under the FIPS crypto policy"
+        fi
+        log "system crypto policy: ${pol} (OpenSSL, GnuTLS, NSS, OpenSSH, Kerberos, libssh follow it)"
+        return 0
+    fi
     if ubuntu_pro_fips_active; then
         log "Ubuntu Pro FIPS is enabled: /etc/ssl/openssl.cnf is managed by the Pro FIPS packages and left unchanged"
         return 0
@@ -1474,19 +1956,26 @@ harden_file_permissions() {
     step "5.1 critical file ownership and permissions"
     chown root:root /etc/passwd /etc/group
     chmod 0644 /etc/passwd /etc/group
-    chown root:shadow /etc/shadow /etc/gshadow
-    chmod 0640 /etc/shadow /etc/gshadow
     local f
+    if is_rhel; then
+        # EL: no shadow group; the shadow files are root-only (CIS: 0000).
+        for f in /etc/shadow /etc/gshadow /etc/shadow- /etc/gshadow-; do
+            [[ -f $f ]] && { chown root:root "$f"; chmod 0000 "$f"; }
+        done
+    else
+        chown root:shadow /etc/shadow /etc/gshadow
+        chmod 0640 /etc/shadow /etc/gshadow
+        # Backup copies of the password databases: nobody needs to read them.
+        [[ -f /etc/shadow- ]] && { chown root:shadow /etc/shadow-; chmod 0000 /etc/shadow-; }
+        # CIS Debian 12 and Ubuntu expect group shadow here, CIS Debian 13 root.
+        if [[ -f /etc/gshadow- ]]; then
+            if is_debian && (( OS_MAJOR >= 13 )); then chown root:root /etc/gshadow-; else chown root:shadow /etc/gshadow-; fi
+            chmod 0000 /etc/gshadow-
+        fi
+    fi
     for f in /etc/passwd- /etc/group-; do
         [[ -f $f ]] && { chown root:root "$f"; chmod 0644 "$f"; }
     done
-    # Backup copies of the password databases: nobody needs to read them.
-    [[ -f /etc/shadow- ]] && { chown root:shadow /etc/shadow-; chmod 0000 /etc/shadow-; }
-    # CIS Debian 12 and Ubuntu expect group shadow here, CIS Debian 13 root.
-    if [[ -f /etc/gshadow- ]]; then
-        if is_debian && (( OS_MAJOR >= 13 )); then chown root:root /etc/gshadow-; else chown root:shadow /etc/gshadow-; fi
-        chmod 0000 /etc/gshadow-
-    fi
     [[ -f /etc/shells ]] && { chown root:root /etc/shells; chmod 0644 /etc/shells; }
     if [[ -f /etc/security/opasswd ]]; then chown root:root /etc/security/opasswd; chmod 0600 /etc/security/opasswd; fi
     if [[ -f /etc/security/opasswd.old ]]; then chown root:root /etc/security/opasswd.old; chmod 0600 /etc/security/opasswd.old; fi
@@ -1522,9 +2011,11 @@ harden_file_permissions() {
     # Log files: no group write, no world access (rsyslog will keep 0640).
     find /var/log -type f -perm /u+xs,g+xws,o+xwrt -exec chmod u-xs,g-xws,o-xwrt {} + 2>/dev/null || true
     find /var/log -type d -perm /o+w -exec chmod o-w {} + 2>/dev/null || true
-    for f in /var/log/syslog /var/log/auth.log /var/log/kern.log /var/log/messages /var/log/user.log /var/log/cron.log; do
-        [[ -f $f ]] && chgrp adm "$f"
-    done
+    if is_deb; then
+        for f in /var/log/syslog /var/log/auth.log /var/log/kern.log /var/log/messages /var/log/user.log /var/log/cron.log; do
+            [[ -f $f ]] && chgrp adm "$f"
+        done
+    fi
     for f in /var/log/wtmp /var/log/btmp /var/log/lastlog; do
         [[ -f $f ]] && chgrp utmp "$f"
     done
@@ -1740,6 +2231,18 @@ configure_sshd() {
     done < <(interactive_users)
     local pwauth="# PasswordAuthentication: unchanged (set SSH_DISABLE_PASSWORD=1 for key-only)"
     [[ $SSH_DISABLE_PASSWORD == 1 ]] && pwauth="PasswordAuthentication no"
+    # Debian family: explicit FIPS algorithms. RHEL family: the system crypto
+    # policy (FIPS) governs sshd; CIS fails sshd_config overrides of it.
+    # EL CIS: one unanswered keepalive (300 s) ends the session; Debian/Ubuntu CIS: 3.
+    local alive_max=3
+    is_rhel && alive_max=1
+    local crypto=""
+    if is_deb; then
+        crypto='Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+KexAlgorithms ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256
+'
+    fi
     local block
     block=$(cat <<EOF
 # BEGIN ${MARK} managed block - first match wins in sshd, keep this at the top
@@ -1757,7 +2260,7 @@ MaxSessions 10
 MaxStartups 10:30:60
 LoginGraceTime 60
 ClientAliveInterval 300
-ClientAliveCountMax 3
+ClientAliveCountMax ${alive_max}
 HostbasedAuthentication no
 IgnoreRhosts yes
 PermitEmptyPasswords no
@@ -1773,15 +2276,13 @@ Compression no
 PrintLastLog yes
 Banner /etc/issue.net
 AllowGroups ssh-users
-Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
-MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
-KexAlgorithms ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256
-RekeyLimit 1G 1h
+${crypto}RekeyLimit 1G 1h
 # END ${MARK} managed block
 EOF
 )
     local keys
     keys=$(sed -n '/^# BEGIN/,/^# END/p' <<<"$block" | awk '!/^#/ && NF {print $1}' | sort -u | paste -sd'|')
+    is_rhel && keys+="|Ciphers|MACs|KexAlgorithms"
     local tmp
     tmp=$(mktemp "${cfg}.XXXXXX")
     {
@@ -1810,21 +2311,35 @@ EOF
     fi
     mv -f "$tmp" "$cfg"
     # Host keys
-    for f in /etc/ssh/ssh_host_*_key; do chown root:root "$f"; chmod 0600 "$f"; done
+    if is_rhel && getent group ssh_keys >/dev/null; then
+        for f in /etc/ssh/ssh_host_*_key; do chown root:ssh_keys "$f"; chmod 0600 "$f"; done
+    else
+        for f in /etc/ssh/ssh_host_*_key; do chown root:root "$f"; chmod 0600 "$f"; done
+    fi
     for f in /etc/ssh/ssh_host_*_key.pub; do chown root:root "$f"; chmod 0644 "$f"; done
-    systemctl enable ssh.service >/dev/null 2>&1 || true
-    if systemctl is-active --quiet ssh.service; then
-        systemctl reload ssh.service
+    if is_rhel; then
+        # Keys cleared by the crypto policy above stay out of sshd_config.d too.
+        for f in /etc/ssh/sshd_config.d/*.conf; do
+            sed -i -E 's/^([[:space:]]*(Ciphers|MACs|KexAlgorithms)[[:space:]].*)/# overridden by '"${MARK}"' (system crypto policy): \1/I' "$f"
+        done
+    fi
+    systemctl enable "${SSH_UNIT}.service" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "${SSH_UNIT}.service"; then
+        systemctl reload "${SSH_UNIT}.service"
     else
         # Socket activation (Ubuntu 22.10+): ssh.socket holds the listener and
         # hands it to ssh.service, which then reads the new configuration.
-        systemctl start ssh.service
+        systemctl start "${SSH_UNIT}.service"
     fi
     log "sshd reloaded (existing sessions are not interrupted)"
 }
 
 configure_ufw() {
-    step "5.4 UFW host firewall (default deny inbound)"
+    step "5.4 host firewall: default deny inbound (UFW / firewalld)"
+    if is_rhel; then
+        configure_firewalld
+        return 0
+    fi
     sed -i -E 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
     if [[ $ALLOW_CONTAINERS != 1 ]]; then
         sed -i -E 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="DROP"/' /etc/default/ufw
@@ -1844,9 +2359,9 @@ configure_ufw() {
     ufw allow out on lo >/dev/null
     ufw deny in from 127.0.0.0/8 >/dev/null
     ufw deny in from ::1 >/dev/null
-    if [[ $UFW_OUTBOUND_POLICY == deny ]]; then
+    if [[ $FIREWALL_OUTBOUND_POLICY == deny ]]; then
         local r
-        for r in 53/udp 53/tcp 67/udp 547/udp 123/udp 80/tcp 443/tcp $UFW_EXTRA_OUT; do
+        for r in 53/udp 53/tcp 67/udp 547/udp 123/udp 80/tcp 443/tcp $FIREWALL_EXTRA_OUT; do
             ufw allow out "$r" comment 'egress allow-list (harden-and-audit)' >/dev/null
         done
         ufw default deny outgoing >/dev/null
@@ -1863,6 +2378,65 @@ configure_ufw() {
     # 'ufw enable' loads the rules but leaves the oneshot unit inactive.
     host_only "start ufw.service" systemctl start ufw.service
     ufw status verbose || true
+}
+
+# RHEL family: firewalld, default zone public with only SSH (and DHCPv6
+# client) open, loopback anti-spoofing, optional egress allow-list.
+configure_firewalld() {
+    systemctl unmask firewalld.service >/dev/null 2>&1 || true
+    systemctl enable firewalld.service >/dev/null 2>&1 || true
+    if ! systemctl is-active --quiet firewalld.service; then
+        host_only "start firewalld" systemctl start firewalld.service
+    fi
+    local zone=public p svc online=0
+    systemctl is-active --quiet firewalld.service && online=1
+    # fw: permanent configuration, through the daemon or (not running, e.g.
+    # no netfilter in a container) firewall-offline-cmd on the same files.
+    if [[ $online == 1 ]]; then
+        fw() { firewall-cmd --permanent -q "$@"; }
+        firewall-cmd -q --set-default-zone="$zone"
+    else
+        fw() { firewall-offline-cmd -q "$@"; }
+        firewall-offline-cmd -q --set-default-zone="$zone"
+    fi
+    # SSH first, before anything is removed - never cut the session.
+    for p in "${SSH_PORTS[@]}"; do
+        if [[ $p == 22 ]]; then fw --zone="$zone" --add-service=ssh; else fw --zone="$zone" --add-port="${p}/tcp"; fi
+    done
+    local -a listed
+    if [[ $online == 1 ]]; then
+        read -r -a listed <<<"$(firewall-cmd --permanent --zone="$zone" --list-services 2>/dev/null)"
+    else
+        read -r -a listed <<<"$(firewall-offline-cmd --zone="$zone" --list-services 2>/dev/null)"
+    fi
+    for svc in "${listed[@]}"; do
+        case $svc in ssh|dhcpv6-client) ;; *) fw --zone="$zone" --remove-service="$svc"; log "firewalld: closed ${svc} in zone ${zone}" ;; esac
+    done
+    # Loopback: trusted on lo, spoofed 127.0.0.0/8 / ::1 from elsewhere dropped.
+    fw --zone=trusted --add-interface=lo 2>/dev/null || true
+    local zr
+    for zr in trusted "$zone"; do
+        fw --zone="$zr" --add-rich-rule='rule family="ipv4" source address="127.0.0.1" destination not address="127.0.0.1" drop' 2>/dev/null || true
+        fw --zone="$zr" --add-rich-rule='rule family="ipv6" source address="::1" destination not address="::1" drop' 2>/dev/null || true
+    done
+    # firewalld drives nftables itself: a second ruleset service would conflict (CIS).
+    systemctl disable --now nftables.service >/dev/null 2>&1 || true
+    systemctl mask nftables.service >/dev/null 2>&1 || true
+    if [[ $FIREWALL_OUTBOUND_POLICY == deny ]]; then
+        local r
+        fw --get-policies 2>/dev/null | qgrep -w harden-egress || fw --new-policy=harden-egress
+        fw --policy=harden-egress --add-ingress-zone=HOST
+        fw --policy=harden-egress --add-egress-zone=ANY
+        fw --policy=harden-egress --set-target=REJECT
+        for r in 53/udp 53/tcp 67/udp 547/udp 123/udp 80/tcp 443/tcp $FIREWALL_EXTRA_OUT; do
+            fw --policy=harden-egress --add-port="$r"
+        done
+    fi
+    unset -f fw
+    if [[ $online == 1 ]]; then
+        firewall-cmd -q --reload
+        firewall-cmd --list-all || true
+    fi
 }
 
 configure_pam() {
@@ -1907,6 +2481,104 @@ EOF
     chown root:root /etc/security/opasswd
     chmod 0600 /etc/security/opasswd
 
+    if is_rhel; then
+        configure_authselect
+    else
+        configure_pam_debian
+    fi
+
+    # su is restricted to members of the (empty) sugroup: admins use sudo.
+    getent group sugroup >/dev/null || groupadd -r sugroup
+    backup_file /etc/pam.d/su
+    if ! grep -Eq '^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_wheel\.so.*group=sugroup' /etc/pam.d/su; then
+        sed -i -E '/^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_wheel\.so/d' /etc/pam.d/su
+        sed -i '0,/^# auth       required   pam_wheel.so$/s//# auth       required   pam_wheel.so\nauth       required   pam_wheel.so use_uid group=sugroup/' /etc/pam.d/su
+        # EL: no commented example; after pam_rootok (root keeps su), else first.
+        if ! grep -q 'group=sugroup' /etc/pam.d/su; then
+            if grep -Eq '^auth[[:space:]]+sufficient[[:space:]]+pam_rootok\.so' /etc/pam.d/su; then
+                sed -i -E '0,/^auth[[:space:]]+sufficient[[:space:]]+pam_rootok\.so.*$/s//&\nauth       required   pam_wheel.so use_uid group=sugroup/' /etc/pam.d/su
+            else
+                sed -i '0,/^auth/s//auth       required   pam_wheel.so use_uid group=sugroup\nauth/' /etc/pam.d/su
+            fi
+        fi
+        grep -q 'group=sugroup' /etc/pam.d/su || printf 'auth       required   pam_wheel.so use_uid group=sugroup\n' >>/etc/pam.d/su
+    fi
+    # shadow group must have no members (CIS)
+    if [[ -n $(getent group shadow | cut -d: -f4) ]]; then
+        gpasswd -M '' shadow >/dev/null
+    fi
+}
+
+# RHEL family: a custom authselect profile (CIS EL) with faillock, password
+# history and no nullok. pam_pwhistory gets remember=24 in the profile
+# itself (EL8's PAM has no pwhistory.conf). The base profile must match the
+# installed modules: "sssd" needs pam_sss.so (sssd-client); without it the
+# account phase denies EVERY login, SSH included. Local-only hosts use
+# "minimal" (EL8/9) or "local" (EL10).
+pam_modules_present() {
+    local f m missing=0
+    for f in "$@"; do
+        while read -r m; do
+            [[ -e /usr/lib64/security/${m} || -e /usr/lib/security/${m} || -e /lib64/security/${m} ]] && continue
+            echo "PAM module ${m} referenced by ${f} is not installed" >&2
+            missing=1
+        done < <(grep -Eo '^[^#]*\b(pam_[a-z0-9_]+\.so)' "$f" | grep -Eo 'pam_[a-z0-9_]+\.so' | sort -u)
+    done
+    return "$missing"
+}
+
+configure_authselect() {
+    local base prof=/etc/authselect/custom/harden f feat
+    if [[ -e /usr/lib64/security/pam_sss.so ]]; then
+        base=sssd
+    elif authselect list 2>/dev/null | qgrep -E '^-[[:space:]]+local[[:space:]]'; then
+        base=local
+    else
+        base=minimal
+    fi
+    # A profile created from another base (earlier run, sssd removed) is rebuilt.
+    if [[ -d $prof && $(cat "${prof}/.harden-base" 2>/dev/null) != "$base" ]]; then
+        rm -rf "$prof"
+    fi
+    if [[ ! -d $prof ]]; then
+        authselect create-profile harden -b "$base" --symlink-meta >/dev/null
+        echo "$base" >"${prof}/.harden-base"
+    fi
+    for f in system-auth password-auth; do
+        [[ -f ${prof}/${f} ]] || continue
+        # EL9+: pwhistory.conf carries remember/enforce_for_root (CIS checks it there).
+        if (( OS_MAJOR == 8 )); then
+            sed -i -E '/pam_pwhistory\.so/ { /remember=/! s/(pam_pwhistory\.so)/\1 remember=24 enforce_for_root/ }' "${prof}/${f}"
+        fi
+        sed -i -E 's/[[:space:]]nullok\b//g' "${prof}/${f}"
+    done
+    local -a feats=()
+    for feat in with-faillock with-pwhistory without-nullok; do
+        authselect list-features "custom/harden" 2>/dev/null | qgrep -Fx "$feat" && feats+=("$feat")
+    done
+    backup_file /etc/pam.d/system-auth
+    backup_file /etc/pam.d/password-auth
+    local prev
+    prev=$(authselect current -r 2>/dev/null || true)
+    authselect select custom/harden "${feats[@]}" --force >/dev/null
+    authselect apply-changes >/dev/null 2>&1 || true
+    # Anti-lockout: a stack referencing a missing module denies all logins.
+    if ! pam_modules_present /etc/pam.d/system-auth /etc/pam.d/password-auth; then
+        if [[ -n $prev ]]; then
+            # shellcheck disable=SC2086  # profile name followed by its features
+            authselect select $prev --force >/dev/null 2>&1 || true
+        fi
+        die "the hardened PAM stack references a missing module (logins would be denied); previous authselect profile '${prev:-none}' restored"
+    fi
+    grep -q 'pam_faillock.so preauth' /etc/pam.d/system-auth || die "pam_faillock was not enabled"
+    grep -q 'pam_pwquality.so' /etc/pam.d/system-auth || die "pam_pwquality was not enabled"
+    if grep -Eq '^[^#].*pam_unix\.so.*nullok' /etc/pam.d/system-auth /etc/pam.d/password-auth; then
+        die "pam_unix nullok is still present"
+    fi
+    log "authselect: custom/harden (from ${base}) ${feats[*]}"
+}
+
+configure_pam_debian() {
     # pam-auth-update profiles (the Debian-native way to edit common-*).
     write_file 0644 /usr/share/pam-configs/harden-faillock <<'EOF'
 Name: harden-and-audit: lock accounts after repeated authentication failures
@@ -1975,19 +2647,6 @@ EOF
     if grep -Eq '^[^#].*pam_unix\.so.*nullok' /etc/pam.d/common-auth /etc/pam.d/common-password; then
         die "pam_unix nullok is still present"
     fi
-
-    # su is restricted to members of the (empty) sugroup: admins use sudo.
-    getent group sugroup >/dev/null || groupadd -r sugroup
-    backup_file /etc/pam.d/su
-    if ! grep -Eq '^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_wheel\.so.*group=sugroup' /etc/pam.d/su; then
-        sed -i -E '/^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_wheel\.so/d' /etc/pam.d/su
-        sed -i '0,/^# auth       required   pam_wheel.so$/s//# auth       required   pam_wheel.so\nauth       required   pam_wheel.so use_uid group=sugroup/' /etc/pam.d/su
-        grep -q 'group=sugroup' /etc/pam.d/su || printf 'auth       required   pam_wheel.so use_uid group=sugroup\n' >>/etc/pam.d/su
-    fi
-    # shadow group must have no members (CIS)
-    if [[ -n $(getent group shadow | cut -d: -f4) ]]; then
-        gpasswd -M '' shadow >/dev/null
-    fi
 }
 
 configure_login_defs() {
@@ -1997,9 +2656,14 @@ configure_login_defs() {
     set_kv "$f" PASS_MIN_DAYS "$PASS_MIN_DAYS" $'\t'
     set_kv "$f" PASS_WARN_AGE "$PASS_WARN_AGE" $'\t'
     set_kv "$f" UMASK 027 $'\t\t'
-    set_kv "$f" ENCRYPT_METHOD YESCRYPT ' '
-    set_kv "$f" LOGIN_RETRIES 3 $'\t\t'
-    set_kv "$f" LOGIN_TIMEOUT 60 $'\t\t'
+    if is_rhel; then
+        # EL CIS: SHA512 (matches the authselect profiles' pam_unix hashing).
+        set_kv "$f" ENCRYPT_METHOD SHA512 ' '
+    else
+        set_kv "$f" ENCRYPT_METHOD YESCRYPT ' '
+        set_kv "$f" LOGIN_RETRIES 3 $'\t\t'
+        set_kv "$f" LOGIN_TIMEOUT 60 $'\t\t'
+    fi
     set_kv "$f" HOME_MODE 0750 $'\t\t'
     useradd -D -f "$ACCOUNT_INACTIVE_DAYS"
     # Apply aging to existing accounts that have a usable password - except
@@ -2019,7 +2683,17 @@ configure_login_defs() {
     done < /etc/shadow
 
     # Interactive shells: umask 027, idle timeout.
-    if is_ubuntu; then
+    if is_rhel; then
+        # The EL CIS check expects "typeset -xr TMOUT=<n>".
+        write_file 0644 /etc/profile.d/60-harden.sh <<EOF
+# Managed by ${SCRIPT_NAME}
+umask 027
+# Idle shell timeout (read-only, exported); skip if already set (re-sourcing).
+if [ -z "\${TMOUT:-}" ]; then
+    typeset -xr TMOUT=${SHELL_TMOUT}
+fi
+EOF
+    elif is_ubuntu; then
         # The Ubuntu CIS check expects the POSIX three-line form.
         write_file 0644 /etc/profile.d/60-harden.sh <<EOF
 # Managed by ${SCRIPT_NAME}
@@ -2042,7 +2716,13 @@ if [ -n "\${BASH_VERSION:-}" ] && [ -z "\${TMOUT:-}" ]; then
 fi
 EOF
     fi
-    for f in /etc/profile /etc/bash.bashrc; do
+    if is_rhel && [[ -f /etc/bashrc ]]; then
+        # EL CIS checks every umask in /etc/bashrc (inside its if/else).
+        backup_file /etc/bashrc
+        sed -i -E 's/^([^#]*\bumask)[[:space:]]+[0-7]+/\1 027/' /etc/bashrc
+    fi
+    for f in /etc/profile /etc/bash.bashrc /etc/bashrc; do
+        [[ -f $f ]] || continue
         backup_file "$f"
         sed -i -E 's/^([[:space:]]*umask[[:space:]]+0?(0[0-2][0-6]|[0-2][0-6]))[[:space:]]*$/# \1  (superseded by harden-and-audit)/' "$f"
         sed -i "/^umask 027  # ${MARK}$/d" "$f"
@@ -2176,9 +2856,9 @@ configure_kernel_modules() {
     step "5.9 disable unneeded filesystems, protocols and USB storage"
     local -a mods=(cramfs freevxfs hfs hfsplus jffs2 udf usb-storage dccp rds sctp tipc atm can firewire-core firewire-ohci)
     [[ $ALLOW_CONTAINERS != 1 ]] && mods+=(overlay overlayfs)
-    # Ubuntu CIS also disables squashfs, which every snap is mounted from:
-    # only where snapd is absent.
-    if is_ubuntu; then
+    # Ubuntu and EL CIS also disable squashfs, which every snap is mounted
+    # from: only where snapd is absent.
+    if is_ubuntu || is_rhel; then
         if pkg_installed snapd; then
             log "squashfs stays available: snapd is installed (snaps are squashfs images)"
         else
@@ -2324,6 +3004,39 @@ logger -t harden-log-budget -p user.warning "$msg"
 echo "$msg"
 EOF
     } | write_file 0700 /usr/local/sbin/harden-log-budget
+    # EL8's logrotate has no systemd units (cron.daily only): ship them.
+    if ! systemctl cat logrotate.service >/dev/null 2>&1; then
+        write_file 0644 /etc/systemd/system/logrotate.service <<'EOF'
+# Managed by harden-and-audit.sh (this logrotate ships no systemd units)
+[Unit]
+Description=Rotate log files
+ConditionACPower=true
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate /etc/logrotate.conf
+Nice=19
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+EOF
+        write_file 0644 /etc/systemd/system/logrotate.timer <<'EOF'
+# Managed by harden-and-audit.sh
+[Unit]
+Description=Hourly rotation of log files
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+        # The cron.daily job would rotate a second time.
+        if [[ -f /etc/cron.daily/logrotate ]]; then
+            backup_file /etc/cron.daily/logrotate
+            rm -f /etc/cron.daily/logrotate
+        fi
+    fi
     write_file 0644 /etc/systemd/system/logrotate.timer.d/60-harden.conf <<'EOF'
 # Managed by harden-and-audit.sh - rotate hourly so maxsize is enforced
 # within the hour (logrotate.conf keeps "daily" for time-based rotation).
@@ -2389,7 +3102,17 @@ EOF
             -e 's/^([[:space:]]*\$ModLoad[[:space:]]+im(tcp|udp).*)$/# disabled by harden-and-audit: \1/' \
             -e 's/^([[:space:]]*\$(InputTCPServerRun|UDPServerRun).*)$/# disabled by harden-and-audit: \1/' "$f"
     done
-    rsyslogd -N1 >/dev/null 2>&1 || die "rsyslog configuration is invalid"
+    local rout
+    if ! rout=$(rsyslogd -N1 2>&1); then
+        # rsyslog >= 8.2312 drops capabilities even when only validating;
+        # unprivileged containers refuse that (error 2455), the config is fine.
+        if in_container && grep -q -- '-2455' <<<"$rout"; then
+            warn "container: rsyslogd cannot drop capabilities here, so its config check cannot run (it does on a real host)"
+        else
+            printf '%s\n' "$rout" >&2
+            die "rsyslog configuration is invalid"
+        fi
+    fi
     # Rotation: daily, LOG_ROTATE_KEEP generations, compressed, size-capped.
     # Logs are shipped off-host, so local copies are a short buffer only.
     backup_file /etc/logrotate.conf
@@ -2425,14 +3148,51 @@ EOF
     done
     logrotate -d /etc/logrotate.conf >/dev/null 2>&1 || die "logrotate configuration is invalid"
     systemctl enable logrotate.timer rsyslog.service >/dev/null 2>&1 || true
-    systemctl enable --now cron.service >/dev/null 2>&1 || true
+    if is_rhel; then
+        # journal-remote is installed for upload/forwarding only: no listener.
+        systemctl mask systemd-journal-remote.socket >/dev/null 2>&1 || true
+        systemctl enable --now crond.service >/dev/null 2>&1 || true
+    else
+        systemctl enable --now cron.service >/dev/null 2>&1 || true
+    fi
     systemctl restart systemd-journald.service
-    systemctl restart rsyslog.service
+    # EL10's sandboxed rsyslog.service cannot start inside a container at all
+    # (it fails there before any change); on a host a failure stays fatal.
+    if ! systemctl restart rsyslog.service; then
+        journalctl -u rsyslog.service --no-pager -n 15 >&2 || true
+        host_only "restart rsyslog" false
+    fi
 }
 
 configure_timesync() {
     step "5.13 time synchronisation"
     local s
+    if is_rhel; then
+        # chronyd: vendor pool unless NTP_SERVERS is set; runs as user chrony.
+        install -d -m 0755 /etc/chrony/sources.d
+        if [[ -n $NTP_SERVERS ]]; then
+            {
+                echo "# Managed by ${SCRIPT_NAME}"
+                for s in $NTP_SERVERS; do echo "server ${s} iburst"; done
+            } | write_file 0644 /etc/chrony/sources.d/60-harden.sources
+        else
+            log "chrony keeps the distribution time sources (set NTP_SERVERS to use your enclave's servers)"
+        fi
+        backup_file /etc/chrony.conf
+        grep -q '^sourcedir /etc/chrony/sources.d' /etc/chrony.conf || echo 'sourcedir /etc/chrony/sources.d' >>/etc/chrony.conf
+        if [[ -f /etc/sysconfig/chronyd ]]; then
+            backup_file /etc/sysconfig/chronyd
+            if grep -q '^OPTIONS=' /etc/sysconfig/chronyd; then
+                grep -Eq '^OPTIONS=.*-u[[:space:]]+chrony' /etc/sysconfig/chronyd \
+                    || sed -i -E 's/^OPTIONS="?([^"]*)"?/OPTIONS="\1 -u chrony"/' /etc/sysconfig/chronyd
+            else
+                echo 'OPTIONS="-u chrony"' >>/etc/sysconfig/chronyd
+            fi
+        fi
+        systemctl enable chronyd.service >/dev/null 2>&1 || true
+        systemctl restart chronyd.service >/dev/null 2>&1 || warn "chronyd did not start (no clock control in containers)"
+        return 0
+    fi
     if pkg_installed chrony; then
         if [[ -n $NTP_SERVERS ]]; then
             {
@@ -2469,7 +3229,11 @@ EOF
 }
 
 configure_apparmor() {
-    step "5.14 AppArmor enforcing"
+    step "5.14 mandatory access control: AppArmor / SELinux enforcing"
+    if is_rhel; then
+        configure_selinux
+        return 0
+    fi
     systemctl enable apparmor.service >/dev/null 2>&1 || true
     local p
     local -a enforce=() complain=()
@@ -2496,8 +3260,39 @@ configure_apparmor() {
     host_only "start AppArmor" systemctl restart apparmor.service
 }
 
+# RHEL family: SELinux enforcing with the targeted policy. A host that booted
+# with SELinux disabled gets permissive + a full relabel first: enforcing an
+# unlabelled filesystem can stop services (and SSH) at the next boot. The
+# next run, after that reboot, switches it to enforcing.
+configure_selinux() {
+    local cfg=/etc/selinux/config want=enforcing cur
+    pkg_installed selinux-policy-targeted || dnf_install selinux-policy-targeted
+    cur=$(getenforce 2>/dev/null || echo Disabled)
+    if [[ $cur == Disabled ]] && ! in_container; then
+        want=permissive
+        touch /.autorelabel
+        warn "SELinux was disabled: set to permissive with a full relabel at next boot; re-run this script after the reboot to enforce it"
+    fi
+    [[ -f $cfg ]] || printf 'SELINUX=%s\nSELINUXTYPE=targeted\n' "$want" >"$cfg"
+    backup_file "$cfg"
+    sed -i -E "s/^SELINUX=.*/SELINUX=${want}/; s/^SELINUXTYPE=.*/SELINUXTYPE=targeted/" "$cfg"
+    grep -q '^SELINUX=' "$cfg" || echo "SELINUX=${want}" >>"$cfg"
+    grep -q '^SELINUXTYPE=' "$cfg" || echo 'SELINUXTYPE=targeted' >>"$cfg"
+    if [[ $cur == Permissive && $want == enforcing ]]; then
+        host_only "setenforce 1" setenforce 1
+    fi
+    if in_container; then
+        warn "container: SELinux is a host kernel feature; ${cfg} set to ${want}, it applies on a real host"
+    fi
+    log "SELinux: ${cur} now, ${want} (targeted) configured"
+}
+
 configure_fail2ban() {
     step "5.15 fail2ban (SSH brute-force protection)"
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        warn "fail2ban is not installed (RHEL family: it comes from EPEL; EPEL_ENABLE=${EPEL_ENABLE})"
+        return 0
+    fi
     local ports
     ports=$(IFS=,; echo "${SSH_PORTS[*]}")
     write_file 0644 /etc/fail2ban/jail.d/60-harden.local <<EOF
@@ -2543,28 +3338,19 @@ bind X lock-session
 EOF
 }
 
-configure_aide_config() {
-    step "5.18 AIDE configuration (database is built at the end)"
-    apt_install aide aide-common
-    # Protect the audit toolchain (CIS / STIG). Scanners read these lines
-    # from aide.conf itself, with exactly this attribute set.
-    local aconf=/etc/aide/aide.conf t
-    backup_file "$aconf"
-    rm -f /etc/aide/aide.conf.d/99_harden_audit_tools
-    sed -i -E "/^# ${MARK}: audit tools$/d; \#^(/usr)?/sbin/(auditctl|auditd|ausearch|aureport|autrace|augenrules)[[:space:]]#d" "$aconf"
-    {
-        echo "# ${MARK}: audit tools"
-        for t in auditctl auditd ausearch aureport autrace augenrules; do
-            echo "/usr/sbin/${t} p+i+n+u+g+s+b+acl+selinux+xattrs+sha512"
-        done
-    } >>"$aconf"
-    # The vendor catch-all (99_aide_root: "/ 0 Full") checksums every byte
-    # under /, including container layers, VM disks and caches. On a docker/
-    # containerd host that is 100+ GB, so the baseline takes hours and the
-    # daily check never finishes; the content also churns constantly, so it
-    # would only produce noise. Exclude bulk runtime data, not system files.
-    # (Name must match aide.conf's x_include filter: [a-zA-Z0-9_-]+.)
-    write_file 0644 /etc/aide/aide.conf.d/90_harden_bulk_excludes <<'EOF'
+# Distribution-specific AIDE locations (set by aide_paths).
+AIDE_CONF=/etc/aide/aide.conf
+AIDE_DB=/var/lib/aide/aide.db
+aide_paths() {
+    if is_rhel; then
+        AIDE_CONF=/etc/aide.conf
+        AIDE_DB=/var/lib/aide/aide.db.gz
+    fi
+}
+
+# The bulk/volatile excludes, shared by both families.
+aide_bulk_excludes() {
+    cat <<'EOF'
 # Managed by harden-and-audit.sh: bulk / volatile data kept out of AIDE.
 # Container and VM storage (images are verified by their runtime digests)
 !/var/lib/(containerd|docker|containers|kubelet|rancher)(/|$)
@@ -2586,14 +3372,58 @@ configure_aide_config() {
 !/(swap\.img|swapfile)$
 EOF
     # Any other active swap file, wherever it lives.
-    local sw
+    local sw t
     while read -r sw t _; do
         [[ $t == file && $sw == /* ]] || continue
         printf '!%s$\n' "$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<<"$sw")"
-    done < <(tail -n +2 /proc/swaps) >>/etc/aide/aide.conf.d/90_harden_bulk_excludes
+    done < <(tail -n +2 /proc/swaps)
+}
+
+configure_aide_config() {
+    step "5.18 AIDE configuration (database is built at the end)"
+    aide_paths
+    if is_rhel; then pkg_install aide; else apt_install aide aide-common; fi
+    # Protect the audit toolchain (CIS / STIG). Scanners read these lines
+    # from aide.conf itself, with exactly this attribute set.
+    local aconf=$AIDE_CONF t
+    backup_file "$aconf"
+    rm -f /etc/aide/aide.conf.d/99_harden_audit_tools
+    sed -i -E "/^# ${MARK}: audit tools$/d; \#^(/usr)?/sbin/(auditctl|auditd|ausearch|aureport|autrace|augenrules)[[:space:]]#d" "$aconf"
+    {
+        echo "# ${MARK}: audit tools"
+        for t in auditctl auditd ausearch aureport autrace augenrules; do
+            echo "/usr/sbin/${t} p+i+n+u+g+s+b+acl+selinux+xattrs+sha512"
+        done
+    } >>"$aconf"
+    # The vendor catch-all (99_aide_root: "/ 0 Full") checksums every byte
+    # under /, including container layers, VM disks and caches. On a docker/
+    # containerd host that is 100+ GB, so the baseline takes hours and the
+    # daily check never finishes; the content also churns constantly, so it
+    # would only produce noise. Exclude bulk runtime data, not system files.
+    if is_rhel; then
+        # EL aide.conf has no conf.d: a managed block at the end of the file.
+        sed -i "/^# BEGIN ${MARK} bulk excludes$/,/^# END ${MARK} bulk excludes$/d" "$aconf"
+        { echo "# BEGIN ${MARK} bulk excludes"; aide_bulk_excludes; echo "# END ${MARK} bulk excludes"; } >>"$aconf"
+    else
+        # (Name must match aide.conf's x_include filter: [a-zA-Z0-9_-]+.)
+        aide_bulk_excludes | write_file 0644 /etc/aide/aide.conf.d/90_harden_bulk_excludes
+    fi
+    # EL CIS: aide.conf root-only. (Debian/Ubuntu AIDE 0.19 reads it as _aide.)
+    is_rhel && chmod 0600 "$aconf"
     aide --config-check --config "$aconf" >/dev/null 2>&1 || die "AIDE configuration check failed"
     # Ubuntu's aide-common ships dailyaidecheck.{service,timer}, which the
     # Ubuntu CIS content checks: use it rather than adding a second check.
+    if is_rhel; then
+        # EL CIS (aide_periodic_cron_checking) checks /etc/crontab.
+        systemctl disable --now aidecheck.timer aidecheck.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/aidecheck.service /etc/systemd/system/aidecheck.timer
+        systemctl daemon-reload
+        backup_file /etc/crontab
+        sed -i '\#/usr/sbin/aide --check#d' /etc/crontab
+        echo "05 4 * * * root /usr/sbin/aide --check" >>/etc/crontab
+        log "AIDE: daily check from /etc/crontab"
+        return 0
+    fi
     if is_ubuntu && systemctl cat dailyaidecheck.timer >/dev/null 2>&1; then
         systemctl disable --now aidecheck.timer aidecheck.service >/dev/null 2>&1 || true
         rm -f /etc/systemd/system/aidecheck.service /etc/systemd/system/aidecheck.timer
@@ -2603,15 +3433,15 @@ EOF
         log "AIDE: vendor dailyaidecheck.timer enabled"
         return 0
     fi
-    write_file 0644 /etc/systemd/system/aidecheck.service <<'EOF'
-# Managed by harden-and-audit.sh
+    write_file 0644 /etc/systemd/system/aidecheck.service <<EOF
+# Managed by ${SCRIPT_NAME}
 [Unit]
 Description=AIDE file integrity check
-ConditionPathExists=/var/lib/aide/aide.db
+ConditionPathExists=${AIDE_DB}
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/aide --config /etc/aide/aide.conf --check
+ExecStart=$(command -v aide) --config ${AIDE_CONF} --check
 Nice=19
 IOSchedulingClass=idle
 
@@ -2643,7 +3473,17 @@ EOF
 provision_cuda_prereqs() {
     step "6.1 CUDA / DKMS build prerequisites (driver itself is not installed)"
     local -a hdrs=()
-    if is_ubuntu; then
+    if is_rhel; then
+        local -a el=(gcc make kernel-devel kernel-headers elfutils-libelf-devel pkgconf-pkg-config)
+        pkg_candidate dkms && el+=(dkms)
+        dnf_install "${el[@]}"
+        pkg_candidate dkms || warn "dkms is not available (it comes from EPEL; EPEL_ENABLE=${EPEL_ENABLE})"
+        if pkg_candidate "kernel-devel-$(uname -r)" || dnf -q list --available "kernel-devel-$(uname -r)" >/dev/null 2>&1; then
+            dnf_install "kernel-devel-$(uname -r)"
+        else
+            warn "kernel-devel-$(uname -r) is not available (running kernel differs from the packaged one); DKMS builds target the installed kernel"
+        fi
+    elif is_ubuntu; then
         # Headers follow each installed kernel flavour metapackage
         # (linux-image-generic, -virtual, -aws, -azure, -gcp, ...).
         local meta flavour
@@ -2657,13 +3497,15 @@ provision_cuda_prereqs() {
         hdrs=(linux-headers-amd64)
         [[ $DEB_ARCH == arm64 ]] && hdrs=(linux-headers-arm64)
     fi
-    apt_install libc6 libc6-dev gcc make build-essential pkg-config dkms "${hdrs[@]}"
-    local running
-    running="linux-headers-$(uname -r)"
-    if pkg_candidate "$running"; then
-        apt_install "$running"
-    else
-        warn "${running} is not available from the archive (running kernel differs from the packaged one); DKMS builds target the installed kernel"
+    if is_deb; then
+        apt_install libc6 libc6-dev gcc make build-essential pkg-config dkms "${hdrs[@]}"
+        local running
+        running="linux-headers-$(uname -r)"
+        if pkg_candidate "$running"; then
+            apt_install "$running"
+        else
+            warn "${running} is not available from the archive (running kernel differs from the packaged one); DKMS builds target the installed kernel"
+        fi
     fi
     write_file 0644 /etc/modprobe.d/60-harden-nouveau.conf <<'EOF'
 # Managed by harden-and-audit.sh - the proprietary NVIDIA driver needs nouveau off.
@@ -2721,6 +3563,14 @@ provision_media_coturn_libs() {
         "libwebsockets19t64 libwebsockets17 libwebsockets16 ~^libwebsockets[0-9]+(t64)?$"
         "libcurl4t64 libcurl4"
     )
+    if is_rhel; then
+        # RPM names (vendor + EPEL). x264/x265 exist only in RPM Fusion,
+        # which is third party and not enabled: reported as unavailable.
+        groups=(libevent hiredis mariadb-connector-c libpq sqlite-libs sqlite openssl-libs systemd-libs
+            libmicrohttpd opus libvpx libsrtp x264-libs x265-libs libaom libdav1d libogg libvorbis speex speexdsp
+            libwebp libtheora flac-libs lame-libs libsndfile libsamplerate soxr gsm usrsctp jansson libconfig
+            libwebsockets "libcurl libcurl-minimal")
+    fi
     local -a pkgs=() missing=() alts
     local g p
     for g in "${groups[@]}"; do
@@ -2734,9 +3584,9 @@ provision_media_coturn_libs() {
         fi
     done
     [[ ${#missing[@]} -gt 0 ]] && warn "media libraries unavailable on this release: ${missing[*]}"
-    apt_install "${pkgs[@]}"
-    apt-mark manual "${pkgs[@]}" >/dev/null
-    if pkg_installed libx11-6 && ! apt-get -s purge libx11-6 2>/dev/null | awk '/^Purg /{print $2}' | qgrep -Ev '^(libx11-6|libx11-xcb1)$'; then
+    pkg_install "${pkgs[@]}"
+    pkg_mark_manual "${pkgs[@]}"
+    if is_deb && pkg_installed libx11-6 && ! apt-get -s purge libx11-6 2>/dev/null | awk '/^Purg /{print $2}' | qgrep -Ev '^(libx11-6|libx11-xcb1)$'; then
         warn "libx11-6 is still installed only because a non-graphical package depends on it"
     fi
     log "installed ${#pkgs[@]} media/coturn runtime libraries"
@@ -2747,6 +3597,13 @@ provision_media_coturn_libs() {
 # ============================================================================
 install_openscap() {
     step "7.1 OpenSCAP tooling"
+    if is_rhel; then
+        # Vendor content, matched to the platform (ssg-rl9, ssg-almalinux9, ...).
+        dnf_install openscap-scanner scap-security-guide unzip
+        command -v oscap >/dev/null 2>&1 || die "no OpenSCAP scanner (oscap) could be installed on ${OS_NAME}"
+        log "OpenSCAP: $(oscap --version 2>/dev/null | head -n1); content: scap-security-guide $(rpm -q --qf '%{version}' scap-security-guide)"
+        return 0
+    fi
     local -a pkgs=(unzip) p
     # Debian 12/13, Ubuntu 24.04+: openscap-scanner/-utils (libopenscap25).
     # Ubuntu 22.04: only libopenscap8 (oscap 1.2.17) and no ssg-* packages.
@@ -2834,6 +3691,17 @@ resolve_datastream() {
         [[ -f $SSG_DATASTREAM ]] || die "SSG_DATASTREAM=${SSG_DATASTREAM} does not exist"
         printf '%s\n' "$SSG_DATASTREAM"
         return 0
+    fi
+    if is_rhel; then
+        # Vendor-packaged content first (patched for that vendor's packages
+        # and platform CPEs); then RHEL content; then the pinned upstream zip.
+        local c
+        for c in "/usr/share/xml/scap/ssg/content/${name}" "/usr/share/xml/scap/ssg/content/ssg-rhel${OS_MAJOR}-ds.xml"; do
+            if [[ -f $c ]] && ds_has_profile "$c" "$SCAP_PROFILE"; then
+                printf '%s\n' "$c"
+                return 0
+            fi
+        done
     fi
     ds=$(find_datastream "$name" || true)
     if [[ -n $ds ]] && ds_has_profile "$ds" "$SCAP_PROFILE"; then
@@ -2926,7 +3794,7 @@ scap_summarize() {
     {
         echo "OpenSCAP compliance summary - $(ts)"
         echo "host:           $(hostname -f 2>/dev/null || hostname)"
-        echo "os:             ${OS_NAME} (${OS_CODENAME})"
+        echo "os:             ${OS_NAME}${OS_CODENAME:+ (${OS_CODENAME})}"
         echo "profile:        ${profile}"
         echo "datastream:     ${DS_PATH}"
         if [[ $DS_PATH == *.retarget-* ]]; then
@@ -3044,7 +3912,13 @@ readonly AIDE_INIT_LOG=/var/log/harden-and-audit-aideinit.log
 # stdin from /dev/null: a prompt must fail, never wait invisibly.
 aide_init_quiet() {
     # Lowest CPU/IO priority: the baseline still reads every in-scope file.
-    ( umask 077; nice -n 19 ionice -c 3 aideinit -y -f </dev/null >"$AIDE_INIT_LOG" 2>&1 )
+    if is_rhel; then
+        # EL: no aideinit wrapper; the new database is renamed into place.
+        ( umask 077; nice -n 19 ionice -c 3 aide --init --config "$AIDE_CONF" </dev/null >"$AIDE_INIT_LOG" 2>&1 \
+            && mv -f /var/lib/aide/aide.db.new.gz "$AIDE_DB" )
+    else
+        ( umask 077; nice -n 19 ionice -c 3 aideinit -y -f </dev/null >"$AIDE_INIT_LOG" 2>&1 )
+    fi
 }
 
 # Bytes in use on local disk filesystems: the upper bound of what AIDE reads
@@ -3091,7 +3965,7 @@ aide_progress() {
         for f in /proc/"$apid"/fd/*; do
             f=$(readlink "$f") || continue
             case $f in
-                /dev/*|/proc/*|pipe:*|socket:*|anon_inode:*|/var/lib/aide/*|/etc/aide/*|/var/log/*) ;;
+                /dev/*|/proc/*|pipe:*|socket:*|anon_inode:*|/var/lib/aide/*|/etc/aide/*|/etc/aide.conf|/var/log/*) ;;
                 /*) cur=$f; break ;;
             esac
         done
@@ -3111,11 +3985,12 @@ aide_progress() {
 
 build_aide_database() {
     step "AIDE baseline database (final state)"
+    aide_paths
     if [[ $AIDE_INIT != 1 ]]; then
-        warn "AIDE_INIT=0: AIDE database not built - run 'aideinit -y -f' later"
+        warn "AIDE_INIT=0: AIDE database not built - run '$(is_rhel && echo "aide --init" || echo "aideinit -y -f")' later"
         return 0
     fi
-    if [[ -f /var/lib/aide/aide.db ]]; then
+    if [[ -f $AIDE_DB ]]; then
         log "updating existing AIDE database"
     fi
     AIDE_TOTAL_BYTES=$(aide_estimate_total || echo 0)
@@ -3129,7 +4004,7 @@ build_aide_database() {
         in_container || die "aideinit failed (full output: ${AIDE_INIT_LOG})"
         warn "container: 'aideinit' could not be applied here (it applies on a real host)"
     fi
-    if [[ -f /var/lib/aide/aide.db ]]; then
+    if [[ -f $AIDE_DB ]]; then
         chmod 0600 /var/lib/aide/aide.db*
     elif ! in_container; then
         die "AIDE database was not created"
@@ -3162,14 +4037,14 @@ main() {
     if [[ $SCAN_ONLY == 1 ]]; then
         local src=0
         run_scap_audit || src=$?
-        return "$src"
+        exit "$src"
     fi
 
-    # Full run: every step header in this file, minus the repository step
-    # of the other distribution, plus purge_graphical and
-    # harden_file_permissions running twice. tests/assertions.sh checks that
-    # the final step number equals this total.
-    STEP_TOTAL=$(( $(grep -c '^[[:space:]]*step "' "${BASH_SOURCE[0]}") - 1 + 2 ))
+    # Full run: every step header in this file, minus the two repository
+    # steps of the other distributions (Debian / Ubuntu / EL: one runs), plus
+    # purge_graphical and harden_file_permissions running twice.
+    # tests/assertions.sh checks that the final step number equals this total.
+    STEP_TOTAL=$(( $(grep -c '^[[:space:]]*step "' "${BASH_SOURCE[0]}") - 2 + 2 ))
 
     preflight_admin
     detect_ssh_ports
@@ -3229,10 +4104,11 @@ main() {
         local w
         for w in "${WARNINGS[@]}"; do printf '  - %s\n' "$w"; done
     fi
-    log "A reboot is required to activate fips=1, audit=1 and the other kernel arguments."
-    return "$rc"
+    log "A reboot is required to activate fips=1, audit=1$(is_rhel && echo ', SELinux enforcing') and the other kernel arguments."
+    exit "$rc"
 }
 
-rc=0
-main "$@" || rc=$?
-exit "$rc"
+# Not "main || rc=$?": a function called on the left of || runs with errexit
+# and the ERR trap disabled for everything inside it, which silently skipped
+# failed commands. main exits with the gate's status itself.
+main "$@"

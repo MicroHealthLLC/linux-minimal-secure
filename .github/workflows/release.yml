@@ -2,7 +2,8 @@
 #
 # Every push to main re-runs the full CI matrix; if it passes, the script is
 # published as a GitHub Release (tag v<VERSION>) with its SHA-256 checksum
-# and the CI compliance reports for Debian 12/13 and Ubuntu 22.04/24.04/26.04.
+# and the CI compliance reports for Debian 12/13, Ubuntu 22.04/24.04/26.04,
+# Rocky Linux and AlmaLinux 8/9/10 and CentOS Stream 9/10.
 # A VERSION that is already released is skipped, never overwritten.
 name: release
 
@@ -32,6 +33,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: read and verify version
         id: version
@@ -60,6 +62,8 @@ jobs:
 
       - name: build release assets
         if: steps.version.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -72,14 +76,14 @@ jobs:
             done
           done
           {
-            echo "## harden-and-audit.sh v${{ steps.version.outputs.version }}"
+            echo "## linux-minimal-secure (harden-and-audit.sh) v${VERSION}"
             echo
-            echo "FIPS-ready, CIS Level 2 hardened headless Debian 12 / 13 and Ubuntu 22.04 / 24.04 / 26.04 server transformation with an OpenSCAP self-audit."
+            echo "FIPS-ready, CIS Level 2 hardened headless server transformation with an OpenSCAP self-audit. The distribution is detected: Debian 12 / 13, Ubuntu 22.04 / 24.04 / 26.04, and the RHEL family (RHEL, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux 8 / 9 / 10)."
             echo
             echo "### Install"
             echo '```bash'
-            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${{ steps.version.outputs.version }}/harden-and-audit.sh"
-            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${{ steps.version.outputs.version }}/harden-and-audit.sh.sha256"
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/harden-and-audit.sh"
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/harden-and-audit.sh.sha256"
             echo "sha256sum -c harden-and-audit.sh.sha256 && sudo bash harden-and-audit.sh"
             echo '```'
             echo
@@ -96,11 +100,12 @@ jobs:
         if: steps.version.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          v=v${{ steps.version.outputs.version }}
+          v=v${VERSION}
           gh release create "$v" \
             --target "$GITHUB_SHA" \
-            --title "harden-and-audit $v" \
+            --title "linux-minimal-secure $v" \
             --notes-file dist/RELEASE_NOTES.md \
             dist/harden-and-audit.sh dist/harden-and-audit.sh.sha256 dist/*-scap-*.html dist/*-scap-*.txt
