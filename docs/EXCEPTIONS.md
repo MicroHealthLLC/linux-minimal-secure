@@ -138,6 +138,14 @@ The check requires a UFW rule for every non-loopback listener. Inspection of a h
 | **No `dnf autoremove`** after the graphical purge | Installer-placed packages are often marked as dependencies; autoremove could remove real services |
 | **RHEL in CI** | Needs a subscription. The rebuilds take the same code path; RHEL adds only the subscription check and EPEL bootstrap from the Fedora project |
 
-### 9.2 Rules expected to fail in CI containers
+### 9.2 Fedora and desktop mode
+
+| Decision | Reason |
+|---|---|
+| **Fedora: no kernel FIPS mode** (`fips=1` not set) | Fedora does not support FIPS mode and ships no `fips-mode-setup`. A kernel in FIPS mode without the integrity HMACs/dracut module can fail to boot, which violates "nothing stops the machine". The system crypto policy is `FIPS` (servers) or `DEFAULT:NO-SHA1`, the CIS policy (desktops) |
+| **Fedora: yescrypt** password hashing | Fedora's authselect profiles hash with yescrypt; `login.defs` matches them |
+| **Desktop mode** (a display manager is installed) | The owner's requirement: hardening must not kill the desktop experience. Kept: graphical stack and `graphical.target`, cups/avahi/bluez, USB storage, overlay (toolbox/podman), the desktop firewall zone and services (UFW: mDNS allowed), sshd off if it was off, IPv6 privacy addresses, `/tmp` exec (AppImages, IDEs), existing authselect features (fingerprint, smartcard). No shell `TMOUT`: the desktop's screen lock covers idle sessions. Debian-family desktops get no kernel `fips=1` (it breaks Wi-Fi/Bluetooth algorithms); the user-space FIPS provider stays. The CIS rules for those items fail by design. The gate profile is CIS Level 2 Workstation |
+
+### 9.3 Rules expected to fail in CI containers
 
 As on Debian/Ubuntu (§5), rules that need a booted kernel, a real bootloader or host-global state (kernel FIPS mode, `grub2_*` arguments in BLS entries, SELinux runtime state, auditd/chronyd/firewalld service state in an unprivileged run, separate partitions) fail inside the CI container and pass on a real host or VM. The CI job summary of each EL target lists the failing rules.

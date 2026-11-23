@@ -33,6 +33,13 @@
 | Δ10 | CI only: EL SSH login denied in privileged containers. The Ubuntu runner's AppArmor `unix-chkpwd` profile attaches by path to the EL helper and cannot read EL's `0000` shadow (strace: EACCES as root with all capabilities) | Profile unloaded on the ephemeral runner for EL jobs (a real EL host has no AppArmor). Local runs add `CAP_DAC_READ_SEARCH`, which EL's `unix_chkpwd` keeps |
 | Δ11 | GitHub security: code scanning, Dependabot and secret scanning are disabled for this private repository (nothing to clear via the API) | Equivalent scans run locally and in CI on every push: gitleaks over the full history (no leaks), zizmor on the workflows. 3 medium `artipacked` (checkout credentials persisted) and 4 template-injection findings fixed (`persist-credentials: false`, version via env). zizmor clean |
 
+## Follow-up: 2.0.1 and 2.1.0
+
+| Version | Delivered |
+|---|---|
+| 2.0.1 | Owner policy "nothing stops the machine": `--backlog_wait_time 0` (a full audit backlog drops records instead of blocking every audited process for up to 60 s), `nofail` on every fstab line the script adds (no emergency mode on a console-less VM), CI assertions for both and for the absence of `kernel.panic*` |
+| 2.1.0 | **Fedora 41+** (it has no `ID_LIKE=rhel`, so it was rejected): dnf5 (repoquery newline, `mark user`, `dnf5-plugin-automatic`/`dnf5-automatic.timer`), no CRB/EPEL, `ssg-fedora`, yescrypt, no kernel FIPS mode. **Desktop mode** for every distribution (see EXCEPTIONS §9.2). CI: Fedora 44, 45 and a Fedora 45 GNOME desktop job |
+
 ## CI results
 
 | Run | Commit | Result |

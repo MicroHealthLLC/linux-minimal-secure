@@ -1104,8 +1104,10 @@ install_base_stack_rhel() {
         "$auto" sudo policycoreutils policycoreutils-python-utils selinux-policy-targeted
         crypto-policies-scripts authselect grubby python3-systemd) opt
     # CIS EL: systemd-journal-remote available (its listener stays masked, see
-    # configure_logging), a local-only MTA (postfix).
-    for opt in systemd-journal-remote postfix; do
+    # configure_logging), a local-only MTA (postfix). cracklib-dicts: with
+    # pwquality dictcheck=1 and no dictionary every password change fails
+    # (minimal Fedora images lack it) - an expired password could not be renewed.
+    for opt in systemd-journal-remote postfix cracklib-dicts; do
         pkg_candidate "$opt" && pkgs+=("$opt")
     done
     # EL9+ images ship curl-minimal, which conflicts with curl: keep either.
@@ -2656,7 +2658,9 @@ pam_modules_present() {
             [[ -e /usr/lib64/security/${m} || -e /usr/lib/security/${m} || -e /lib64/security/${m} ]] && continue
             echo "PAM module ${m} referenced by ${f} is not installed" >&2
             missing=1
-        done < <(grep -Eo '^[^#]*\b(pam_[a-z0-9_]+\.so)' "$f" | grep -Eo 'pam_[a-z0-9_]+\.so' | sort -u)
+        # A leading "-" (e.g. "-session optional pam_systemd.so") tells PAM to
+        # skip the line silently when the module is absent: never a denial.
+        done < <(grep -Ev '^[[:space:]]*(#|-)' "$f" | grep -Eo '\bpam_[a-z0-9_]+\.so' | sort -u)
     done
     return "$missing"
 }
@@ -2813,6 +2817,10 @@ configure_login_defs() {
     # where that would expire the password immediately (lockout risk).
     local today u hash lastchg
     today=$(( $(date +%s) / 86400 ))
+    # shadow-utils 4.20 (Fedora 45) removed "chage --mindays"; login.defs
+    # PASS_MIN_DAYS still applies to new passwords there.
+    local -a minday=()
+    chage --help 2>&1 | qgrep -- '--mindays' && minday=(--mindays "$PASS_MIN_DAYS")
     while IFS=: read -r u hash lastchg _; do
         [[ $hash == \$* ]] || continue
         if [[ -n $lastchg && $lastchg =~ ^[0-9]+$ && $(( lastchg + PASS_MAX_DAYS )) -lt $today ]]; then
@@ -2822,7 +2830,7 @@ configure_login_defs() {
         if [[ -z $lastchg || $lastchg -gt $today ]]; then
             chage -d "$today" "$u"
         fi
-        chage --maxdays "$PASS_MAX_DAYS" --mindays "$PASS_MIN_DAYS" --warndays "$PASS_WARN_AGE" --inactive "$ACCOUNT_INACTIVE_DAYS" "$u"
+        chage --maxdays "$PASS_MAX_DAYS" "${minday[@]}" --warndays "$PASS_WARN_AGE" --inactive "$ACCOUNT_INACTIVE_DAYS" "$u"
     done < /etc/shadow
 
     # Interactive shells: umask 027, idle timeout. Desktops: no TMOUT (it would

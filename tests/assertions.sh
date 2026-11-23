@@ -97,7 +97,7 @@ for p in openssh-server tmux kbd git firewalld fail2ban-server libpwquality audi
     check "package ${p} installed" installed "$p"
 done
 check "curl available (curl or curl-minimal)" command -v curl
-check "every PAM module in system-auth/password-auth is installed" bash -c "for m in \$(grep -Eho '^[^#]*pam_[a-z0-9_]+\\.so' /etc/pam.d/system-auth /etc/pam.d/password-auth | grep -Eo 'pam_[a-z0-9_]+\\.so' | sort -u); do [[ -e /usr/lib64/security/\$m ]] || exit 1; done"
+check "every PAM module in system-auth/password-auth is installed" bash -c "for m in \$(grep -Ehv '^[[:space:]]*(#|-)' /etc/pam.d/system-auth /etc/pam.d/password-auth | grep -Eo 'pam_[a-z0-9_]+\\.so' | sort -u); do [[ -e /usr/lib64/security/\$m ]] || exit 1; done"
 check "dnf-automatic applies updates"  grep -Eq '^apply_updates = yes$' /etc/dnf/automatic.conf
 if [[ $OS == centos ]]; then
     check "dnf-automatic: all updates (Stream has no errata)" grep -Eq '^upgrade_type = default$' /etc/dnf/automatic.conf
@@ -319,6 +319,7 @@ check "password hashing yescrypt (Fedora)" grep -Eq '^ENCRYPT_METHOD[[:space:]]+
 else
 check "password hashing SHA512" grep -Eq '^ENCRYPT_METHOD[[:space:]]+SHA512' /etc/login.defs
 fi
+check "cracklib dictionary present (pwquality dictcheck can load it)" bash -c "ls /usr/share/cracklib/pw_dict.pwd* >/dev/null 2>&1"
 check "SELinux enforcing/targeted configured" bash -c "grep -qx 'SELINUX=enforcing' /etc/selinux/config && grep -qx 'SELINUXTYPE=targeted' /etc/selinux/config"
 check "abrt / setroubleshoot / mcstrans absent" bash -c "! rpm -qa --qf '%{NAME}\\n' | grep -Eq '^(abrt|setroubleshoot|mcstrans)'"
 check "chronyd runs as user chrony" bash -c "[[ ! -f /etc/sysconfig/chronyd ]] || grep -Eq '^OPTIONS=.*-u chrony' /etc/sysconfig/chronyd"
