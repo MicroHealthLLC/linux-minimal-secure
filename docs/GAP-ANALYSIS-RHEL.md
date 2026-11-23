@@ -35,4 +35,20 @@
 
 ## CI results
 
-Filled in when GitHub CI on `integration` is green.
+| Run | Commit | Result |
+|---|---|---|
+| 45273737522 | `9e944a2` | Debian/Ubuntu cancelled by the next push. EL: SSH anti-lockout failed (Δ10), EL10 rsyslog (Δ8) |
+| 45275147763 | `26db042` | Debian 13, Ubuntu ×3 green with fail-fast active (Δ1). EL anti-lockout diagnostics captured |
+| 45278056675 | `89b52b0` | strace: `unix_chkpwd` EACCES on shadow as root with all capabilities, no sysctl involved, pointing to the host AppArmor profile (Δ10) |
+| 45279312988 | `17006a7` | EL anti-lockout **fixed** on all 8. EL9/10: outdated pwhistory assertion. EL8: CIS 89.76% |
+| **45281242813** | **`ead2b5f`** | **all 14 green** |
+
+| Target | CIS L2 Server | Informational |
+|---|---|---|
+| Debian 12 / 13 | 94.24% / 94.80% | ANSSI BP-028 High 74.03% / 74.03% |
+| Ubuntu 22.04 / 24.04 / 26.04 | 94.17% / 95.18% / 95.18% | DISA STIG 71.77% / 72.86% / 71.90% |
+| Rocky Linux 8 / 9 / 10 | 95.12% / 95.20% / 93.24% | DISA STIG 72.94% / 74.94% / 70.24% |
+| AlmaLinux 8 / 9 / 10 | 94.88% / 95.20% / 93.48% | DISA STIG 72.75% / 74.77% / 70.88% |
+| CentOS Stream 9 / 10 | 95.47% / 93.48% | DISA STIG 74.88% / 70.57% |
+
+Released from `main` as **v2.0.0**; the GitHub repository is renamed to **linux-minimal-secure** (old URLs redirect).

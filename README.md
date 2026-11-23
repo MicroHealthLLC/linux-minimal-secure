@@ -10,7 +10,7 @@
 | | |
 |---|---|
 | Gate profile | **CIS Level 2 – Server** for the running OS (`cis_level2_server` on Debian/Ubuntu, `cis` on the RHEL family). Target pass rate ≥ 90%, enforced in CI on every target below |
-| Measured in CI | Debian 12: **94.46%** · Debian 13: **95.22%** · Ubuntu 22.04: **94.17%** · Ubuntu 24.04: **95.39%** · Ubuntu 26.04: **95.39%** · RHEL family: see the CI job summaries (every remaining failure is explained in [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md)) |
+| Measured in CI (v2.0.0) | Debian 12: **94.24%** · Debian 13: **94.80%** · Ubuntu 22.04: **94.17%** · 24.04: **95.18%** · 26.04: **95.18%** · Rocky 8: **95.12%** · 9: **95.20%** · 10: **93.24%** · AlmaLinux 8: **94.88%** · 9: **95.20%** · 10: **93.48%** · CentOS Stream 9: **95.47%** · 10: **93.48%** (every remaining failure is explained in [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md)) |
 | Also reported | Debian: ANSSI BP-028 High. Ubuntu and RHEL family: **DISA STIG**. Informational; see [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md) |
 | FIPS | Debian family: kernel `fips=1` plus the **NIST CMVP validated OpenSSL 3.1.2 FIPS provider (FIPS 140-3, cert #4985)**, active alongside the default provider. RHEL family: the distribution's own FIPS module (`fips-mode-setup` on 8/9; crypto policy `FIPS` + `fips=1` on 10) |
 | Reports | `/var/log/scap-results.xml`, `/var/log/scap-report.html`, `/var/log/scap-summary.txt` |
