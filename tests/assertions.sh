@@ -217,6 +217,13 @@ check "sshd running" systemctl is-active sshd
 fi
 check "ANTI-LOCKOUT: sudo admin can still SSH in with a key" \
     ssh -i /root/ciadmin_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 ciadmin@127.0.0.1 true
+if ! ssh -i /root/ciadmin_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 ciadmin@127.0.0.1 true >/dev/null 2>&1; then
+    echo "  --- anti-lockout diagnostics"
+    ssh -v -i /root/ciadmin_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 ciadmin@127.0.0.1 true 2>&1 | tail -6 | sed 's/^/    /'
+    journalctl -u sshd -u ssh --no-pager -n 12 2>/dev/null | sed 's/^/    /'
+    tail -n 8 /var/log/secure /var/log/auth.log 2>/dev/null | sed 's/^/    /'
+    getenforce 2>/dev/null | sed 's/^/    selinux: /'
+fi
 check "root SSH login is rejected" \
     bash -c "! ssh -i /root/root_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@127.0.0.1 true"
 if rhel; then

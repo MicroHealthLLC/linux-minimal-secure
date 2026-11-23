@@ -3085,7 +3085,12 @@ EOF
         systemctl enable --now cron.service >/dev/null 2>&1 || true
     fi
     systemctl restart systemd-journald.service
-    systemctl restart rsyslog.service
+    # EL10's sandboxed rsyslog.service cannot start inside a container at all
+    # (it fails there before any change); on a host a failure stays fatal.
+    if ! systemctl restart rsyslog.service; then
+        journalctl -u rsyslog.service --no-pager -n 15 >&2 || true
+        host_only "restart rsyslog" false
+    fi
 }
 
 configure_timesync() {
