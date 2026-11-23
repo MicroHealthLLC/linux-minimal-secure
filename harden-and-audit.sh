@@ -1039,7 +1039,8 @@ install_base_stack_rhel() {
         audit rsyslog rsyslog-gnutls logrotate cronie acl unzip perl procps-ng iproute kmod e2fsprogs chrony
         dnf-automatic sudo policycoreutils policycoreutils-python-utils selinux-policy-targeted
         crypto-policies-scripts authselect grubby python3-systemd) opt
-    # CIS EL: systemd-journal-remote available, a local-only MTA (postfix).
+    # CIS EL: systemd-journal-remote available (its listener stays masked, see
+    # configure_logging), a local-only MTA (postfix).
     for opt in systemd-journal-remote postfix; do
         pkg_candidate "$opt" && pkgs+=("$opt")
     done
@@ -1325,7 +1326,7 @@ EOF
 -w /etc/hosts -p wa -k system-locale
 -w /etc/hostname -p wa -k system-locale
 -w /etc/networks -p wa -k system-locale
-$(for d in /etc/network/ /etc/NetworkManager /etc/sysconfig/network /etc/sysconfig/network-scripts/; do
+$(for d in /etc/network/ /etc/NetworkManager /etc/sysconfig/network /etc/sysconfig/network-scripts; do
     if [[ -e $d ]]; then echo "-w ${d} -p wa -k system-locale"; fi
 done)
 
@@ -1472,19 +1473,22 @@ EOF
     fi
 }
 
-# audit_watches_to_syscall FILE - rewrite "-w PATH -p PERM -k KEY" lines.
+# audit_watches_to_syscall FILE - add the syscall form next to every
+# "-w PATH -p PERM -k KEY" line. The EL content checks some watches as -w
+# (/etc/selinux/, /etc/hosts) and others as "-F path=" (even directories such
+# as /etc/NetworkManager) or "-F dir=.../" (/etc/pam.d/): a trailing slash in
+# the source rule selects dir=. Both forms audit the same writes.
 audit_watches_to_syscall() {
     local file=$1 tmp line path perm key field
     tmp=$(mktemp)
     while IFS= read -r line; do
+        printf '%s\n' "$line"
         if [[ $line =~ ^-w[[:space:]]+([^[:space:]]+)[[:space:]]+-p[[:space:]]+([rwxa]+)[[:space:]]+-k[[:space:]]+([^[:space:]]+) ]]; then
             path=${BASH_REMATCH[1]}; perm=${BASH_REMATCH[2]}; key=${BASH_REMATCH[3]}
             field=path
-            if [[ $path == */ || -d $path ]]; then field=dir; path=${path%/}/; fi
+            [[ $path == */ ]] && field=dir
             echo "-a always,exit -F arch=b64 -F ${field}=${path} -F perm=${perm} -k ${key}"
             echo "-a always,exit -F arch=b32 -F ${field}=${path} -F perm=${perm} -k ${key}"
-        else
-            printf '%s\n' "$line"
         fi
     done <"$file" >"$tmp"
     cat "$tmp" >"$file"
@@ -2308,7 +2312,7 @@ EOF
     mv -f "$tmp" "$cfg"
     # Host keys
     if is_rhel && getent group ssh_keys >/dev/null; then
-        for f in /etc/ssh/ssh_host_*_key; do chown root:ssh_keys "$f"; chmod 0640 "$f"; done
+        for f in /etc/ssh/ssh_host_*_key; do chown root:ssh_keys "$f"; chmod 0600 "$f"; done
     else
         for f in /etc/ssh/ssh_host_*_key; do chown root:root "$f"; chmod 0600 "$f"; done
     fi
@@ -2417,6 +2421,7 @@ configure_firewalld() {
     done
     # firewalld drives nftables itself: a second ruleset service would conflict (CIS).
     systemctl disable --now nftables.service >/dev/null 2>&1 || true
+    systemctl mask nftables.service >/dev/null 2>&1 || true
     if [[ $FIREWALL_OUTBOUND_POLICY == deny ]]; then
         local r
         fw --get-policies 2>/dev/null | qgrep -w harden-egress || fw --new-policy=harden-egress
@@ -3144,6 +3149,8 @@ EOF
     logrotate -d /etc/logrotate.conf >/dev/null 2>&1 || die "logrotate configuration is invalid"
     systemctl enable logrotate.timer rsyslog.service >/dev/null 2>&1 || true
     if is_rhel; then
+        # journal-remote is installed for upload/forwarding only: no listener.
+        systemctl mask systemd-journal-remote.socket >/dev/null 2>&1 || true
         systemctl enable --now crond.service >/dev/null 2>&1 || true
     else
         systemctl enable --now cron.service >/dev/null 2>&1 || true

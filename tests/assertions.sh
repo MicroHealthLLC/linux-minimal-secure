@@ -254,7 +254,7 @@ check "firewalld default zone public"  bash -c "grep -q '^DefaultZone=public' /e
 check "firewalld: SSH allowed (permanent)" bash -c "grep -q '<service name=\"ssh\"/>' /etc/firewalld/zones/public.xml"
 check "firewalld: cockpit not open"    bash -c "! grep -q '<service name=\"cockpit\"/>' /etc/firewalld/zones/public.xml"
 check "firewalld: loopback anti-spoofing rule (trusted zone)" bash -c "grep -q 'source address=\"127.0.0.1\"' /etc/firewalld/zones/trusted.xml"
-check "nftables.service not enabled beside firewalld" bash -c "! systemctl is-enabled --quiet nftables.service"
+check "nftables.service masked beside firewalld" bash -c "[[ \$(systemctl is-enabled nftables.service 2>/dev/null) == masked ]]"
 if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
     check "firewalld running" systemctl is-active --quiet firewalld
     check "firewalld runtime allows SSH" bash -c "firewall-cmd --list-services | grep -qw ssh"
@@ -275,7 +275,8 @@ if rhel; then
 check "authselect profile custom/harden" bash -c "authselect current -r | grep -q '^custom/harden'"
 check "pam_faillock enabled"    grep -q 'pam_faillock.so preauth' /etc/pam.d/system-auth
 check "pam_pwquality enabled"   grep -q 'pam_pwquality.so' /etc/pam.d/system-auth
-check "pam_pwhistory enabled"   grep -q 'pam_pwhistory.so.*remember=24' /etc/pam.d/system-auth
+check "pam_pwhistory enabled"   grep -q 'pam_pwhistory.so' /etc/pam.d/system-auth
+check "password history 24 (pwhistory.conf, or inline on EL8)" bash -c "grep -Eq '^remember = 24' /etc/security/pwhistory.conf || grep -q 'pam_pwhistory.so.*remember=24' /etc/pam.d/system-auth"
 check "no nullok"               bash -c "! grep -Eq '^[^#].*nullok' /etc/pam.d/system-auth /etc/pam.d/password-auth"
 check "password hashing SHA512" grep -Eq '^ENCRYPT_METHOD[[:space:]]+SHA512' /etc/login.defs
 check "SELinux enforcing/targeted configured" bash -c "grep -qx 'SELINUX=enforcing' /etc/selinux/config && grep -qx 'SELINUXTYPE=targeted' /etc/selinux/config"
@@ -335,14 +336,14 @@ fi
 if rhel; then
     check "TMOUT readonly+exported (typeset -xr)" grep -Eq '^[[:space:]]*typeset -xr TMOUT=[0-9]+' /etc/profile.d/60-harden.sh
     check "every umask in /etc/bashrc is 027" bash -c "! grep -E '^[^#]*\\bumask[[:space:]]+[0-7]+' /etc/bashrc | grep -vq 'umask 027'"
-    check "audit watches in syscall form (EL content)" grep -q -- '-a always,exit -F arch=b64 -F path=/etc/passwd -F perm=wa' /etc/audit/rules.d/50-harden.rules
+    check "audit watches in syscall form too (EL content)" bash -c "grep -q -- '-a always,exit -F arch=b64 -F path=/etc/passwd -F perm=wa' /etc/audit/rules.d/50-harden.rules && grep -q '^-w /etc/selinux/ -p wa' /etc/audit/rules.d/50-harden.rules"
     check "AIDE daily check in /etc/crontab" grep -q '/usr/sbin/aide --check' /etc/crontab
 fi
 if [[ $OS == ubuntu ]]; then
     check "/etc/netplan watched by auditd" grep -q '^-w /etc/netplan/ -p wa' /etc/audit/rules.d/52-harden-netplan.rules
 fi
 if rhel; then
-    check "SELinux policy changes audited" grep -q -- '-F dir=/etc/selinux/ -F perm=wa -k MAC-policy' /etc/audit/rules.d/50-harden.rules
+    check "SELinux policy changes audited" grep -q '^-w /etc/selinux/ -p wa -k MAC-policy' /etc/audit/rules.d/50-harden.rules
     check "no AppArmor watches on EL" bash -c "! grep -q apparmor /etc/audit/rules.d/50-harden.rules"
 fi
 
