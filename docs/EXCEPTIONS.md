@@ -15,6 +15,8 @@ The system owner requires that audit-log pressure must never suspend logging, dr
 
 Compensating controls: `max_log_file = 20` (passes the CIS `>= 6` check), `num_logs = 10` (200 MB ceiling), the audit failure flag `-f 1` (printk, never panic), a 512 MB journald cap with 1 GB kept free, logrotate `maxsize 100M` checked hourly, a hard `/var/log` budget (`LOG_MAX_TOTAL`, default 4G, plus `LOG_MIN_FREE_PCT` disk free) enforced by pruning the oldest rotated archives, and syslog alerts that can be forwarded to the SIEM over TLS (`rsyslog-gnutls` is installed).
 
+Owner policy since 2.0.1, stated for cloud machines: **nothing may stop, hang or reboot the host.** Besides the auditd actions above, the kernel audit backlog uses `--backlog_wait_time 0`. With a full backlog (auditd stalled or dead), records are dropped and logged instead of blocking every audited process for up to 60 s. Every `/etc/fstab` line the script adds carries `nofail`, so a failed mount cannot drop a console-less VM into emergency mode.
+
 ## 2. Conflicts inside the profile, or with mandated components
 
 | Rule | Why it fails |

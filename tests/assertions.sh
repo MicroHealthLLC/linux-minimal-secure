@@ -127,6 +127,9 @@ check "disk_full_action = SYSLOG"        conf $A disk_full_action SYSLOG
 check "disk_error_action = SYSLOG"       conf $A disk_error_action SYSLOG
 check "no SUSPEND/SINGLE/HALT anywhere in auditd.conf" bash -c "! grep -Eiq '=[[:space:]]*(suspend|single|halt)\b' $A"
 check "audit failure mode -f 1 (never panic)" bash -c "grep -hq '^-f 1' /etc/audit/rules.d/*.rules && ! grep -hq '^-f 2' /etc/audit/rules.d/*.rules"
+check "audit backlog never blocks processes (backlog_wait_time 0)" bash -c "grep -hq '^--backlog_wait_time 0$' /etc/audit/rules.d/*.rules"
+check "no kernel panic / reboot-on-oops settings" bash -c "! grep -REhs '^[[:space:]]*kernel\\.(panic|panic_on_oops|panic_on_warn)[[:space:]]*=[[:space:]]*[1-9]' /etc/sysctl.conf /etc/sysctl.d/"
+check "every fstab line added by the script has nofail" bash -c "! grep -E '^(tmpfs[[:space:]]+/dev/shm|/var/tmp[[:space:]]+/var/tmp)[[:space:]]' /etc/fstab | grep -vq nofail"
 check "audit rules immutable (-e 2)" grep -q '^-e 2' /etc/audit/rules.d/99-harden-finalize.rules
 check "privileged command rules generated" grep -q 'path=/usr/bin/sudo' /etc/audit/rules.d/55-harden-privileged.rules
 check "audit rules compile" augenrules --check

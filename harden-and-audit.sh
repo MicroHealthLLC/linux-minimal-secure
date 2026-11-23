@@ -23,7 +23,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.0.1"
 readonly SCRIPT_NAME="harden-and-audit.sh"
 readonly LOG_FILE="/var/log/harden-and-audit.log"
 readonly STATE_DIR="/var/lib/harden-and-audit"
@@ -1287,10 +1287,13 @@ configure_audit_rules() {
 ## Managed by harden-and-audit.sh
 ## Remove existing rules, size the backlog for bursts, and on audit failure
 ## only log to the kernel ring buffer (-f 1). -f 2 (panic) is forbidden by
-## the owner's no-halt policy.
+## the owner's no-halt policy. backlog_wait_time 0: when the backlog is full
+## the kernel drops the record and logs it instead of blocking every audited
+## process for up to 60 s (a stalled auditd would otherwise freeze sshd and
+## every service: a hung cloud machine).
 -D
 -b 8192
---backlog_wait_time 60000
+--backlog_wait_time 0
 -f 1
 ## Keep loading the remaining rules if one rule is rejected (e.g. a syscall
 ## unknown to an older kernel) instead of leaving the host unaudited.
@@ -2918,15 +2921,19 @@ EOF
     if grep -Eq '^[^#[:space:]]+[[:space:]]+/dev/shm[[:space:]]' /etc/fstab; then
         sed -i -E '\|^[^#[:space:]]+[[:space:]]+/dev/shm[[:space:]]|d' /etc/fstab
     fi
-    printf 'tmpfs\t/dev/shm\ttmpfs\tdefaults,%s,size=50%%\t0\t0\n' "$opts" >>/etc/fstab
+    # nofail on every line the script adds: a mount that fails at boot is
+    # logged, it never drops a console-less cloud VM into emergency mode.
+    printf 'tmpfs\t/dev/shm\ttmpfs\tdefaults,%s,size=50%%,nofail\t0\t0\n' "$opts" >>/etc/fstab
     # /var/tmp: honour a dedicated partition; otherwise bind it onto itself
     # to enforce the mount options (does not add space isolation).
     if grep -Eq '^[^#[:space:]]+[[:space:]]+/var/tmp[[:space:]]' /etc/fstab; then
         awk -v o="$opts" '$2=="/var/tmp" && $1 !~ /^#/ { n=split(o,a,","); for (i=1;i<=n;i++) if ($4 !~ "(^|,)"a[i]"(,|$)") $4=$4","a[i] } {print}' /etc/fstab >/etc/fstab.tmp
         cat /etc/fstab.tmp >/etc/fstab && rm -f /etc/fstab.tmp
     else
-        printf '/var/tmp\t/var/tmp\tnone\tbind,%s\t0\t0\n' "$opts" >>/etc/fstab
+        printf '/var/tmp\t/var/tmp\tnone\tbind,%s,nofail\t0\t0\n' "$opts" >>/etc/fstab
     fi
+    # Hosts hardened by an earlier version: give the script's bind line nofail.
+    sed -i -E '/^\/var\/tmp[[:space:]]+\/var\/tmp[[:space:]]+none[[:space:]]+/{/nofail/!s/^(\/var\/tmp[[:space:]]+\/var\/tmp[[:space:]]+none[[:space:]]+[^[:space:]]+)/\1,nofail/}' /etc/fstab
     systemctl daemon-reload
 
     # Apply now where safe.

@@ -51,6 +51,7 @@ The script is built so you cannot lose access to the server:
 7. **GRUB password protects editing, not booting.** Menu entries are `--unrestricted`, so unattended reboots keep working.
 8. **NOPASSWD sudo rules are reported, not removed.** On cloud images they are often the only working sudo path.
 9. **SELinux is never enforced on an unlabelled system.** A RHEL-family host that booted with SELinux *disabled* is set to `permissive` with a full relabel at the next boot; re-running the script after that reboot switches it to `enforcing`.
+10. **Nothing stops, hangs or reboots the machine** (these are console-less cloud VMs). auditd only alerts on full or failing disks, audit failure mode is `-f 1` (never panic), audit logs rotate at 20 MB × 10, a full kernel audit backlog drops records instead of blocking processes (`--backlog_wait_time 0`), every fstab line the script adds carries `nofail` (no emergency mode at boot), `/var/log` has a hard budget, and automatic updates never reboot.
 
 The CI proves #3: after hardening, the sudo admin must still log in over SSH with a key, and root must be refused.
 
