@@ -148,7 +148,7 @@ The two long steps print a status line every `PROGRESS_INTERVAL` seconds (60 by 
 [INFO ] OpenSCAP cis_level2_server: 3m00s elapsed - 214/507 rules (42%), ~4m06s left, last: Ensure auditd Collects ...
 ```
 
-AIDE's percentage compares data read against disk space in use, minus the bulk paths AIDE skips. AIDE has other exclusions too, so the estimate reads low and the time left errs long. AIDE's full output is in `/var/log/harden-and-audit-aideinit.log`.
+AIDE's percentage compares data read against disk space in use, minus the bulk paths AIDE skips (container, VM and snap storage, caches, and home directories apart from the shell/login dotfiles, `.gitconfig`, `.ssh`, `.config/autostart`, systemd user units and `.local/bin`). AIDE has other exclusions too, so the estimate reads low and the time left errs long. AIDE's full output is in `/var/log/harden-and-audit-aideinit.log`.
 
 ## CI and releases
 
