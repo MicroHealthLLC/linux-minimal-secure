@@ -371,7 +371,7 @@ pkg_mark_manual() {
     if is_rhel; then
         if [[ $DNF5 == 1 ]]; then dnf -q -y mark user "$@" >/dev/null 2>&1 || true; else dnf -q -y mark install "$@" >/dev/null 2>&1 || true; fi
     else
-        apt-mark manual "$@" >/dev/null
+        apt-mark "${APT_LOCK_WAIT[@]}" manual "$@" >/dev/null
     fi
 }
 
@@ -404,13 +404,17 @@ first_available() {
     return 1
 }
 
+# apt-daily / unattended-upgrades (enabled with --now in step 1) can hold the
+# dpkg lock for a long time: wait for it instead of failing (apt >= 1.9.11).
+APT_LOCK_WAIT=(-o DPkg::Lock::Timeout=1800)
+
 apt_install() {
-    apt-get install -y -q --no-install-recommends \
+    apt-get "${APT_LOCK_WAIT[@]}" install -y -q --no-install-recommends \
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
 }
 
 apt_update() {
-    apt-get update -q -o Acquire::Retries=5
+    apt-get "${APT_LOCK_WAIT[@]}" update -q -o Acquire::Retries=5
 }
 
 # Purge PACKAGES only when apt would not remove anything outside the given
@@ -448,7 +452,7 @@ safe_purge() {
     fi
     if [[ ${#keep[@]} -gt 0 ]]; then
         log "purging: ${keep[*]}"
-        apt-get purge -y -q "${keep[@]}"
+        apt-get "${APT_LOCK_WAIT[@]}" purge -y -q "${keep[@]}"
     fi
 }
 
@@ -782,11 +786,11 @@ purge_graphical() {
         systemctl set-default multi-user.target >/dev/null
         return 0
     fi
-    apt-get autoremove --purge -y -q
+    apt-get "${APT_LOCK_WAIT[@]}" autoremove --purge -y -q
     local -a residual
     mapfile -t residual < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1=="rc"{print $2}')
     if [[ ${#residual[@]} -gt 0 ]]; then
-        dpkg --purge "${residual[@]}" >/dev/null
+        apt-get "${APT_LOCK_WAIT[@]}" purge -y -q "${residual[@]}" >/dev/null
     fi
     systemctl set-default multi-user.target >/dev/null
 }
@@ -1099,7 +1103,7 @@ install_base_stack() {
     fi
     apt_install "${pkgs[@]}"
     log "installing pending security updates"
-    apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade
+    apt-get "${APT_LOCK_WAIT[@]}" -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade
 }
 
 install_base_stack_rhel() {
