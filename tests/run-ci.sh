@@ -234,4 +234,4 @@ if [[ $gate != PASS ]]; then
     echo "CIS Level 2 Server pass rate ${cis_rate}% is below ${SCAP_MIN_SCORE}%" >&2
     exit 1
 fi
-log "PASS: CIS L2 Server ${cis_rate}% (XCCDF ${cis_score})${extra_note}"
+log "PASS: CIS L2 $([[ $VARIANT == desktop ]] && echo Workstation || echo Server) ${cis_rate}% (XCCDF ${cis_score})${extra_note}"

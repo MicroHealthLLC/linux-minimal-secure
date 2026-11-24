@@ -58,4 +58,6 @@
 | AlmaLinux 8 / 9 / 10 | 94.88% / 95.20% / 93.48% | DISA STIG 72.75% / 74.77% / 70.88% |
 | CentOS Stream 9 / 10 | 95.47% / 93.48% | DISA STIG 74.88% / 70.57% |
 
+**2.1.0** (run 45294343508, `4769ed7`): all **17** green. Fedora 44 / 45: 93.95% / 93.95% (CIS L2 Server); Fedora 45 GNOME desktop: 92.40% (CIS L2 Workstation); EL9: 95.73%; EL10: 94.69–94.93%. Fedora deltas fixed on the way: PAM guard misread optional `-` lines, `chage --mindays` removed in shadow 4.20, backup of a relative symlink (`/etc/issue`) failed on the second run, missing cracklib dictionary (password changes impossible), Fedora content forms, GNOME dconf settings.
+
 Released from `main` as **v2.0.0**; the GitHub repository is renamed to **linux-minimal-secure** (old URLs redirect).
