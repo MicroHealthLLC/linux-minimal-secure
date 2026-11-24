@@ -62,7 +62,7 @@ avc=$(dpkg-query -W -f='${Package}\n' 'libavcodec[0-9]*' 2>/dev/null | head -n1)
 check "dependency-aware purge kept non-graphical ${avc:-libavcodec}" installed "${avc:-libavcodec-missing}"
 for p in inetutils-telnet rpcbind; do check "legacy service ${p} purged" not_installed "$p"; done
 else
-check "dnf: no weak dependencies"      grep -Eq '^install_weak_deps=False$' /etc/dnf/dnf.conf
+check "dnf: no weak dependencies"      grep -Eq '^install_weak_deps=(False|0)$' /etc/dnf/dnf.conf
 check "dnf: gpgcheck=1"                grep -Eq '^gpgcheck=1$' /etc/dnf/dnf.conf
 check "dnf: localpkg_gpgcheck=1"       grep -Eq '^localpkg_gpgcheck=1$' /etc/dnf/dnf.conf
 check "no repository with gpgcheck=0"  bash -c "! grep -Eqs '^[[:space:]]*gpgcheck[[:space:]]*=[[:space:]]*0' /etc/yum.repos.d/*.repo"
@@ -75,6 +75,7 @@ check "desktop: USB storage not blacklisted" bash -c "! grep -q 'usb-storage' /e
 check "desktop: overlay kept (toolbox/podman)" bash -c "! grep -q 'install overlay ' /etc/modprobe.d/60-harden-blacklist.conf"
 check "desktop: no shell TMOUT (screen lock covers idle)" bash -c "! grep -q TMOUT= /etc/profile.d/60-harden.sh"
 check "desktop: /tmp keeps exec (AppImages, IDEs)" bash -c "! grep -q 'noexec' /etc/systemd/system/tmp.mount"
+check "desktop: GNOME screen lock + login banner locked in dconf" bash -c "grep -q '^idle-delay=uint32 900' /etc/dconf/db/local.d/00-security-settings && grep -q '^banner-message-enable=true' /etc/dconf/db/distro.d/00-security-settings && grep -qx '/org/gnome/desktop/session/idle-delay' /etc/dconf/db/local.d/locks/00-security-settings-lock"
 check "desktop: fips=1 not on the kernel command line of a Fedora desktop" bash -c "[[ $OS != fedora ]] || ! grep -q 'fips=1' /etc/default/grub"
 else
 for p in xterm xorg-x11-xauth; do check "graphical package ${p} removed" not_installed "$p"; done
@@ -319,6 +320,7 @@ check "password hashing yescrypt (Fedora)" grep -Eq '^ENCRYPT_METHOD[[:space:]]+
 else
 check "password hashing SHA512" grep -Eq '^ENCRYPT_METHOD[[:space:]]+SHA512' /etc/login.defs
 fi
+check "pam_unix reuses the checked token (use_authtok)" bash -c "grep -E '^password[[:space:]].*pam_unix\\.so' /etc/pam.d/system-auth | grep -q use_authtok"
 check "cracklib dictionary present (pwquality dictcheck can load it)" bash -c "ls /usr/share/cracklib/pw_dict.pwd* >/dev/null 2>&1"
 check "SELinux enforcing/targeted configured" bash -c "grep -qx 'SELINUX=enforcing' /etc/selinux/config && grep -qx 'SELINUXTYPE=targeted' /etc/selinux/config"
 check "abrt / setroubleshoot / mcstrans absent" bash -c "! rpm -qa --qf '%{NAME}\\n' | grep -Eq '^(abrt|setroubleshoot|mcstrans)'"
@@ -345,7 +347,7 @@ check "fail2ban sshd jail active" bash -c "fail2ban-client status sshd"
 
 AC=/etc/aide/aide.conf; ADB=/var/lib/aide/aide.db
 rhel && { AC=/etc/aide.conf; ADB=/var/lib/aide/aide.db.gz; }
-check "AIDE watches the audit tools in aide.conf" grep -q '^/usr/sbin/auditctl p+i+n+u+g+s+b+acl+selinux+xattrs+sha512$' "$AC"
+check "AIDE watches the audit tools in aide.conf" grep -Eq '^/usr/sbin/auditctl p\+i\+n\+u\+g\+s\+b\+acl\+(selinux\+)?xattrs\+sha512$' "$AC"
 check "AIDE configuration valid" aide --config-check --config "$AC"
 check "AIDE excludes container storage and caches" grep -qs '^!/var/cache(/|\$)' "$AC" /etc/aide/aide.conf.d/90_harden_bulk_excludes
 # aide -p (path check) exists from AIDE 0.17; EL8 ships 0.16.
@@ -417,7 +419,7 @@ check "coturn itself NOT installed" not_installed coturn
 for p in opus libsrtp mariadb-connector-c libpq sqlite-libs systemd-libs libvpx libtheora libwebp jansson libevent libdav1d hiredis; do
     check "media/coturn lib ${p}" installed "$p"
 done
-check "no X server present" bash -c "! rpm -qa --qf '%{NAME}\\n' | grep -q '^xorg-x11-server'"
+desktop || check "no X server present" bash -c "! rpm -qa --qf '%{NAME}\\n' | grep -q '^xorg-x11-server'"
 else
 HDR=linux-headers-amd64
 [[ $OS == ubuntu ]] && HDR=linux-headers-virtual     # the CI image boots linux-image-virtual

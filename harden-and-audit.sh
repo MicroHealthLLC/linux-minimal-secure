@@ -57,7 +57,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${PASS_MAX_DAYS:=365}"            # DoD sites commonly set 60
 : "${PASS_MIN_DAYS:=1}"
 : "${PASS_WARN_AGE:=7}"
-: "${ACCOUNT_INACTIVE_DAYS:=45}"
+: "${ACCOUNT_INACTIVE_DAYS:=}"      # empty = 45 (30 on Fedora, its CIS value)
 : "${SHELL_TMOUT:=900}"
 : "${SSH_LOGLEVEL:=}"                # empty = INFO (Debian family CIS) / VERBOSE (EL CIS: logs key fingerprints)
 : "${FAILLOCK_DENY:=4}"
@@ -244,7 +244,8 @@ run_with_progress() {
 backup_file() {
     local f=$1 dest
     dest="${BACKUP_DIR}${f}"
-    if [[ -e $f && ! -e $dest ]]; then
+    # -L: a backed-up relative symlink dangles inside BACKUP_DIR (-e is false).
+    if [[ ( -e $f || -L $f ) && ! -e $dest && ! -L $dest ]]; then
         install -d -m 0700 "$(dirname "$dest")"
         cp -a -- "$f" "$dest"
     fi
@@ -584,6 +585,9 @@ preflight_os() {
             SCAP_PROFILE=cis_level2_server
         fi
     fi
+    if [[ -z $ACCOUNT_INACTIVE_DAYS ]]; then
+        if is_fedora; then ACCOUNT_INACTIVE_DAYS=30; else ACCOUNT_INACTIVE_DAYS=45; fi
+    fi
     if [[ -z $SSH_LOGLEVEL ]]; then
         if is_rhel; then SSH_LOGLEVEL=VERBOSE; else SSH_LOGLEVEL=INFO; fi
     fi
@@ -719,7 +723,9 @@ configure_dnf_minimal() {
     local conf=/etc/dnf/dnf.conf kv f
     backup_file "$conf"
     grep -q '^\[main\]' "$conf" || printf '[main]\n' >>"$conf"
-    for kv in install_weak_deps=False gpgcheck=1 localpkg_gpgcheck=1 repo_gpgcheck=0 clean_requirements_on_remove=True skip_if_unavailable=False; do
+    local weak=False
+    is_fedora && weak=0    # Fedora CIS (dnf5) checks the numeric form
+    for kv in install_weak_deps=${weak} gpgcheck=1 localpkg_gpgcheck=1 repo_gpgcheck=0 clean_requirements_on_remove=True skip_if_unavailable=False; do
         # repo_gpgcheck=0: vendor repositories sign packages, not metadata;
         # 1 would make every mirror without signed metadata unusable.
         [[ ${kv%%=*} == repo_gpgcheck ]] && continue
@@ -1405,12 +1411,12 @@ EOF
 -w /etc/hosts -p wa -k system-locale
 -w /etc/hostname -p wa -k system-locale
 -w /etc/networks -p wa -k system-locale
-$(for d in /etc/network/ /etc/NetworkManager /etc/sysconfig/network /etc/sysconfig/network-scripts; do
+$(for d in /etc/network/ /etc/NetworkManager /etc/NetworkManager/system-connections/ /etc/sysconfig/network /etc/sysconfig/network-scripts; do
     if [[ -e $d ]]; then echo "-w ${d} -p wa -k system-locale"; fi
 done)
 
 ## --- Mandatory access control (AppArmor / SELinux)
-$(for d in /etc/apparmor /etc/apparmor.d /etc/selinux/ /usr/share/selinux/; do
+$(for d in /etc/apparmor /etc/apparmor.d /etc/selinux/ /usr/share/selinux/ /var/lib/selinux/; do
     if [[ -e $d ]]; then echo "-w ${d} -p wa -k MAC-policy"; fi
 done)
 
@@ -1471,8 +1477,8 @@ EOF
     # "-a always,exit -F arch=b64 -F path=/etc/passwd -F perm=wa -k identity"
     # (dir= with a trailing slash for directories).
     if is_rhel; then
-        install -d -m 0755 /etc/sysconfig/network-scripts
-        install -d -m 0755 /var/run/faillock
+        install -d -m 0755 /etc/sysconfig/network-scripts /var/run/faillock /etc/NetworkManager/system-connections
+        [[ -e /etc/sysconfig/network ]] || : >/etc/sysconfig/network
         audit_watches_to_syscall ${rules_dir}/50-harden.rules
     fi
     # Syscalls added in Linux 6.6 (fchmodat2) / 3.15 (renameat2): emitted only
@@ -1568,6 +1574,10 @@ audit_watches_to_syscall() {
             [[ $path == */ ]] && field=dir
             echo "-a always,exit -F arch=b64 -F ${field}=${path} -F perm=${perm} -k ${key}"
             echo "-a always,exit -F arch=b32 -F ${field}=${path} -F perm=${perm} -k ${key}"
+        elif [[ $line =~ ^-a\ always,exit\ -F\ path=([^[:space:]]+)\ -F\ perm=x\ (.*)$ ]]; then
+            # Command-execution rules: the Fedora content checks per-ABI copies.
+            echo "-a always,exit -F arch=b64 -F path=${BASH_REMATCH[1]} -F perm=x ${BASH_REMATCH[2]}"
+            echo "-a always,exit -F arch=b32 -F path=${BASH_REMATCH[1]} -F perm=x ${BASH_REMATCH[2]}"
         fi
     done <"$file" >"$tmp"
     cat "$tmp" >"$file"
@@ -2434,6 +2444,9 @@ EOF
     fi
     mv -f "$tmp" "$cfg"
     # Host keys
+    if is_rhel; then
+        getent group ssh_keys >/dev/null || groupadd -r ssh_keys
+    fi
     if is_rhel && getent group ssh_keys >/dev/null; then
         for f in /etc/ssh/ssh_host_*_key; do chown root:ssh_keys "$f"; chmod 0600 "$f"; done
     else
@@ -2684,6 +2697,8 @@ configure_authselect() {
     fi
     for f in system-auth password-auth; do
         [[ -f ${prof}/${f} ]] || continue
+        # pam_unix must reuse the pwquality-checked token (CIS pam_unix_authtok).
+        sed -i -E '/^password[[:space:]].*pam_unix\.so/ { /use_authtok/! s/(pam_unix\.so)/\1 use_authtok/ }' "${prof}/${f}"
         # EL9+: pwhistory.conf carries remember/enforce_for_root (CIS checks it there).
         if (( OS_MAJOR == 8 )); then
             sed -i -E '/pam_pwhistory\.so/ { /remember=/! s/(pam_pwhistory\.so)/\1 remember=24 enforce_for_root/ }' "${prof}/${f}"
@@ -2831,6 +2846,10 @@ configure_login_defs() {
             chage -d "$today" "$u"
         fi
         chage --maxdays "$PASS_MAX_DAYS" "${minday[@]}" --warndays "$PASS_WARN_AGE" --inactive "$ACCOUNT_INACTIVE_DAYS" "$u"
+        # chage without --mindays (shadow 4.20): passwd -n sets the minimum age.
+        if [[ ${#minday[@]} -eq 0 ]]; then
+            passwd -n "$PASS_MIN_DAYS" "$u" >/dev/null 2>&1 || warn "could not set the minimum password age of ${u}"
+        fi
     done < /etc/shadow
 
     # Interactive shells: umask 027, idle timeout. Desktops: no TMOUT (it would
@@ -3007,6 +3026,54 @@ EOF
     # Dynamic MOTD must not disclose kernel/OS details.
     [[ -f /etc/update-motd.d/10-uname ]] && chmod 0644 /etc/update-motd.d/10-uname
     return 0
+}
+
+# Desktop mode, GNOME: lock the screen after 15 idle minutes (5 s grace),
+# DoD banner on the login screen, no user list, no autorun, no window popping
+# up on mount (USB drives still mount). Locked so users cannot undo them.
+configure_gnome_desktop() {
+    is_desktop || return 0
+    command -v dconf >/dev/null 2>&1 || return 0
+    local banner
+    banner=$(tr '\n' ' ' </etc/issue | sed -E "s/'/\\\\'/g; s/[[:space:]]+/ /g")
+    install -d -m 0755 /etc/dconf/profile /etc/dconf/db/local.d/locks /etc/dconf/db/distro.d/locks
+    if [[ ! -f /etc/dconf/profile/user ]]; then
+        printf 'user-db:user\nsystem-db:local\nsystem-db:site\nsystem-db:distro\n' | write_file 0644 /etc/dconf/profile/user
+    fi
+    write_file 0644 /etc/dconf/db/local.d/00-security-settings <<'EOF'
+# Managed by harden-and-audit.sh (desktop mode)
+[org/gnome/desktop/session]
+idle-delay=uint32 900
+
+[org/gnome/desktop/screensaver]
+lock-enabled=true
+lock-delay=uint32 5
+
+[org/gnome/desktop/media-handling]
+autorun-never=true
+automount-open=false
+EOF
+    write_file 0644 /etc/dconf/db/local.d/locks/00-security-settings-lock <<'EOF'
+/org/gnome/desktop/session/idle-delay
+/org/gnome/desktop/screensaver/lock-enabled
+/org/gnome/desktop/screensaver/lock-delay
+/org/gnome/desktop/media-handling/autorun-never
+/org/gnome/desktop/media-handling/automount-open
+EOF
+    {
+        echo "# Managed by ${SCRIPT_NAME} (desktop mode)"
+        echo "[org/gnome/login-screen]"
+        echo "banner-message-enable=true"
+        echo "banner-message-text='${banner}'"
+        echo "disable-user-list=true"
+    } | write_file 0644 /etc/dconf/db/distro.d/00-security-settings
+    write_file 0644 /etc/dconf/db/distro.d/locks/00-security-settings-lock <<'EOF'
+/org/gnome/login-screen/banner-message-enable
+/org/gnome/login-screen/banner-message-text
+/org/gnome/login-screen/disable-user-list
+EOF
+    dconf update || warn "dconf update failed: GNOME settings apply after the next dconf update"
+    log "desktop mode: GNOME screen lock (15 min), login banner, no autorun"
 }
 
 configure_kernel_modules() {
@@ -3557,8 +3624,10 @@ configure_aide_config() {
     sed -i -E "/^# ${MARK}: audit tools$/d; \#^(/usr)?/sbin/(auditctl|auditd|ausearch|aureport|autrace|augenrules)[[:space:]]#d" "$aconf"
     {
         echo "# ${MARK}: audit tools"
+        local attrs="p+i+n+u+g+s+b+acl+selinux+xattrs+sha512"
+        is_rhel && attrs="p+i+n+u+g+s+b+acl+xattrs+sha512"    # the EL/Fedora content's exact set
         for t in auditctl auditd ausearch aureport autrace augenrules; do
-            echo "/usr/sbin/${t} p+i+n+u+g+s+b+acl+selinux+xattrs+sha512"
+            echo "/usr/sbin/${t} ${attrs}"
         done
     } >>"$aconf"
     # The vendor catch-all (99_aide_root: "/ 0 Full") checksums every byte
@@ -4237,6 +4306,7 @@ main() {
     configure_login_defs
     configure_sudo
     configure_banners
+    configure_gnome_desktop
     configure_kernel_modules
     configure_mounts
     configure_coredumps
