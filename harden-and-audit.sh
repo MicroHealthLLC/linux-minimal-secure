@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.1.1"
 readonly SCRIPT_NAME="harden-and-audit.sh"
 readonly LOG_FILE="/var/log/harden-and-audit.log"
 readonly STATE_DIR="/var/lib/harden-and-audit"
@@ -3229,7 +3229,7 @@ while IFS= read -r -d '' rec; do
     if rm -f -- "$f"; then used=$(( used - size )); n=$(( n + 1 )); fi
 done < <(find /var/log -xdev -regextype posix-extended -type f -not -path '/var/log/journal/*' \
     \( -name '*.gz' -o -name '*.xz' -o -name '*.zst' -o -name '*.bz2' -o -name '*.old' \
-       -o -regex '.*\.[0-9]+(\.log)?' -o -regex '.*-[0-9]{8}(\.log)?' \) \
+       -o -regex '.*\.[0-9]+(\.log)?' -o -regex '.*-[0-9]{8}([0-9]{2})?(\.log)?' \) \
     -printf '%T@ %s %p\0' | sort -zn)
 msg="pruned ${n} rotated log file(s), freed $(numfmt --to=iec $(( start - used ))); /var/log now $(numfmt --to=iec "$used"), $(free_pct)% free"
 if over; then msg+=" - STILL OVER BUDGET: live logs alone exceed it"; fi
@@ -3356,6 +3356,11 @@ EOF
     grep -q '^compress$' /etc/logrotate.conf || sed -i '/^create/a compress' /etc/logrotate.conf
     sed -i '/^maxsize /d' /etc/logrotate.conf
     sed -i "/^compress$/a maxsize ${LOG_MAXSIZE}" /etc/logrotate.conf
+    # Hourly maxsize rotation can rotate a file twice in one day: with
+    # dateext's default -%Y%m%d suffix the second one collides ("destination
+    # already exists") and logrotate fails. Hour-stamped suffixes never do.
+    sed -i '/^dateformat /d' /etc/logrotate.conf
+    sed -i "/^maxsize /a dateformat -%Y%m%d%H" /etc/logrotate.conf
     grep -q '^daily$' /etc/logrotate.conf || sed -i '1i daily' /etc/logrotate.conf
     # This script's own logs.
     write_file 0644 /etc/logrotate.d/harden-and-audit <<'EOF'
@@ -3379,7 +3384,22 @@ EOF
         backup_file "$f"
         sed -i -E 's/^([[:space:]]*create[[:space:]]+)0?6[0-7][0-7]([[:space:]]|$)/\10640\2/' "$f"
     done
-    logrotate -d /etc/logrotate.conf >/dev/null 2>&1 || die "logrotate configuration is invalid"
+    # Validate against a private copy of the state file: the timer started
+    # above may be rotating right now and holds the real state file's lock.
+    local lstate lout
+    lstate=$(mktemp)
+    cp -f /var/lib/logrotate/logrotate.status "$lstate" 2>/dev/null || true
+    if ! lout=$(logrotate -d -s "$lstate" /etc/logrotate.conf 2>&1); then
+        rm -f "$lstate"
+        grep -E '^error:' <<<"$lout" >&2 || printf '%s\n' "$lout" | tail -n 20 >&2
+        # Only a parse error (it names a config file and line) is fatal;
+        # a missing log, an unreadable olddir and the like are not.
+        if grep -qE '^error: /etc/logrotate[^:]*:[0-9]+' <<<"$lout"; then
+            die "logrotate configuration is invalid"
+        fi
+        warn "logrotate reported non-configuration errors (above); the configuration itself parses"
+    fi
+    rm -f "$lstate"
     systemctl enable logrotate.timer rsyslog.service >/dev/null 2>&1 || true
     if is_rhel; then
         # journal-remote is installed for upload/forwarding only: no listener.
