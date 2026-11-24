@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly SCRIPT_VERSION="2.1.1"
+readonly SCRIPT_VERSION="2.1.2"
 readonly SCRIPT_NAME="harden-and-audit.sh"
 readonly LOG_FILE="/var/log/harden-and-audit.log"
 readonly STATE_DIR="/var/lib/harden-and-audit"
@@ -3609,21 +3609,23 @@ aide_paths() {
 aide_bulk_excludes() {
     cat <<'EOF'
 # Managed by harden-and-audit.sh: bulk / volatile data kept out of AIDE.
-# Container and VM storage (images are verified by their runtime digests)
+# Container, VM and app-image storage (verified by their own digests/signatures)
 !/var/lib/(containerd|docker|containers|kubelet|rancher)(/|$)
 !/var/lib/libvirt/images(/|$)
 !/var/lib/snapd/(snaps|cache)(/|$)
+!/var/lib/flatpak/(repo|app|runtime)(/|$)
+!/snap/(?!bin(/|$))[^/]+(/|$)
+!/usr/share/ollama/\.ollama/models(/|$)
 # Caches and scratch space
 !/var/cache(/|$)
 !/var/tmp(/|$)
 !/tmp(/|$)
-# Home directories hold user data (repositories, package caches, app
-# profiles), not the system. Still watched: the shell dotfiles, .ssh,
-# .config/autostart, systemd user units and .local/bin - where something
-# planted would run.
-!/(root|home/[^/]+)/[^.][^/]*(/|$)
-!/(root|home/[^/]+)/\.(cache|npm|pnpm-store|yarn|bun|deno|nvm|pyenv|cargo|rustup|go|gradle|m2|terraform\.d|vscode-server|mozilla|var)(/|$)
-!/(root|home/[^/]+)/\.local/(share|lib|state)(/|$)
+# Home directories hold user data (repositories, toolchains, models, package
+# caches, app profiles), not the system: all of it is skipped except where
+# something planted would run - the shell/login dotfiles, .gitconfig, .ssh,
+# .config/autostart, systemd user units and .local/bin.
+!/(root|home/[^/]+)/(?!(\.ssh|\.config|\.local)(/|$)|\.(bashrc|bash_profile|bash_login|bash_logout|profile|zshrc|zshenv|zprofile|zlogin|zlogout|login|logout|inputrc|pam_environment|xprofile|xsession|xsessionrc|xinitrc|gitconfig|forward|rhosts|shosts|netrc)$)[^/]+(/|$)
+!/(root|home/[^/]+)/\.local/(?!bin(/|$))[^/]+(/|$)
 !/(root|home/[^/]+)/\.config/(?!(autostart|systemd)(/|$))[^/]+(/|$)
 # Swap files (contents change with every page out)
 !/(swap\.img|swapfile)$
@@ -4183,31 +4185,45 @@ aide_init_quiet() {
 # Bytes in use on local disk filesystems: the upper bound of what AIDE reads
 # (its exclusions make the real amount smaller, so the estimate is cautious).
 AIDE_TOTAL_BYTES=0
-# Minus the bulk data 90_harden_bulk_excludes keeps out of AIDE (same paths,
-# as globs; each du is time-boxed so a huge tree cannot stall the estimate).
+# Minus the bulk data 90_harden_bulk_excludes keeps out of AIDE (the same
+# paths; home directories whole - their watched dotfiles are a few KB). The
+# du runs go in parallel under one time box; container storage that cannot
+# be measured in time (hundreds of GB of layers) falls back to docker's own
+# accounting.
 aide_estimate_total() {
-    local total skip=0 d b h
+    local total skip=0 d b h i tmp cskip=0 cfail=0 ddf
     local -a dirs=(/var/lib/containerd /var/lib/docker /var/lib/containers /var/lib/kubelet /var/lib/rancher
-                   /var/lib/libvirt/images /var/lib/snapd/snaps /var/lib/snapd/cache /var/cache /var/tmp /tmp
-                   /swap.img /swapfile)
+                   /var/lib/libvirt/images /var/lib/snapd/snaps /var/lib/snapd/cache
+                   /var/lib/flatpak/repo /var/lib/flatpak/app /var/lib/flatpak/runtime
+                   /usr/share/ollama/.ollama/models /var/cache /var/tmp /tmp /swap.img /swapfile)
     total=$(df -l -B1 --output=used -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null \
         | awk 'NR > 1 { s += $1 } END { printf "%d\n", s }')
-    for h in /root /home/*; do
-        [[ -d $h ]] || continue
-        for d in "$h"/[!.]* "$h"/.{cache,npm,pnpm-store,yarn,bun,deno,nvm,pyenv,cargo,rustup,go,gradle,m2,terraform.d,vscode-server,mozilla,var} \
-                 "$h"/.local/{share,lib,state} "$h"/.config/*; do
-            case ${d##*/.config/} in autostart|systemd) [[ $d == */.config/* ]] && continue ;; esac
-            dirs+=("$d")
-        done
-    done
+    for h in /root /home/*; do [[ -d $h ]] && dirs+=("$h"); done
     while read -r d b _; do
-        [[ $b == file && $d == /* && $d != /swap.img && $d != /swapfile ]] && dirs+=("$d")
+        [[ $b == file && $d == /* && $d != /swap.img && $d != /swapfile && $d != /root/* && $d != /home/* ]] && dirs+=("$d")
     done < <(tail -n +2 /proc/swaps 2>/dev/null)
-    for d in "${dirs[@]}"; do
-        [[ -e $d ]] || continue
-        b=$(timeout 20 du -sxb "$d" 2>/dev/null | cut -f1) || continue
-        skip=$(( skip + ${b:-0} ))
+    tmp=$(mktemp -d) || { printf '%d\n' "$total"; return; }
+    for i in "${!dirs[@]}"; do
+        [[ -e ${dirs[i]} ]] || continue
+        { timeout 180 du -sxb "${dirs[i]}" 2>/dev/null | cut -f1 >"$tmp/$i"; } &
     done
+    wait
+    for i in "${!dirs[@]}"; do
+        [[ -e ${dirs[i]} ]] || continue
+        b=$(<"$tmp/$i") 2>/dev/null; b=${b:-0}
+        case ${dirs[i]} in
+            /var/lib/containerd|/var/lib/docker) cskip=$(( cskip + b )); (( b > 0 )) || cfail=1 ;;
+            *) skip=$(( skip + b )) ;;
+        esac
+    done
+    rm -rf "$tmp"
+    if (( cfail )) && command -v docker >/dev/null 2>&1; then
+        ddf=$(timeout 30 docker system df --format '{{.Size}}' 2>/dev/null \
+            | sed -E 's/B$//; s/([0-9.]+)([kKMGTP]?)/\1\U\2/' | numfmt --from=si 2>/dev/null \
+            | awk '{ s += $1 } END { printf "%d\n", s }')
+        (( ${ddf:-0} > cskip )) && cskip=$ddf
+    fi
+    skip=$(( skip + cskip ))
     (( total > skip )) && total=$(( total - skip ))
     printf '%d\n' "$total"
 }

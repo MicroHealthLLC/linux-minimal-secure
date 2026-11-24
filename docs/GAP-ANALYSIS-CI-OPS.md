@@ -8,7 +8,7 @@
 | P2 | Keep upstream `nice`/`ionice` | Moved into `aide_init_quiet` | done |
 | P3 | `[STEP n/N]` + run time | `step()` and `fmt_dur`. N comes from the script's own step headers. CI asserts the final step number equals N | done |
 | P4 | Heartbeat during long steps | `run_with_progress` (background command, status line every `PROGRESS_INTERVAL`) | done |
-| P5 | AIDE %, time left, current file, log file, stdin closed | `aide_estimate_total` (disk in use minus the bulk excludes, each `du` limited to 20 s), `aide_progress` (`/proc/PID/io` rchar plus the open file), `/var/log/harden-and-audit-aideinit.log`, `</dev/null` | done |
+| P5 | AIDE %, time left, current file, log file, stdin closed | `aide_estimate_total` (disk in use minus the bulk excludes and home directories; the `du` runs go in parallel under one 180 s limit, with `docker system df` as the fallback for container storage), `aide_progress` (`/proc/PID/io` rchar plus the open file), `/var/log/harden-and-audit-aideinit.log`, `</dev/null` | done |
 | P6 | OpenSCAP n/N rules, %, time left | `scap_rule_count` (selected rules in the resolved profile: 507 for CIS L2 on 24.04, matching the 507 results oscap reports), `scap_progress`, `stdbuf -oL` | done |
 | P7 | 14 rotated copies, 100M, hourly, own logs | `logrotate.conf` edits, `logrotate.timer.d/60-harden.conf`, `/etc/logrotate.d/harden-and-audit` | done |
 | P8 | `/var/log` budget | `/usr/local/sbin/harden-log-budget` run by `ExecStartPost` after each logrotate and once during hardening. Tested against a fake log tree (oldest first, stops under the cap, live logs and journal kept) and by a CI assertion | done |

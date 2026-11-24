@@ -356,6 +356,11 @@ if aide -h 2>&1 | grep -q -- '--path-check'; then
 check "AIDE skips container storage" bash -c "aide --config $AC -p f:/var/lib/containerd/x 2>&1 | grep -Eq 'negative rule|no matching rule'"
 check "AIDE skips caches" bash -c "aide --config $AC -p f:/var/cache/x 2>&1 | grep -Eq 'negative rule|no matching rule'"
 check "AIDE skips home repositories" bash -c "aide --config $AC -p f:/root/project/x 2>&1 | grep -Eq 'negative rule|no matching rule'"
+check "AIDE skips home dot-dir data" bash -c "aide --config $AC -p f:/root/.work/repo/x 2>&1 | grep -Eq 'negative rule|no matching rule'"
+check "AIDE skips home .local data" bash -c "aide --config $AC -p f:/root/.local/node/bin/node 2>&1 | grep -Eq 'negative rule|no matching rule'"
+check "AIDE skips snap images" bash -c "aide --config $AC -p f:/snap/core24/1/usr/bin/x 2>&1 | grep -Eq 'negative rule|no matching rule'"
+check "AIDE still watches shell dotfiles" bash -c "aide --config $AC -p f:/root/.bashrc 2>&1 | grep -qi '^\\[x\\]'"
+check "AIDE still watches .local/bin" bash -c "aide --config $AC -p f:/root/.local/bin/x 2>&1 | grep -qi '^\\[x\\]'"
 check "AIDE still watches authorized_keys" bash -c "aide --config $AC -p f:/root/.ssh/authorized_keys 2>&1 | grep -qi '^\\[x\\]'"
 check "AIDE still watches system binaries" bash -c "aide --config $AC -p f:/usr/bin/ls 2>&1 | grep -qi '^\\[x\\]'"  # 0.18 prints [X], 0.19 [x]
 fi
