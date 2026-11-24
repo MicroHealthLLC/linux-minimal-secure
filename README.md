@@ -5,12 +5,14 @@
 | Family | Releases |
 |---|---|
 | Debian | **Debian 12 (bookworm)**, **Debian 13 (trixie)**, **Ubuntu 22.04 / 24.04 / 26.04 LTS** |
-| RHEL | **RHEL**, **CentOS Stream**, **Rocky Linux**, **AlmaLinux**, **Oracle Linux**: releases **8, 9 and 10** (any distribution with `ID_LIKE=rhel`) |
+| RHEL | **RHEL**, **CentOS Stream**, **Rocky Linux**, **AlmaLinux**, **Oracle Linux**: releases **8, 9 and 10** (any distribution with `ID_LIKE=rhel`), and **Fedora 41+** (server and Workstation) |
+
+**Servers and desktops.** When a display manager is installed (GDM, SDDM, LightDM …), the script runs in **desktop mode**: it hardens the machine without breaking the desktop. The graphical session, printing, Bluetooth, USB drives, network discovery (mDNS) and toolbox/podman keep working; sshd stays off if it was off; terminals get no idle timeout (the screen lock covers that); the gate profile is CIS Level 2 **Workstation**. Force it with `DESKTOP_MODE=1`, or harden a desktop as a server with `DESKTOP_MODE=0`.
 
 | | |
 |---|---|
 | Gate profile | **CIS Level 2 – Server** for the running OS (`cis_level2_server` on Debian/Ubuntu, `cis` on the RHEL family). Target pass rate ≥ 90%, enforced in CI on every target below |
-| Measured in CI (v2.0.0) | Debian 12: **94.24%** · Debian 13: **94.80%** · Ubuntu 22.04: **94.17%** · 24.04: **95.18%** · 26.04: **95.18%** · Rocky 8: **95.12%** · 9: **95.20%** · 10: **93.24%** · AlmaLinux 8: **94.88%** · 9: **95.20%** · 10: **93.48%** · CentOS Stream 9: **95.47%** · 10: **93.48%** (every remaining failure is explained in [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md)) |
+| Measured in CI (v2.1.0) | Debian 12: **94.24%** · Debian 13: **94.80%** · Ubuntu 22.04: **94.17%** · 24.04: **95.18%** · 26.04: **95.18%** · Rocky 8: **95.12%** · 9: **95.73%** · 10: **94.69%** · AlmaLinux 8: **95.12%** · 9: **95.73%** · 10: **94.93%** · CentOS Stream 9: **95.73%** · 10: **94.69%** · Fedora 44: **93.95%** · 45: **93.95%** · Fedora 45 GNOME desktop (Workstation profile): **92.40%** (every remaining failure is explained in [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md)) |
 | Also reported | Debian: ANSSI BP-028 High. Ubuntu and RHEL family: **DISA STIG**. Informational; see [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md) |
 | FIPS | Debian family: kernel `fips=1` plus the **NIST CMVP validated OpenSSL 3.1.2 FIPS provider (FIPS 140-3, cert #4985)**, active alongside the default provider. RHEL family: the distribution's own FIPS module (`fips-mode-setup` on 8/9; crypto policy `FIPS` + `fips=1` on 10) |
 | Reports | `/var/log/scap-results.xml`, `/var/log/scap-report.html`, `/var/log/scap-summary.txt` |
@@ -51,6 +53,7 @@ The script is built so you cannot lose access to the server:
 7. **GRUB password protects editing, not booting.** Menu entries are `--unrestricted`, so unattended reboots keep working.
 8. **NOPASSWD sudo rules are reported, not removed.** On cloud images they are often the only working sudo path.
 9. **SELinux is never enforced on an unlabelled system.** A RHEL-family host that booted with SELinux *disabled* is set to `permissive` with a full relabel at the next boot; re-running the script after that reboot switches it to `enforcing`.
+10. **Nothing stops, hangs or reboots the machine** (these are console-less cloud VMs). auditd only alerts on full or failing disks, audit failure mode is `-f 1` (never panic), audit logs rotate at 20 MB × 10, a full kernel audit backlog drops records instead of blocking processes (`--backlog_wait_time 0`), every fstab line the script adds carries `nofail` (no emergency mode at boot), `/var/log` has a hard budget, and automatic updates never reboot.
 
 The CI proves #3: after hardening, the sudo admin must still log in over SSH with a key, and root must be refused.
 
@@ -118,7 +121,8 @@ The table describes the Debian family; the RHEL-family equivalents follow it.
 | `ALLOW_CONTAINERS` | `0` | `1` keeps overlayfs and IPv4 forwarding for Docker/Podman hosts |
 | `KEEP_IPV6_RA` | `auto` | `auto` keeps RA when SLAAC is in use |
 | `FIREWALL_OUTBOUND_POLICY` / `FIREWALL_EXTRA_OUT` | `allow` / *(empty)* | `deny` + allow-list for egress filtering (UFW or firewalld). The old names `UFW_OUTBOUND_POLICY` / `UFW_EXTRA_OUT` still work |
-| `EPEL_ENABLE` | `1` | RHEL family: enable CRB/PowerTools + EPEL (fail2ban, dkms, some media libraries) |
+| `EPEL_ENABLE` | `1` | RHEL family: enable CRB/PowerTools + EPEL (fail2ban, dkms, some media libraries). Not used on Fedora |
+| `DESKTOP_MODE` | `auto` | `auto` = desktop mode when a display manager is installed; `1` force; `0` harden as a server |
 | `FAIL2BAN_IGNOREIP` | *(empty)* | Jump hosts that must never be banned |
 | `SSH_DISABLE_PASSWORD` | `0` | `1` = key-only SSH (verified for every sudo admin first) |
 | `ENABLE_GRUB_PASSWORD` / `GRUB_PASSWORD_PBKDF2` | `1` / *(generated)* | Supply your own `grub.pbkdf2.sha512…` hash; otherwise one is generated into `/root/grub-superuser-password.txt` |
@@ -150,7 +154,7 @@ AIDE's percentage compares data read against disk space in use, minus the bulk p
 
 * **`integration`** is the default branch. Every push and PR runs [`ci.yml`](.github/workflows/ci.yml):
   1. `bash -n` + ShellCheck.
-  2. A Debian 12 / 13, Ubuntu 22.04 / 24.04 / 26.04, Rocky Linux 8 / 9 / 10, AlmaLinux 8 / 9 / 10 and CentOS Stream 9 / 10 matrix. The script runs inside a systemd-PID-1 container that looks like a netinst server (kernel, GRUB, an admin user, seeded GUI/legacy packages). The container markers are removed so OpenSCAP scores the full *machine* ruleset rather than skipping it as "container". Ubuntu 26.04 runs on its default uutils (Rust) coreutils.
+  2. A Debian 12 / 13, Ubuntu 22.04 / 24.04 / 26.04, Rocky Linux 8 / 9 / 10, AlmaLinux 8 / 9 / 10, CentOS Stream 9 / 10, Fedora 44 / 45 and Fedora 45 GNOME desktop matrix. The script runs inside a systemd-PID-1 container that looks like a netinst server (kernel, GRUB, an admin user, seeded GUI/legacy packages). The container markers are removed so OpenSCAP scores the full *machine* ruleset rather than skipping it as "container". Ubuntu 26.04 runs on its default uutils (Rust) coreutils.
   3. `tests/assertions.sh` verifies every requirement functionally (auditd policy, FIPS provider, SSH key login still works, root refused, purge, libraries, reports …).
   4. The script runs a **second time** to prove idempotence.
   5. **Gate:** the CIS L2 Server pass rate must be ≥ 90%. The XML/HTML/summary reports are uploaded as build artifacts, and the score table is posted to the job summary.
@@ -164,7 +168,8 @@ tests/run-ci.sh debian 13
 tests/run-ci.sh ubuntu 22.04
 tests/run-ci.sh ubuntu 24.04
 tests/run-ci.sh ubuntu 26.04
-tests/run-ci.sh rocky 9          # also: rocky 8|10, almalinux 8|9|10, centos 9|10 (Stream)
+tests/run-ci.sh rocky 9          # also: rocky 8|10, almalinux 8|9|10, centos 9|10 (Stream), fedora 44|45
+tests/run-ci.sh fedora 45 desktop   # GNOME desktop: proves desktop mode keeps the desktop
 ```
 
 ## Documentation

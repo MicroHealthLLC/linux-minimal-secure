@@ -22,10 +22,12 @@
 # =============================================================================
 set -Eeuo pipefail
 
-usage() { echo "usage: tests/run-ci.sh <debian|ubuntu|rocky|almalinux|centos> <version>   (or: tests/run-ci.sh <12|13>)" >&2; exit 64; }
+usage() { echo "usage: tests/run-ci.sh <debian|ubuntu|rocky|almalinux|centos|fedora> <version> [desktop]   (or: tests/run-ci.sh <12|13>)" >&2; exit 64; }
+VARIANT=""
 case $# in
     1) DISTRO=debian; VER=$1 ;;
     2) DISTRO=$1; VER=$2 ;;
+    3) DISTRO=$1; VER=$2; VARIANT=$3; [[ $VARIANT == desktop ]] || usage ;;
     *) usage ;;
 esac
 FAMILY=deb
@@ -34,18 +36,19 @@ BASE_IMAGE="${DISTRO}:${VER}"
 case $DISTRO in
     debian) [[ $VER =~ ^[0-9]+$ ]] || usage; DEFAULT_EXTRA=anssi_bp28_high ;;
     ubuntu) [[ $VER =~ ^[0-9]+\.[0-9]+$ ]] || usage; DEFAULT_EXTRA=stig ;;
-    rocky|almalinux|centos)
+    rocky|almalinux|centos|fedora)
         [[ $VER =~ ^[0-9]+$ ]] || usage
         FAMILY=rhel; DOCKERFILE=Dockerfile.el; DEFAULT_EXTRA=stig
         case $DISTRO in
             rocky)     BASE_IMAGE="rockylinux/rockylinux:${VER}" ;;
             almalinux) BASE_IMAGE="almalinux:${VER}" ;;
             centos)    BASE_IMAGE="quay.io/centos/centos:stream${VER}" ;;
+            fedora)    BASE_IMAGE="fedora:${VER}"; DEFAULT_EXTRA="" ;;   # no STIG content for Fedora
         esac
         ;;
     *) usage ;;
 esac
-TAG="${DISTRO}${VER/./}"                # debian12, ubuntu2404
+TAG="${DISTRO}${VER/./}${VARIANT}"      # debian12, ubuntu2404, fedora45desktop
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMG="dms-test:${TAG}"
 NAME="dms-ci-${TAG}"
@@ -65,7 +68,8 @@ cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 mkdir -p "$OUT_DIR"
 
 log "building test image ${IMG}"
-docker build --build-arg "BASE_IMAGE=${BASE_IMAGE}" -f "${REPO}/tests/${DOCKERFILE}" -t "$IMG" "${REPO}/tests"
+docker build --build-arg "BASE_IMAGE=${BASE_IMAGE}" --build-arg "DESKTOP=$([[ $VARIANT == desktop ]] && echo 1 || echo 0)" \
+    -f "${REPO}/tests/${DOCKERFILE}" -t "$IMG" "${REPO}/tests"
 
 cleanup
 run_flags=(--detach --name "$NAME" --hostname "ci-${TAG}" --tmpfs /run --tmpfs /run/lock
@@ -184,7 +188,9 @@ case $DISTRO in
     rocky)     os_label="Rocky Linux ${VER}" ;;
     almalinux) os_label="AlmaLinux ${VER}" ;;
     centos)    os_label="CentOS Stream ${VER}" ;;
+    fedora)    os_label="Fedora ${VER}" ;;
 esac
+[[ $VARIANT == desktop ]] && os_label+=" desktop"
 profile_label() {
     case $1 in
         anssi_bp28_high) echo "ANSSI BP-028 High" ;;
@@ -204,7 +210,7 @@ extra_note=""
     [[ -n $note ]] && { echo "> ${note}"; echo; }
     echo "| Profile | Pass | Fail | Pass rate | XCCDF score | Gate (≥ ${SCAP_MIN_SCORE}%) |"
     echo "|---|---|---|---|---|---|"
-    echo "| CIS ${os_label} Level 2 Server | ${cis_pass} | ${cis_fail} | **${cis_rate}%** | ${cis_score} | **${gate}** |"
+    echo "| CIS ${os_label} Level 2 $([[ $VARIANT == desktop ]] && echo Workstation || echo Server) | ${cis_pass} | ${cis_fail} | **${cis_rate}%** | ${cis_score} | **${gate}** |"
     for p in $SCAP_EXTRA; do
         E="${OUT_DIR}/scap-summary-${p}.txt"
         if [[ -f $E ]]; then
@@ -228,4 +234,4 @@ if [[ $gate != PASS ]]; then
     echo "CIS Level 2 Server pass rate ${cis_rate}% is below ${SCAP_MIN_SCORE}%" >&2
     exit 1
 fi
-log "PASS: CIS L2 Server ${cis_rate}% (XCCDF ${cis_score})${extra_note}"
+log "PASS: CIS L2 $([[ $VARIANT == desktop ]] && echo Workstation || echo Server) ${cis_rate}% (XCCDF ${cis_score})${extra_note}"

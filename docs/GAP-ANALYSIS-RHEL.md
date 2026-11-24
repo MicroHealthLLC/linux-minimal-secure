@@ -33,6 +33,13 @@
 | Δ10 | CI only: EL SSH login denied in privileged containers. The Ubuntu runner's AppArmor `unix-chkpwd` profile attaches by path to the EL helper and cannot read EL's `0000` shadow (strace: EACCES as root with all capabilities) | Profile unloaded on the ephemeral runner for EL jobs (a real EL host has no AppArmor). Local runs add `CAP_DAC_READ_SEARCH`, which EL's `unix_chkpwd` keeps |
 | Δ11 | GitHub security: code scanning, Dependabot and secret scanning are disabled for this private repository (nothing to clear via the API) | Equivalent scans run locally and in CI on every push: gitleaks over the full history (no leaks), zizmor on the workflows. 3 medium `artipacked` (checkout credentials persisted) and 4 template-injection findings fixed (`persist-credentials: false`, version via env). zizmor clean |
 
+## Follow-up: 2.0.1 and 2.1.0
+
+| Version | Delivered |
+|---|---|
+| 2.0.1 | Owner policy "nothing stops the machine": `--backlog_wait_time 0` (a full audit backlog drops records instead of blocking every audited process for up to 60 s), `nofail` on every fstab line the script adds (no emergency mode on a console-less VM), CI assertions for both and for the absence of `kernel.panic*` |
+| 2.1.0 | **Fedora 41+** (it has no `ID_LIKE=rhel`, so it was rejected): dnf5 (repoquery newline, `mark user`, `dnf5-plugin-automatic`/`dnf5-automatic.timer`), no CRB/EPEL, `ssg-fedora`, yescrypt, no kernel FIPS mode. **Desktop mode** for every distribution (see EXCEPTIONS §9.2). CI: Fedora 44, 45 and a Fedora 45 GNOME desktop job |
+
 ## CI results
 
 | Run | Commit | Result |
@@ -50,5 +57,7 @@
 | Rocky Linux 8 / 9 / 10 | 95.12% / 95.20% / 93.24% | DISA STIG 72.94% / 74.94% / 70.24% |
 | AlmaLinux 8 / 9 / 10 | 94.88% / 95.20% / 93.48% | DISA STIG 72.75% / 74.77% / 70.88% |
 | CentOS Stream 9 / 10 | 95.47% / 93.48% | DISA STIG 74.88% / 70.57% |
+
+**2.1.0** (run 45294343508, `4769ed7`): all **17** green. Fedora 44 / 45: 93.95% / 93.95% (CIS L2 Server); Fedora 45 GNOME desktop: 92.40% (CIS L2 Workstation); EL9: 95.73%; EL10: 94.69–94.93%. Fedora deltas fixed on the way: PAM guard misread optional `-` lines, `chage --mindays` removed in shadow 4.20, backup of a relative symlink (`/etc/issue`) failed on the second run, missing cracklib dictionary (password changes impossible), Fedora content forms, GNOME dconf settings.
 
 Released from `main` as **v2.0.0**; the GitHub repository is renamed to **linux-minimal-secure** (old URLs redirect).

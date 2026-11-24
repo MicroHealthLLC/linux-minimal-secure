@@ -1,5 +1,7 @@
 # Test harness image for harden-and-audit.sh on the RHEL family (Rocky Linux,
-# AlmaLinux, CentOS Stream 8/9/10).
+# AlmaLinux, CentOS Stream 8/9/10, Fedora). DESKTOP=1 adds a GNOME desktop
+# (GDM, graphical.target), printing and Bluetooth, and an enabled sshd: the
+# script must keep all of them (desktop mode).
 #
 # Boots real systemd as PID 1 and mirrors a minimal server install: a kernel
 # package (SCAP's "system_with_kernel" applicability), GRUB 2 + grubby, an
@@ -8,6 +10,7 @@
 # against libX11 through libXpm) proves the purge takes no collateral.
 ARG BASE_IMAGE=rockylinux/rockylinux:9
 FROM ${BASE_IMAGE}
+ARG DESKTOP=0
 
 ENV container=docker
 
@@ -19,6 +22,11 @@ RUN set -eux; \
     dnf -y -q install --setopt=install_weak_deps=False --setopt=tsflags=noscripts kernel-core grub2-tools grub2-pc grubby; \
     printf 'GRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR="$(sed "s, release .*$,,g" /etc/system-release)"\nGRUB_DEFAULT=saved\nGRUB_DISABLE_SUBMENU=true\nGRUB_TERMINAL_OUTPUT="console"\nGRUB_CMDLINE_LINUX="crashkernel=auto rhgb quiet"\nGRUB_DISABLE_RECOVERY="true"\nGRUB_ENABLE_BLSCFG=true\n' > /etc/default/grub; \
     dnf -y -q install --setopt=install_weak_deps=False xterm xorg-x11-xauth telnet rpcbind gd; \
+    if [ "$DESKTOP" = 1 ]; then \
+        dnf -y -q install --setopt=install_weak_deps=False gdm gnome-shell cups bluez openssh-server; \
+        systemctl enable gdm.service sshd.service; \
+        systemctl set-default graphical.target; \
+    fi; \
     dnf clean all; \
     rm -rf /var/cache/dnf; \
     systemctl mask systemd-firstboot.service systemd-udevd.service systemd-udevd-kernel.socket \

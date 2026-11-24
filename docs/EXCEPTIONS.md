@@ -15,6 +15,8 @@ The system owner requires that audit-log pressure must never suspend logging, dr
 
 Compensating controls: `max_log_file = 20` (passes the CIS `>= 6` check), `num_logs = 10` (200 MB ceiling), the audit failure flag `-f 1` (printk, never panic), a 512 MB journald cap with 1 GB kept free, logrotate `maxsize 100M` checked hourly, a hard `/var/log` budget (`LOG_MAX_TOTAL`, default 4G, plus `LOG_MIN_FREE_PCT` disk free) enforced by pruning the oldest rotated archives, and syslog alerts that can be forwarded to the SIEM over TLS (`rsyslog-gnutls` is installed).
 
+Owner policy since 2.0.1, stated for cloud machines: **nothing may stop, hang or reboot the host.** Besides the auditd actions above, the kernel audit backlog uses `--backlog_wait_time 0`. With a full backlog (auditd stalled or dead), records are dropped and logged instead of blocking every audited process for up to 60 s. Every `/etc/fstab` line the script adds carries `nofail`, so a failed mount cannot drop a console-less VM into emergency mode.
+
 ## 2. Conflicts inside the profile, or with mandated components
 
 | Rule | Why it fails |
@@ -136,6 +138,16 @@ The check requires a UFW rule for every non-loopback listener. Inspection of a h
 | **No `dnf autoremove`** after the graphical purge | Installer-placed packages are often marked as dependencies; autoremove could remove real services |
 | **RHEL in CI** | Needs a subscription. The rebuilds take the same code path; RHEL adds only the subscription check and EPEL bootstrap from the Fedora project |
 
-### 9.2 Rules expected to fail in CI containers
+### 9.2 Fedora and desktop mode
+
+| Decision | Reason |
+|---|---|
+| **Fedora: no kernel FIPS mode** (`fips=1` not set) | Fedora does not support FIPS mode and ships no `fips-mode-setup`. A kernel in FIPS mode without the integrity HMACs/dracut module can fail to boot, which violates "nothing stops the machine". The system crypto policy is `FIPS` (servers) or `DEFAULT:NO-SHA1`, the CIS policy (desktops) |
+| **Fedora: yescrypt** password hashing | Fedora's authselect profiles hash with yescrypt; `login.defs` matches them |
+| **Desktop mode** (a display manager is installed) | The owner's requirement: hardening must not kill the desktop experience. Kept: graphical stack and `graphical.target`, cups/avahi/bluez, USB storage, overlay (toolbox/podman), the desktop firewall zone and services (UFW: mDNS allowed), sshd off if it was off, IPv6 privacy addresses, `/tmp` exec (AppImages, IDEs), existing authselect features (fingerprint, smartcard). No shell `TMOUT`: the desktop's screen lock covers idle sessions. Debian-family desktops get no kernel `fips=1` (it breaks Wi-Fi/Bluetooth algorithms); the user-space FIPS provider stays. The CIS rules for those items fail by design. The gate profile is CIS Level 2 Workstation |
+
+Fedora content defects (fail on every Fedora host): `ensure_fedora_gpgkey_installed` (the 0.1.82 content knows release fingerprints only up to Fedora 40) and `package_cron_installed` (checks for a package literally named `cron`; Fedora's cron is `cronie`). Fedora CIS also asks for journald-only logging (`journald_disable_forward_to_syslog`, `service_systemd-journal-upload_enabled`, `ensure_journald_and_rsyslog_not_active_together`): rsyslog is kept because logs are shipped off-host from it, as on every other distribution.
+
+### 9.3 Rules expected to fail in CI containers
 
 As on Debian/Ubuntu (§5), rules that need a booted kernel, a real bootloader or host-global state (kernel FIPS mode, `grub2_*` arguments in BLS entries, SELinux runtime state, auditd/chronyd/firewalld service state in an unprivileged run, separate partitions) fail inside the CI container and pass on a real host or VM. The CI job summary of each EL target lists the failing rules.

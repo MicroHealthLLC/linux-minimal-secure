@@ -41,7 +41,14 @@ sysctl_is() { [[ $(eff_sysctl "$1") == "$2" ]]; }
 . /etc/os-release
 OS=$ID
 FAMILY=deb
-case $OS in rhel|centos|rocky|almalinux|ol) FAMILY=rhel ;; esac
+case $OS in rhel|centos|rocky|almalinux|ol|fedora) FAMILY=rhel ;; esac
+# Desktop mode: a display manager is installed (the script keeps the desktop).
+DESKTOP=0
+for dm in gdm gdm3 sddm lightdm; do
+    if [[ $FAMILY == rhel ]]; then rpm -q --quiet "$dm" && DESKTOP=1; else dpkg-query -W -f='${db:Status-Status}' "$dm" 2>/dev/null | grep -qx installed && DESKTOP=1; fi
+done
+desktop() { [[ $DESKTOP == 1 ]]; }
+echo "== desktop mode: ${DESKTOP}"
 deb()  { [[ $FAMILY == deb ]]; }
 rhel() { [[ $FAMILY == rhel ]]; }
 echo "== target: ${PRETTY_NAME} (${FAMILY} family)"
@@ -55,35 +62,52 @@ avc=$(dpkg-query -W -f='${Package}\n' 'libavcodec[0-9]*' 2>/dev/null | head -n1)
 check "dependency-aware purge kept non-graphical ${avc:-libavcodec}" installed "${avc:-libavcodec-missing}"
 for p in inetutils-telnet rpcbind; do check "legacy service ${p} purged" not_installed "$p"; done
 else
-check "dnf: no weak dependencies"      grep -Eq '^install_weak_deps=False$' /etc/dnf/dnf.conf
+check "dnf: no weak dependencies"      grep -Eq '^install_weak_deps=(False|0)$' /etc/dnf/dnf.conf
 check "dnf: gpgcheck=1"                grep -Eq '^gpgcheck=1$' /etc/dnf/dnf.conf
 check "dnf: localpkg_gpgcheck=1"       grep -Eq '^localpkg_gpgcheck=1$' /etc/dnf/dnf.conf
 check "no repository with gpgcheck=0"  bash -c "! grep -Eqs '^[[:space:]]*gpgcheck[[:space:]]*=[[:space:]]*0' /etc/yum.repos.d/*.repo"
+if desktop; then
+check "desktop: display manager kept"   bash -c "rpm -q gdm || rpm -q sddm || rpm -q lightdm"
+check "desktop: graphical.target kept"  bash -c "[[ \$(systemctl get-default) == graphical.target ]]"
+check "desktop: printing kept (cups)"   installed cups
+check "desktop: Bluetooth kept (bluez)" installed bluez
+check "desktop: USB storage not blacklisted" bash -c "! grep -q 'usb-storage' /etc/modprobe.d/60-harden-blacklist.conf"
+check "desktop: overlay kept (toolbox/podman)" bash -c "! grep -q 'install overlay ' /etc/modprobe.d/60-harden-blacklist.conf"
+check "desktop: no shell TMOUT (screen lock covers idle)" bash -c "! grep -q TMOUT= /etc/profile.d/60-harden.sh"
+check "desktop: /tmp keeps exec (AppImages, IDEs)" bash -c "! grep -q 'noexec' /etc/systemd/system/tmp.mount"
+check "desktop: GNOME screen lock + login banner locked in dconf" bash -c "grep -q '^idle-delay=uint32 900' /etc/dconf/db/local.d/00-security-settings && grep -q '^banner-message-enable=true' /etc/dconf/db/distro.d/00-security-settings && grep -qx '/org/gnome/desktop/session/idle-delay' /etc/dconf/db/local.d/locks/00-security-settings-lock"
+check "desktop: fips=1 not on the kernel command line of a Fedora desktop" bash -c "[[ $OS != fedora ]] || ! grep -q 'fips=1' /etc/default/grub"
+else
 for p in xterm xorg-x11-xauth; do check "graphical package ${p} removed" not_installed "$p"; done
 check "dependency-aware removal kept non-graphical gd (links libX11)" installed gd
+fi
 for p in telnet rpcbind; do check "legacy service ${p} removed" not_installed "$p"; done
 fi
 check "nothing left listening on the portmapper port 111" bash -c "! ss -Htuln | awk '{print \$5}' | grep -Eq ':111\$'"
-check "default target is multi-user" bash -c "[[ \$(systemctl get-default) == multi-user.target ]]"
+desktop || check "default target is multi-user" bash -c "[[ \$(systemctl get-default) == multi-user.target ]]"
 
 echo "== 2. repositories, base stack, unattended upgrades"
 if rhel; then
+if [[ $OS != fedora ]]; then
 check "EPEL enabled"                   installed epel-release
 check "CRB/PowerTools enabled"         bash -c "dnf -q repolist --enabled | awk '{print tolower(\$1)}' | grep -Eq '^(crb|powertools)$'"
-for p in openssh-server tmux kbd git firewalld fail2ban-server libpwquality audit sudo rsyslog aide dnf-automatic chrony authselect; do
+fi
+AUTO=dnf-automatic; AUTOT=dnf-automatic.timer
+if [[ $OS == fedora ]]; then AUTO=dnf5-plugin-automatic; AUTOT=dnf5-automatic.timer; fi
+for p in openssh-server tmux kbd git firewalld fail2ban-server libpwquality audit sudo rsyslog aide "$AUTO" chrony authselect; do
     check "package ${p} installed" installed "$p"
 done
 check "curl available (curl or curl-minimal)" command -v curl
-check "every PAM module in system-auth/password-auth is installed" bash -c "for m in \$(grep -Eho '^[^#]*pam_[a-z0-9_]+\\.so' /etc/pam.d/system-auth /etc/pam.d/password-auth | grep -Eo 'pam_[a-z0-9_]+\\.so' | sort -u); do [[ -e /usr/lib64/security/\$m ]] || exit 1; done"
+check "every PAM module in system-auth/password-auth is installed" bash -c "for m in \$(grep -Ehv '^[[:space:]]*(#|-)' /etc/pam.d/system-auth /etc/pam.d/password-auth | grep -Eo 'pam_[a-z0-9_]+\\.so' | sort -u); do [[ -e /usr/lib64/security/\$m ]] || exit 1; done"
 check "dnf-automatic applies updates"  grep -Eq '^apply_updates = yes$' /etc/dnf/automatic.conf
 if [[ $OS == centos ]]; then
     check "dnf-automatic: all updates (Stream has no errata)" grep -Eq '^upgrade_type = default$' /etc/dnf/automatic.conf
 else
     check "dnf-automatic: security errata" grep -Eq '^upgrade_type = security$' /etc/dnf/automatic.conf
 fi
-check "dnf-automatic.timer enabled"    systemctl is-enabled --quiet dnf-automatic.timer
-check "dnf-automatic.timer active"     systemctl is-active --quiet dnf-automatic.timer
-check "dnf-automatic.timer not masked" bash -c "[[ \$(systemctl is-enabled dnf-automatic.timer 2>/dev/null) != masked ]]"
+check "${AUTOT} enabled"    systemctl is-enabled --quiet "$AUTOT"
+check "${AUTOT} active"     systemctl is-active --quiet "$AUTOT"
+check "${AUTOT} not masked" bash -c "[[ \$(systemctl is-enabled $AUTOT 2>/dev/null) != masked ]]"
 check "update check against the repositories works" bash -c "dnf -q check-update >/dev/null; rc=\$?; [[ \$rc == 0 || \$rc == 100 ]]"
 else
 SRC=/etc/apt/sources.list.d/${OS}.sources
@@ -127,6 +151,9 @@ check "disk_full_action = SYSLOG"        conf $A disk_full_action SYSLOG
 check "disk_error_action = SYSLOG"       conf $A disk_error_action SYSLOG
 check "no SUSPEND/SINGLE/HALT anywhere in auditd.conf" bash -c "! grep -Eiq '=[[:space:]]*(suspend|single|halt)\b' $A"
 check "audit failure mode -f 1 (never panic)" bash -c "grep -hq '^-f 1' /etc/audit/rules.d/*.rules && ! grep -hq '^-f 2' /etc/audit/rules.d/*.rules"
+check "audit backlog never blocks processes (backlog_wait_time 0)" bash -c "grep -hq '^--backlog_wait_time 0$' /etc/audit/rules.d/*.rules"
+check "no kernel panic / reboot-on-oops settings" bash -c "! grep -REhs '^[[:space:]]*kernel\\.(panic|panic_on_oops|panic_on_warn)[[:space:]]*=[[:space:]]*[1-9]' /etc/sysctl.conf /etc/sysctl.d/"
+check "every fstab line added by the script has nofail" bash -c "! grep -E '^(tmpfs[[:space:]]+/dev/shm|/var/tmp[[:space:]]+/var/tmp)[[:space:]]' /etc/fstab | grep -vq nofail"
 check "audit rules immutable (-e 2)" grep -q '^-e 2' /etc/audit/rules.d/99-harden-finalize.rules
 check "privileged command rules generated" grep -q 'path=/usr/bin/sudo' /etc/audit/rules.d/55-harden-privileged.rules
 check "audit rules compile" augenrules --check
@@ -134,8 +161,16 @@ check "auditd enabled at boot" systemctl is-enabled auditd
 
 echo "== 4. FIPS"
 if rhel; then
+if [[ $OS == fedora ]] && desktop; then
+check "system crypto policy DEFAULT:NO-SHA1 (Fedora desktop)" bash -c "update-crypto-policies --show | grep -q '^DEFAULT:NO-SHA1'"
+else
 check "system crypto policy FIPS"       bash -c "update-crypto-policies --show | grep -q '^FIPS'"
+fi
+if [[ $OS == fedora ]]; then
+check "no fips=1 on Fedora (kernel FIPS mode unsupported, could stop the boot)" bash -c "! grep -q 'fips=1' /etc/default/grub"
+else
 check "fips=1 on the GRUB command line" grep -Eq '^GRUB_CMDLINE_LINUX=".*\bfips=1\b' /etc/default/grub
+fi
 check "audit=1 on the GRUB command line" grep -Eq '^GRUB_CMDLINE_LINUX=".*\baudit=1\b' /etc/default/grub
 check "no AppArmor arguments (would disable SELinux)" bash -c "! grep -Eq 'security=apparmor|apparmor=1' /etc/default/grub"
 check "no selinux=0 / enforcing=0"      bash -c "! grep -Eq '\b(selinux|enforcing)=0\b' /etc/default/grub"
@@ -250,9 +285,11 @@ check "root SSH login is rejected" \
     bash -c "! ssh -i /root/root_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@127.0.0.1 true"
 if rhel; then
 check "firewalld enabled at boot"      systemctl is-enabled --quiet firewalld
+if ! desktop; then
 check "firewalld default zone public"  bash -c "grep -q '^DefaultZone=public' /etc/firewalld/firewalld.conf"
 check "firewalld: SSH allowed (permanent)" bash -c "grep -q '<service name=\"ssh\"/>' /etc/firewalld/zones/public.xml"
 check "firewalld: cockpit not open"    bash -c "! grep -q '<service name=\"cockpit\"/>' /etc/firewalld/zones/public.xml"
+fi
 check "firewalld: loopback anti-spoofing rule (trusted zone)" bash -c "grep -q 'source address=\"127.0.0.1\"' /etc/firewalld/zones/trusted.xml"
 check "nftables.service masked beside firewalld" bash -c "[[ \$(systemctl is-enabled nftables.service 2>/dev/null) == masked ]]"
 if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
@@ -278,7 +315,13 @@ check "pam_pwquality enabled"   grep -q 'pam_pwquality.so' /etc/pam.d/system-aut
 check "pam_pwhistory enabled"   grep -q 'pam_pwhistory.so' /etc/pam.d/system-auth
 check "password history 24 (pwhistory.conf, or inline on EL8)" bash -c "grep -Eq '^remember = 24' /etc/security/pwhistory.conf || grep -q 'pam_pwhistory.so.*remember=24' /etc/pam.d/system-auth"
 check "no nullok"               bash -c "! grep -Eq '^[^#].*nullok' /etc/pam.d/system-auth /etc/pam.d/password-auth"
+if [[ $OS == fedora ]]; then
+check "password hashing yescrypt (Fedora)" grep -Eq '^ENCRYPT_METHOD[[:space:]]+YESCRYPT' /etc/login.defs
+else
 check "password hashing SHA512" grep -Eq '^ENCRYPT_METHOD[[:space:]]+SHA512' /etc/login.defs
+fi
+check "pam_unix reuses the checked token (use_authtok)" bash -c "grep -E '^password[[:space:]].*pam_unix\\.so' /etc/pam.d/system-auth | grep -q use_authtok"
+check "cracklib dictionary present (pwquality dictcheck can load it)" bash -c "ls /usr/share/cracklib/pw_dict.pwd* >/dev/null 2>&1"
 check "SELinux enforcing/targeted configured" bash -c "grep -qx 'SELINUX=enforcing' /etc/selinux/config && grep -qx 'SELINUXTYPE=targeted' /etc/selinux/config"
 check "abrt / setroubleshoot / mcstrans absent" bash -c "! rpm -qa --qf '%{NAME}\\n' | grep -Eq '^(abrt|setroubleshoot|mcstrans)'"
 check "chronyd runs as user chrony" bash -c "[[ ! -f /etc/sysconfig/chronyd ]] || grep -Eq '^OPTIONS=.*-u chrony' /etc/sysconfig/chronyd"
@@ -304,7 +347,7 @@ check "fail2ban sshd jail active" bash -c "fail2ban-client status sshd"
 
 AC=/etc/aide/aide.conf; ADB=/var/lib/aide/aide.db
 rhel && { AC=/etc/aide.conf; ADB=/var/lib/aide/aide.db.gz; }
-check "AIDE watches the audit tools in aide.conf" grep -q '^/usr/sbin/auditctl p+i+n+u+g+s+b+acl+selinux+xattrs+sha512$' "$AC"
+check "AIDE watches the audit tools in aide.conf" grep -Eq '^/usr/sbin/auditctl p\+i\+n\+u\+g\+s\+b\+acl\+(selinux\+)?xattrs\+sha512$' "$AC"
 check "AIDE configuration valid" aide --config-check --config "$AC"
 check "AIDE excludes container storage and caches" grep -qs '^!/var/cache(/|\$)' "$AC" /etc/aide/aide.conf.d/90_harden_bulk_excludes
 # aide -p (path check) exists from AIDE 0.17; EL8 ships 0.16.
@@ -334,7 +377,7 @@ if [[ $OS == ubuntu ]]; then
     check "TMOUT readonly+exported (POSIX form)" grep -Pzq 'TMOUT=[0-9]+\s+readonly TMOUT\s+export TMOUT' /etc/profile.d/60-harden.sh
 fi
 if rhel; then
-    check "TMOUT readonly+exported (typeset -xr)" grep -Eq '^[[:space:]]*typeset -xr TMOUT=[0-9]+' /etc/profile.d/60-harden.sh
+    desktop || check "TMOUT readonly+exported (typeset -xr)" grep -Eq '^[[:space:]]*typeset -xr TMOUT=[0-9]+' /etc/profile.d/60-harden.sh
     check "every umask in /etc/bashrc is 027" bash -c "! grep -E '^[^#]*\\bumask[[:space:]]+[0-7]+' /etc/bashrc | grep -vq 'umask 027'"
     check "audit watches in syscall form too (EL content)" bash -c "grep -q -- '-a always,exit -F arch=b64 -F path=/etc/passwd -F perm=wa' /etc/audit/rules.d/50-harden.rules && grep -q '^-w /etc/selinux/ -p wa' /etc/audit/rules.d/50-harden.rules"
     check "AIDE daily check in /etc/crontab" grep -q '/usr/sbin/aide --check' /etc/crontab
@@ -365,7 +408,7 @@ USED=$(du -sxb /var/log | cut -f1)
 check "budget prunes the oldest rotated archive" test ! -e "$BT/old.log.1"
 check "budget never touches a live log"         test -e "$BT/live.log"
 rm -rf "$BT"
-check "OpenSCAP closing line reports n/N rules"  grep -Eq '\] OpenSCAP (cis_level2_server|cis): completed in [0-9hms]+ \(exit [02]\) - [0-9]+/[0-9]+ rules \([0-9]+%\)' /var/log/harden-and-audit.log
+check "OpenSCAP closing line reports n/N rules"  grep -Eq '\] OpenSCAP (cis_level2_server|cis|cis_level2_workstation|cis_workstation_l2): completed in [0-9hms]+ \(exit [02]\) - [0-9]+/[0-9]+ rules \([0-9]+%\)' /var/log/harden-and-audit.log
 check "step counter total is exact"             bash -c "grep -E '\[STEP [0-9]+/[0-9]+\] ===== done =====' /var/log/harden-and-audit.log | tail -n1 | grep -Eq '\[STEP ([0-9]+)/\1\]'"
 
 echo "== 6. CUDA prerequisites and media/coturn libraries"
@@ -376,7 +419,7 @@ check "coturn itself NOT installed" not_installed coturn
 for p in opus libsrtp mariadb-connector-c libpq sqlite-libs systemd-libs libvpx libtheora libwebp jansson libevent libdav1d hiredis; do
     check "media/coturn lib ${p}" installed "$p"
 done
-check "no X server present" bash -c "! rpm -qa --qf '%{NAME}\\n' | grep -q '^xorg-x11-server'"
+desktop || check "no X server present" bash -c "! rpm -qa --qf '%{NAME}\\n' | grep -q '^xorg-x11-server'"
 else
 HDR=linux-headers-amd64
 [[ $OS == ubuntu ]] && HDR=linux-headers-virtual     # the CI image boots linux-image-virtual
