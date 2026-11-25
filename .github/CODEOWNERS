@@ -1,0 +1,4 @@
+# Every change is reviewed by the owners: this script runs as root on
+# production hosts.
+*                @MicroHealthLLC/mh-owners @MicroHealthLLC/security
+/.github/        @MicroHealthLLC/mh-owners @MicroHealthLLC/security

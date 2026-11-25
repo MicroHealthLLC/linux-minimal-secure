@@ -37,16 +37,16 @@ jobs:
           fetch-depth: 0          # full history for the secret scan
       - name: secret scan (gitleaks, full history)
         run: |
-          docker run --rm -v "$PWD:/repo:ro" zricethezav/gitleaks:v8.21.2 git /repo --no-banner --redact
+          docker run --rm -v "$PWD:/repo:ro" zricethezav/gitleaks:v8.21.2@sha256:0e99e8821643ea5b235718642b93bb32486af9c8162c8b8731f7cbdc951a7f46 git /repo --no-banner --redact
       - name: workflow security audit (zizmor)
         run: |
-          docker run --rm -v "$PWD:/repo:ro" -w /repo ghcr.io/zizmorcore/zizmor:1.5.2 --offline .github/workflows
+          docker run --rm -v "$PWD:/repo:ro" -w /repo ghcr.io/zizmorcore/zizmor:1.5.2@sha256:2eec97e326025cebb147a380011ff40402866275cbb9e85968a471ca592c00a3 --offline .github/workflows
       - name: bash syntax
         run: |
           for f in harden-and-audit.sh tests/*.sh; do bash -n "$f"; done
       - name: shellcheck
         run: |
-          docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.11.0 \
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d \
             -x --severity=warning harden-and-audit.sh tests/run-ci.sh tests/assertions.sh tests/container-init.sh
 
   harden-and-scan:

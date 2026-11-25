@@ -1,0 +1,12 @@
+# Keep the pinned GitHub Actions current (security fixes arrive as grouped
+# pull requests into integration).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: integration
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
