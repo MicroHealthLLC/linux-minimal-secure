@@ -204,6 +204,16 @@ printf 'quorate: 1\n' >/etc/pve/.members
 install -d -m 0700 /root/.ssh
 install -d /var/lib/vz/images/100 /var/lib/vz/template/iso /data/vmstore
 
+# --- AppArmor: LXC ships an include-only "profile" file (no profile block);
+# aa-enforce rejects it, which used to stop the run on a real node.
+install -d /etc/apparmor.d/lxc
+cat >/etc/apparmor.d/lxc-containers <<'EOF'
+# Do not load this file.  Rather, load /etc/apparmor.d/lxc-containers, which
+# will source all profiles under /etc/apparmor.d/lxc
+
+#include <lxc/>
+EOF
+
 # --- boot: systemd-boot style command line synced by proxmox-boot-tool
 install -d /etc/kernel
 echo "root=ZFS=rpool/ROOT/pve-1 boot=zfs quiet" >/etc/kernel/cmdline
