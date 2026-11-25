@@ -157,7 +157,10 @@ for u in apt-daily.timer apt-daily-upgrade.timer; do
     check "${u} active"     systemctl is-active --quiet "$u"
     check "${u} not masked" bash -c "[[ \$(systemctl is-enabled $u 2>/dev/null) != masked ]]"
 done
-check "no package blacklisted from security updates" bash -c "! apt-config dump | grep -q '^Unattended-Upgrade::Package-Blacklist:: '"
+# The lists are additive (no #clear): the Proxmox stub's "other tool" entry
+# is expected; the hardening itself blacklists nothing.
+check "no package blacklisted from security updates" bash -c "! apt-config dump | grep '^Unattended-Upgrade::Package-Blacklist:: ' | grep -vq '\"ci-pinned-package\"'"
+check "hardening file blacklists nothing" bash -c "! sed -n '/^Unattended-Upgrade::Package-Blacklist {/,/^};/p' /etc/apt/apt.conf.d/52unattended-upgrades-harden | grep -q '\"'"
 check "unattended-upgrade dry run succeeds"     timeout 300 unattended-upgrade --dry-run
 fi
 
@@ -525,6 +528,8 @@ elif [[ $OS == ubuntu && ( -f /usr/lib/systemd/system/dailyaidecheck.timer || -f
 else
     check "aidecheck.service and timer enabled" bash -c "systemctl is-enabled aidecheck.service && systemctl is-enabled aidecheck.timer"
 fi
+check "shell startup files parse (bash -n)" bash -c "for f in /etc/profile /etc/bash.bashrc /etc/bashrc /etc/profile.d/*.sh /root/.bashrc /root/.profile /root/.bash_profile; do [[ -f \$f ]] || continue; bash -n \$f || exit 1; done"
+check "no umask line commented out by older versions" bash -c "! grep -qs 'superseded by harden-and-audit' /etc/profile /etc/bash.bashrc /etc/bashrc"
 # CI seeds a later profile.d file and root .bashrc line that also set TMOUT.
 LOGIN_SH=(env -i HOME=/root TERM=dumb PATH=/usr/sbin:/usr/bin:/sbin:/bin bash -lic)
 check "root login shell prints no 'TMOUT: readonly variable'" bash -c "! ${LOGIN_SH[*]} true 2>&1 </dev/null | grep -q 'readonly variable'"

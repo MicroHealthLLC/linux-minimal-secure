@@ -3510,6 +3510,24 @@ EOF
     fi
 }
 
+# sed_shell_file FILE SED-ARGS... - edit a shell startup file (/etc/profile,
+# bashrc, profile.d) through a copy and install it only if "bash -n" accepts
+# the result. A broken /etc/profile stops every login script from running.
+sed_shell_file() {
+    local f=$1 tmp; shift
+    tmp=$(mktemp "${f}.XXXXXX")
+    cp -a -- "$f" "$tmp"
+    sed -i -E "$@" "$tmp"
+    if cmp -s "$f" "$tmp"; then rm -f "$tmp"; return 0; fi
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        warn "${f}: edit skipped, the result would not parse (bash -n); file left unchanged"
+        return 1
+    fi
+    backup_file "$f"
+    mv -f "$tmp" "$f"
+}
+
 # TMOUT is read-only once /etc/profile.d/60-harden.sh has run, so any later
 # assignment (a profile.d file sorting after it, /etc/bash.bashrc, root's
 # dotfiles) prints "-bash: TMOUT: readonly variable" at every login. Guard
@@ -3522,9 +3540,8 @@ guard_other_tmout() {
     for f in /etc/profile /etc/bash.bashrc /etc/bashrc /etc/profile.d/*.sh /root/.bashrc /root/.profile /root/.bash_profile /root/.bash_login; do
         [[ -f $f && $f != /etc/profile.d/60-harden.sh ]] || continue
         grep -Eq "$re" "$f" || continue
-        backup_file "$f"
-        sed -i -E "s/${re}/\\1[ -n \"\${TMOUT:-}\" ] || \\2/" "$f"
-        log "TMOUT: guarded another assignment in ${f} (TMOUT is read-only after 60-harden.sh)"
+        sed_shell_file "$f" "s/${re}/\\1[ -n \"\${TMOUT:-}\" ] || \\2/" \
+            && log "TMOUT: guarded another assignment in ${f} (TMOUT is read-only after 60-harden.sh)"
     done
     local u home
     while read -r u; do
@@ -3632,13 +3649,18 @@ EOF
     is_desktop || guard_other_tmout
     if is_rhel && [[ -f /etc/bashrc ]]; then
         # EL CIS checks every umask in /etc/bashrc (inside its if/else).
-        backup_file /etc/bashrc
-        sed -i -E 's/^([^#]*\bumask)[[:space:]]+[0-7]+/\1 027/' /etc/bashrc
+        sed_shell_file /etc/bashrc 's/^([^#]*\bumask)[[:space:]]+[0-7]+/\1 027/' || true
     fi
     for f in /etc/profile /etc/bash.bashrc /etc/bashrc; do
         [[ -f $f ]] || continue
+        # Weak umask values are raised to 027 in place. They used to be
+        # commented out, which left an empty then/else on EL8's /etc/profile
+        # (umask 002/022 in an if/else): a syntax error that stopped every
+        # login script. Lines commented out that way are restored as 027.
+        sed_shell_file "$f" \
+            -e 's/^# ([[:space:]]*umask)[[:space:]]+[0-7]+  \(superseded by harden-and-audit\)$/\1 027/' \
+            -e 's/^([[:space:]]*umask)[[:space:]]+0?(0[0-2][0-6]|[0-2][0-6])[[:space:]]*$/\1 027/' || true
         backup_file "$f"
-        sed -i -E 's/^([[:space:]]*umask[[:space:]]+0?(0[0-2][0-6]|[0-2][0-6]))[[:space:]]*$/# \1  (superseded by harden-and-audit)/' "$f"
         sed -i "/^umask 027  # ${MARK}$/d" "$f"
         grep -qx 'umask 027' "$f" || printf '\n# %s\numask 027\n' "$MARK" >>"$f"
     done
