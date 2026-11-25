@@ -525,6 +525,10 @@ elif [[ $OS == ubuntu && ( -f /usr/lib/systemd/system/dailyaidecheck.timer || -f
 else
     check "aidecheck.service and timer enabled" bash -c "systemctl is-enabled aidecheck.service && systemctl is-enabled aidecheck.timer"
 fi
+# CI seeds a later profile.d file and root .bashrc line that also set TMOUT.
+LOGIN_SH=(env -i HOME=/root TERM=dumb PATH=/usr/sbin:/usr/bin:/sbin:/bin bash -lic)
+check "root login shell prints no 'TMOUT: readonly variable'" bash -c "! ${LOGIN_SH[*]} true 2>&1 </dev/null | grep -q 'readonly variable'"
+desktop || check "TMOUT stays 900 for a root login shell" bash -c "${LOGIN_SH[*]} 'echo TMOUT=\$TMOUT' 2>/dev/null </dev/null | grep -qx 'TMOUT=900'"
 if [[ $OS == ubuntu ]]; then
     check "TMOUT readonly+exported (POSIX form)" grep -Pzq 'TMOUT=[0-9]+\s+readonly TMOUT\s+export TMOUT' /etc/profile.d/60-harden.sh
 fi

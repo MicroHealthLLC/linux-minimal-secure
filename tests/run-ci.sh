@@ -128,6 +128,10 @@ docker exec -e FAMILY="$FAMILY" "$NAME" bash -euo pipefail -c '
     ssh-keygen -q -t ecdsa -b 384 -N "" -f /root/ciadmin_key
     install -m 0600 -o ciadmin -g ciadmin /root/ciadmin_key.pub /home/ciadmin/.ssh/authorized_keys
     ssh-keygen -q -t ecdsa -b 384 -N "" -f /root/root_key
+    # Pre-existing TMOUT settings read after 60-harden.sh (field report:
+    # "-bash: TMOUT: readonly variable" at every login).
+    printf "TMOUT=600\nexport TMOUT\n" >/etc/profile.d/zz-ci-tmout.sh
+    printf "\nexport TMOUT=1200\n" >>/root/.bashrc
     install -d -m 0700 /root/.ssh
     # Proxmox look-alike: authorized_keys links into /etc/pve/priv; append.
     if [ -L /root/.ssh/authorized_keys ]; then

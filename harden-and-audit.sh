@@ -3510,6 +3510,33 @@ EOF
     fi
 }
 
+# TMOUT is read-only once /etc/profile.d/60-harden.sh has run, so any later
+# assignment (a profile.d file sorting after it, /etc/bash.bashrc, root's
+# dotfiles) prints "-bash: TMOUT: readonly variable" at every login. Guard
+# those assignments so they only apply when TMOUT is not set yet: an earlier,
+# stricter value still wins and nothing is printed. Other users' dotfiles are
+# reported, not edited.
+guard_other_tmout() {
+    local re='^([[:space:]]*)(((export|readonly|declare[[:space:]]+-[[:alpha:]]+|typeset[[:space:]]+-[[:alpha:]]+)[[:space:]]+)?TMOUT=)'
+    local f
+    for f in /etc/profile /etc/bash.bashrc /etc/bashrc /etc/profile.d/*.sh /root/.bashrc /root/.profile /root/.bash_profile /root/.bash_login; do
+        [[ -f $f && $f != /etc/profile.d/60-harden.sh ]] || continue
+        grep -Eq "$re" "$f" || continue
+        backup_file "$f"
+        sed -i -E "s/${re}/\\1[ -n \"\${TMOUT:-}\" ] || \\2/" "$f"
+        log "TMOUT: guarded another assignment in ${f} (TMOUT is read-only after 60-harden.sh)"
+    done
+    local u home
+    while read -r u; do
+        home=$(getent passwd "$u" | cut -d: -f6)
+        for f in "$home/.bashrc" "$home/.profile" "$home/.bash_profile" "$home/.bash_login"; do
+            [[ -f $f ]] && grep -Eq "$re" "$f" \
+                && warn "TMOUT: ${f} assigns TMOUT, which is read-only system-wide (${SHELL_TMOUT}s); that user will see 'TMOUT: readonly variable' at login until the line is removed"
+        done
+    done < <(interactive_users)
+    return 0
+}
+
 configure_login_defs() {
     step "5.6 password aging, umask, account inactivity"
     local f=/etc/login.defs
@@ -3602,6 +3629,7 @@ if [ -n "\${BASH_VERSION:-}" ] && [ -z "\${TMOUT:-}" ]; then
 fi
 EOF
     fi
+    is_desktop || guard_other_tmout
     if is_rhel && [[ -f /etc/bashrc ]]; then
         # EL CIS checks every umask in /etc/bashrc (inside its if/else).
         backup_file /etc/bashrc
