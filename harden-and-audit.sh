@@ -30,7 +30,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.2.1"
 readonly SCRIPT_NAME="harden-and-audit.sh"
 readonly LOG_FILE="/var/log/harden-and-audit.log"
 readonly STATE_DIR="/var/lib/harden-and-audit"
@@ -626,6 +626,47 @@ safe_purge_rpm() {
     fi
 }
 
+# apt_autoremove - after packages were removed or upgraded: remove what no
+# installed package needs any more, then purge the configuration left behind
+# by removed packages ("rc" state). Debian family only; on the RHEL family
+# clean_requirements_on_remove=True (configure_dnf_minimal) removes orphaned
+# dependencies as part of every "dnf remove", and a blanket "dnf autoremove"
+# is avoided (installer-placed packages are often marked as dependencies).
+# Proxmox VE: kernels are never auto-removed - one pinned with
+# proxmox-boot-tool can be marked automatic, and removing it changes what the
+# node boots. Everything else goes through safe_purge, which refuses any
+# removal that would take a kept kernel with it.
+apt_autoremove() {
+    is_deb || return 0
+    local -a autorm=() rest=() residual=()
+    local p
+    mapfile -t autorm < <(apt-get -s autoremove --purge 2>/dev/null | awk '/^Purg /{print $2}')
+    if [[ ${#autorm[@]} -gt 0 ]]; then
+        if is_pve; then
+            for p in "${autorm[@]}"; do
+                if [[ ${p%%:*} =~ ^(proxmox-kernel-|pve-kernel-|proxmox-headers-|pve-headers-|linux-image-|linux-headers-) ]]; then
+                    log "Proxmox VE: kernel package ${p} kept (kernels are never auto-removed on a node)"
+                else
+                    rest+=("$p")
+                fi
+            done
+            if [[ ${#rest[@]} -gt 0 ]]; then
+                log "autoremove: ${#rest[@]} unneeded package(s)"
+                safe_purge "${rest[@]}"
+            fi
+        else
+            log "autoremove: ${#autorm[@]} unneeded package(s): ${autorm[*]}"
+            apt-get "${APT_LOCK_WAIT[@]}" autoremove --purge -y -q
+        fi
+    fi
+    mapfile -t residual < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1=="rc"{print $2}')
+    if [[ ${#residual[@]} -gt 0 ]]; then
+        log "purging leftover configuration of ${#residual[@]} removed package(s)"
+        apt-get "${APT_LOCK_WAIT[@]}" purge -y -q "${residual[@]}" >/dev/null
+    fi
+    return 0
+}
+
 svc_exists() { systemctl list-unit-files --no-legend "$1" 2>/dev/null | qgrep .; }
 
 disable_service() {
@@ -962,6 +1003,7 @@ purge_graphical() {
     step "1.2 purge graphical stack (display managers, desktops, X11, Wayland, Mesa)"
     if is_desktop; then
         log "desktop mode: graphical stack and graphical.target kept"
+        apt_autoremove
         return 0
     fi
     local re='^(xserver-.*|xorg|xorg-.*|x11-.*|xinit|xauth|xterm|xwayland|weston|xbase-clients|xfonts-.*|'
@@ -999,14 +1041,7 @@ purge_graphical() {
         systemctl set-default multi-user.target >/dev/null
         return 0
     fi
-    # Proxmox VE: no autoremove - kernels pinned with proxmox-boot-tool can be
-    # marked automatic, and removing them changes what the node boots.
-    is_pve || apt-get "${APT_LOCK_WAIT[@]}" autoremove --purge -y -q
-    local -a residual
-    mapfile -t residual < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1=="rc"{print $2}')
-    if [[ ${#residual[@]} -gt 0 ]]; then
-        apt-get "${APT_LOCK_WAIT[@]}" purge -y -q "${residual[@]}" >/dev/null
-    fi
+    apt_autoremove
     systemctl set-default multi-user.target >/dev/null
 }
 
@@ -1063,6 +1098,8 @@ purge_insecure_services() {
             warn "application server '${srv}' is installed and was left in place; CIS expects it removed if not required"
         fi
     done
+    # Dependencies only the purged services needed (Ubuntu telemetry included).
+    apt_autoremove
 }
 
 # RHEL family (CIS): crash reporting (abrt), SELinux troubleshooting daemons
@@ -1428,6 +1465,8 @@ install_base_stack() {
     apt_install "${pkgs[@]}"
     log "installing pending security updates"
     apt-get "${APT_LOCK_WAIT[@]}" -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade
+    # Dependencies the upgrade made obsolete (replaced libraries, old kernels).
+    apt_autoremove
 }
 
 install_base_stack_rhel() {
@@ -4186,6 +4225,10 @@ configure_apparmor() {
     local -a enforce=() complain=()
     for p in /etc/apparmor.d/*; do
         [[ -f $p ]] || continue
+        # Include-only files (Proxmox VE's lxc-containers pulls in the LXC
+        # profiles from /etc/apparmor.d/lxc/) define no profile themselves;
+        # aa-enforce rejects them ("doesn't contain a valid profile").
+        aa_defines_profile "$p" || continue
         # Profiles shipped as "unconfined" are allow-all by design; enforcing
         # them would block their binaries. Leave those alone.
         grep -Eq 'flags=\([^)]*unconfined' "$p" && continue
@@ -4198,13 +4241,41 @@ configure_apparmor() {
             enforce+=("$p")
         fi
     done
-    if [[ ${#enforce[@]} -gt 0 ]]; then
-        host_only "aa-enforce" aa-enforce "${enforce[@]}" >/dev/null
+    aa_set_mode aa-enforce "${enforce[@]}"
+    aa_set_mode aa-complain "${complain[@]}"
+    # reload, not restart: profiles of running confined processes (LXC
+    # containers, Docker, libvirt) stay loaded while the set is refreshed.
+    host_only "load AppArmor profiles" systemctl reload-or-restart apparmor.service
+}
+
+# aa_defines_profile FILE - the file declares at least one profile block
+# (a "{" outside comments); include-only and variable files do not.
+aa_defines_profile() {
+    grep -v '^[[:space:]]*#' "$1" | qgrep '{'
+}
+
+# aa_set_mode TOOL FILE... - aa-enforce / aa-complain in one batch; if the
+# batch fails, file by file, so one vendor profile the parser rejects is
+# reported instead of stopping the run (the others are still applied).
+aa_set_mode() {
+    local tool=$1 f
+    shift
+    [[ $# -gt 0 ]] || return 0
+    if "$tool" "$@" >/dev/null 2>&1; then
+        return 0
     fi
-    if [[ ${#complain[@]} -gt 0 ]]; then
-        host_only "aa-complain" aa-complain "${complain[@]}" >/dev/null
+    if in_container; then
+        warn "container: '${tool}' could not be applied here (it applies on a real host)"
+        return 0
     fi
-    host_only "start AppArmor" systemctl restart apparmor.service
+    local -a bad=()
+    for f in "$@"; do
+        "$tool" "$f" >/dev/null 2>&1 || bad+=("${f##*/}")
+    done
+    if [[ ${#bad[@]} -gt 0 ]]; then
+        warn "AppArmor: ${tool} failed for ${bad[*]} (left in their current mode; check with: apparmor_parser -QT /etc/apparmor.d/<file>)"
+    fi
+    return 0
 }
 
 # RHEL family: SELinux enforcing with the targeted policy. A host that booted
@@ -4645,6 +4716,8 @@ install_openscap() {
     apt_install "${pkgs[@]}"
     command -v oscap >/dev/null 2>&1 || die "no OpenSCAP scanner (oscap) could be installed on ${OS_NAME}"
     log "OpenSCAP: $(oscap --version 2>/dev/null | head -n1)"
+    # Last package change of the run: nothing unneeded is left behind.
+    apt_autoremove
 }
 
 # find_datastream NAME - pinned upstream SSG (cache, then download), then

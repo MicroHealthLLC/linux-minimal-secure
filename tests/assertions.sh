@@ -396,6 +396,7 @@ check "Proxmox VE: Ceph no-subscription repository configured" grep -q '^URIs: h
 check "Proxmox VE: apt-get update succeeds" apt-get update -qq
 check "Proxmox VE: fail2ban web UI jail" bash -c "fail2ban-client status proxmox"
 check "Proxmox VE: cluster peers never banned" bash -c "grep -E '^ignoreip' /etc/fail2ban/jail.d/60-harden.local | grep -q '10.0.0.12'"
+check "Proxmox VE: AppArmor step does not choke on the include-only lxc-containers file" bash -c "! grep -Eq 'lxc-containers doesn.t contain a valid profile|failed for.*lxc-containers' /var/log/harden-and-audit.log"
 check "Proxmox VE: overlay kept (Docker inside LXC)" bash -c "! grep -q 'install overlay ' /etc/modprobe.d/60-harden-blacklist.conf"
 else
 check "UFW enabled at boot" bash -c "grep -q '^ENABLED=yes' /etc/ufw/ufw.conf"
@@ -586,6 +587,13 @@ if ! timeout 120 "$CRT" run --rm "$CIMG" true >/dev/null 2>&1; then
     sysctl net.ipv4.ip_forward 2>&1 | sed 's/^/    /'
     lsmod 2>/dev/null | grep -E '^(overlay|br_netfilter)' | sed 's/^/    /'
 fi
+fi
+
+if deb; then
+echo "== 6c. package cleanup (autoremove)"
+# Proxmox VE keeps auto-installed kernels by design.
+check "no unneeded packages left (apt autoremove has nothing to do)" bash -c "! apt-get -s autoremove 2>/dev/null | awk '/^Remv /{print \$2}' | grep -Ev '^(proxmox-kernel-|pve-kernel-|proxmox-headers-|pve-headers-)' | grep -q ."
+check "no leftover configuration of removed packages (rc)" bash -c "! dpkg-query -W -f='\${db:Status-Abbrev} \${Package}\n' | awk '\$1==\"rc\"' | grep -q ."
 fi
 
 echo "== 6b. no stray backups inside include directories"
