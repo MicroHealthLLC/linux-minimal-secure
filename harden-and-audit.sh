@@ -78,6 +78,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${DESKTOP_MODE:=auto}"           # auto|0|1 - 1 keeps the desktop experience (auto: a display manager is installed)
 : "${PROXMOX_MODE:=auto}"           # auto|0|1 - Proxmox VE node (auto: pve-manager is installed)
 : "${PVE_ROOT_SSH:=auto}"           # auto|yes|prohibit-password - root SSH on Proxmox VE (auto: keys only if a sudo admin exists)
+: "${PVE_ROOT_PASSWORD_FROM:=}"     # Proxmox VE: CIDR(s) root may still SSH from with a password, e.g. 192.168.0.0/16 (empty = keys only)
 : "${PVE_REPO:=auto}"               # auto|enterprise|no-subscription|keep - Proxmox repositories (auto: by subscription status)
 : "${PVE_FIREWALL_ENABLE:=0}"       # 1 = turn the Proxmox datacenter firewall on (SSH + web UI allowed first)
 : "${PVE_FIREWALL_MGMT_SOURCE:=}"   # source CIDR(s) allowed to SSH/8006 when enabling (empty = any)
@@ -893,8 +894,11 @@ pve_root_ssh() {
     if [[ $ROOT_SSH == yes ]]; then
         warn "Proxmox VE: no non-root ${ADMIN_GROUP} administrator with a key or password, so root keeps SSH password login (PermitRootLogin yes). Add one to restrict root to keys (PVE_ROOT_SSH=prohibit-password)"
     fi
-    if [[ $SSH_DISABLE_PASSWORD == 1 || $ROOT_SSH == prohibit-password ]] && [[ ! -s /root/.ssh/authorized_keys ]]; then
-        warn "Proxmox VE: root has no authorized_keys - root SSH (and therefore cluster operations) needs keys; the web UI and console are unaffected"
+    # /root/.ssh/authorized_keys links to /etc/pve/priv/authorized_keys, which
+    # always holds the cluster nodes' keys, so it says nothing about whether
+    # an operator can still log in as root. Warn whenever root is key-only.
+    if [[ $ROOT_SSH == prohibit-password && -z $PVE_ROOT_PASSWORD_FROM ]]; then
+        warn "Proxmox VE: root SSH is key-only (PermitRootLogin prohibit-password); root password SSH logins will be refused after sshd reloads. Add your key to root, or set PVE_ROOT_PASSWORD_FROM=<CIDRs> to keep root password login from trusted networks"
     fi
     local hash
     hash=$(getent shadow root | cut -d: -f2)
@@ -1520,27 +1524,29 @@ EOF
     if is_ubuntu; then
         # Ubuntu security pocket, plus the ESM pockets (used only when the
         # host is attached to Ubuntu Pro; harmless otherwise).
-        origins='#clear Unattended-Upgrade::Allowed-Origins;
-#clear Unattended-Upgrade::Origins-Pattern;
-Unattended-Upgrade::Origins-Pattern {
+        origins='Unattended-Upgrade::Origins-Pattern {
         "origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu";
         "origin=UbuntuESMApps,archive=${distro_codename}-apps-security";
         "origin=UbuntuESM,archive=${distro_codename}-infra-security";
 };'
         check='Unattended-Upgrade::Origins-Pattern:: "origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu"'
     else
-        origins='#clear Unattended-Upgrade::Origins-Pattern;
-Unattended-Upgrade::Origins-Pattern {
+        local pve_origin=""
+        # Proxmox VE: the Proxmox repositories (enterprise or no-subscription).
+        is_pve && pve_origin='
+        "origin=Proxmox,codename=${distro_codename}";'
+        origins='Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
-        "origin=Debian,codename=${distro_codename},label=Debian-Security";
+        "origin=Debian,codename=${distro_codename},label=Debian-Security";'"${pve_origin}"'
 };'
         check='Unattended-Upgrade::Origins-Pattern:: "origin=Debian,codename=${distro_codename}-security,label=Debian-Security"'
     fi
     {
         echo "// Managed by ${SCRIPT_NAME} - apply official ${OS_ID^} security updates daily."
         printf '%s\n' "$origins"
+        # No clear directives: these lists add to the ones in other apt.conf.d
+        # files (50unattended-upgrades, other tools) instead of replacing them.
         cat <<'EOF'
-#clear Unattended-Upgrade::Package-Blacklist;
 Unattended-Upgrade::Package-Blacklist {
 };
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
@@ -2865,11 +2871,21 @@ EOF
     # QEMU/NBD streams through root SSH port and unix-socket forwarding
     # (ssh -L), so root - and only root - keeps those two forwarding types.
     # A Match block must be last in the file; it is appended after the rest.
-    local pve_match=""
+    local pve_match="" pve_pw_match=""
     if is_pve; then
+        # PVE_ROOT_PASSWORD_FROM: root keeps password login from these
+        # networks only; everywhere else root stays key-only.
+        if [[ -n $PVE_ROOT_PASSWORD_FROM ]]; then
+            local pw_from
+            pw_from=$(tr -s ' ,' ',' <<<"$PVE_ROOT_PASSWORD_FROM" | sed 's/^,//; s/,$//')
+            [[ $pw_from =~ ^[0-9A-Fa-f:.,/]+$ ]] || die "PVE_ROOT_PASSWORD_FROM must be a list of CIDRs (got '${PVE_ROOT_PASSWORD_FROM}')"
+            pve_pw_match="Match User root Address ${pw_from}
+    PermitRootLogin yes
+"
+        fi
         pve_match=$(cat <<EOF
 # BEGIN ${MARK} proxmox root match - must stay at the end of the file
-Match User root
+${pve_pw_match}Match User root
     DisableForwarding no
     AllowTcpForwarding yes
     AllowStreamLocalForwarding yes
@@ -3289,6 +3305,13 @@ enforcing = 1
 enforce_for_root
 retry = 3
 EOF
+    local deny_root="even_deny_root
+root_unlock_time = ${FAILLOCK_UNLOCK_TIME}"
+    if is_pve; then
+        deny_root="# even_deny_root / root_unlock_time: not set on Proxmox VE. The web UI login
+# (root@pam) uses this same PAM stack, so locking root would let anyone on the
+# network lock root out of both SSH and the web UI. Other users are still locked."
+    fi
     write_file 0644 /etc/security/faillock.conf <<EOF
 # Managed by ${SCRIPT_NAME} - temporary lockout (auto-unlocks; never permanent).
 dir = /var/run/faillock
@@ -3297,8 +3320,7 @@ silent
 deny = ${FAILLOCK_DENY}
 fail_interval = 900
 unlock_time = ${FAILLOCK_UNLOCK_TIME}
-even_deny_root
-root_unlock_time = ${FAILLOCK_UNLOCK_TIME}
+${deny_root}
 EOF
     write_file 0644 /etc/security/pwhistory.conf <<'EOF'
 # Managed by harden-and-audit.sh
@@ -3488,6 +3510,33 @@ EOF
     fi
 }
 
+# TMOUT is read-only once /etc/profile.d/60-harden.sh has run, so any later
+# assignment (a profile.d file sorting after it, /etc/bash.bashrc, root's
+# dotfiles) prints "-bash: TMOUT: readonly variable" at every login. Guard
+# those assignments so they only apply when TMOUT is not set yet: an earlier,
+# stricter value still wins and nothing is printed. Other users' dotfiles are
+# reported, not edited.
+guard_other_tmout() {
+    local re='^([[:space:]]*)(((export|readonly|declare[[:space:]]+-[[:alpha:]]+|typeset[[:space:]]+-[[:alpha:]]+)[[:space:]]+)?TMOUT=)'
+    local f
+    for f in /etc/profile /etc/bash.bashrc /etc/bashrc /etc/profile.d/*.sh /root/.bashrc /root/.profile /root/.bash_profile /root/.bash_login; do
+        [[ -f $f && $f != /etc/profile.d/60-harden.sh ]] || continue
+        grep -Eq "$re" "$f" || continue
+        backup_file "$f"
+        sed -i -E "s/${re}/\\1[ -n \"\${TMOUT:-}\" ] || \\2/" "$f"
+        log "TMOUT: guarded another assignment in ${f} (TMOUT is read-only after 60-harden.sh)"
+    done
+    local u home
+    while read -r u; do
+        home=$(getent passwd "$u" | cut -d: -f6)
+        for f in "$home/.bashrc" "$home/.profile" "$home/.bash_profile" "$home/.bash_login"; do
+            [[ -f $f ]] && grep -Eq "$re" "$f" \
+                && warn "TMOUT: ${f} assigns TMOUT, which is read-only system-wide (${SHELL_TMOUT}s); that user will see 'TMOUT: readonly variable' at login until the line is removed"
+        done
+    done < <(interactive_users)
+    return 0
+}
+
 configure_login_defs() {
     step "5.6 password aging, umask, account inactivity"
     local f=/etc/login.defs
@@ -3580,6 +3629,7 @@ if [ -n "\${BASH_VERSION:-}" ] && [ -z "\${TMOUT:-}" ]; then
 fi
 EOF
     fi
+    is_desktop || guard_other_tmout
     if is_rhel && [[ -f /etc/bashrc ]]; then
         # EL CIS checks every umask in /etc/bashrc (inside its if/else).
         backup_file /etc/bashrc

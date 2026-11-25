@@ -202,6 +202,18 @@ EOF
 printf 'storage: placeholder\n' >/etc/pve/nodes/pve1/lrm_status
 printf 'quorate: 1\n' >/etc/pve/.members
 install -d -m 0700 /root/.ssh
+# As on a real node: root's authorized_keys is a link into the cluster file
+# system and always holds the other nodes' keys.
+install -d -m 0700 /etc/pve/priv
+ssh-keygen -q -t ed25519 -N "" -C root@pve2 -f /tmp/pve2_key
+install -m 0600 /tmp/pve2_key.pub /etc/pve/priv/authorized_keys
+rm -f /tmp/pve2_key /tmp/pve2_key.pub
+ln -sf /etc/pve/priv/authorized_keys /root/.ssh/authorized_keys
+# Another tool's unattended-upgrades lists: the hardening must add to them.
+cat >/etc/apt/apt.conf.d/51ci-other-tool <<'EOF'
+Unattended-Upgrade::Origins-Pattern { "origin=CI-Other-Tool"; };
+Unattended-Upgrade::Package-Blacklist { "ci-pinned-package"; };
+EOF
 install -d /var/lib/vz/images/100 /var/lib/vz/template/iso /data/vmstore
 
 # --- AppArmor: LXC ships an include-only "profile" file (no profile block);

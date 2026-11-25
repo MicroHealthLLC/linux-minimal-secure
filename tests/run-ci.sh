@@ -128,8 +128,17 @@ docker exec -e FAMILY="$FAMILY" "$NAME" bash -euo pipefail -c '
     ssh-keygen -q -t ecdsa -b 384 -N "" -f /root/ciadmin_key
     install -m 0600 -o ciadmin -g ciadmin /root/ciadmin_key.pub /home/ciadmin/.ssh/authorized_keys
     ssh-keygen -q -t ecdsa -b 384 -N "" -f /root/root_key
+    # Pre-existing TMOUT settings read after 60-harden.sh (field report:
+    # "-bash: TMOUT: readonly variable" at every login).
+    printf "TMOUT=600\nexport TMOUT\n" >/etc/profile.d/zz-ci-tmout.sh
+    printf "\nexport TMOUT=1200\n" >>/root/.bashrc
     install -d -m 0700 /root/.ssh
-    install -m 0600 /root/root_key.pub /root/.ssh/authorized_keys
+    # Proxmox look-alike: authorized_keys links into /etc/pve/priv; append.
+    if [ -L /root/.ssh/authorized_keys ]; then
+        cat /root/root_key.pub >>/root/.ssh/authorized_keys
+    else
+        install -m 0600 /root/root_key.pub /root/.ssh/authorized_keys
+    fi
 '
 
 run_script() {
@@ -142,6 +151,7 @@ run_script() {
         -e AIDE_INIT="${AIDE_INIT:-1}" \
         -e PROGRESS_INTERVAL=10 \
         -e PVE_FIREWALL_ENABLE="$([[ $VARIANT == proxmox ]] && echo 1 || echo 0)" \
+        -e PVE_ROOT_PASSWORD_FROM="$([[ $VARIANT == proxmox ]] && echo '192.168.0.0/16, 172.16.0.0/12')" \
         "$NAME" bash /src/harden-and-audit.sh 2>&1 | tee "${OUT_DIR}/harden-${label}.log"
     local rc=${PIPESTATUS[0]}
     set -e

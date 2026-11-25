@@ -142,6 +142,7 @@ The table describes the Debian family; the RHEL-family equivalents follow it.
 | `K8S_EXTRA_PORTS` | *(empty)* | More inbound ports on Kubernetes nodes, e.g. `"9100/tcp 7946/tcp 7946/udp"` (node exporter, MetalLB) |
 | `PROXMOX_MODE` | `auto` | `auto` = Proxmox mode when `pve-manager` is installed; `1` force; `0` treat the node as plain Debian (not recommended) |
 | `PVE_ROOT_SSH` | `auto` | Proxmox: `auto` = `prohibit-password` when a non-root sudo admin exists, else `yes`; or set `yes` / `prohibit-password` |
+| `PVE_ROOT_PASSWORD_FROM` | *(empty)* | Proxmox: CIDRs (comma or space separated, e.g. `192.168.0.0/16`) root may still SSH from with a password (`Match User root Address …` → `PermitRootLogin yes`). Everywhere else root stays key-only. Empty = no exception, and the run warns when root ends up key-only |
 | `PVE_REPO` | `auto` | Proxmox: `auto` = enterprise repositories with an active subscription, otherwise no-subscription; `enterprise`, `no-subscription` or `keep` (leave the repositories alone) |
 | `PVE_FIREWALL_ENABLE` | `0` | Proxmox: `1` turns the datacenter firewall on (SSH and 8006 accept rules first, existing rules kept). **Cluster-wide** setting |
 | `PVE_FIREWALL_MGMT_SOURCE` | *(empty)* | Proxmox: source CIDR(s) for those SSH/8006 rules (empty = any) |
