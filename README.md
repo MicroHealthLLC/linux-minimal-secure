@@ -12,7 +12,7 @@
 
 **Proxmox VE nodes.** When `pve-manager` is installed the script runs in **Proxmox mode** and keeps everything a node and its cluster need:
 
-* **Root stays usable.** Root keeps SSH: cluster join, live and secure migration, replication and the node shell all run as root over SSH. Root keeps password and key login (`PermitRootLogin yes`; `PVE_ROOT_SSH=prohibit-password` restricts it to keys). `DisableForwarding` is not set on a node, so root's TCP and unix-socket forwarding for migration tunnels works; other users still get every `Allow*Forwarding no`. faillock never locks root (no `even_deny_root`), so failed logins sent to port 22 or 8006 can't shut root out of SSH or `root@pam`; other accounts are still locked. Root's password is exempt from expiry and inactivity locking, because an expired root password breaks key-based cluster logins and `root@pam` in the web UI.
+* **Root stays usable.** Root keeps SSH: cluster join, live and secure migration, replication and the node shell all run as root over SSH. With a non-root sudo admin present it is `PermitRootLogin prohibit-password` (keys only); otherwise `yes`. Root keeps TCP and unix-socket forwarding for migration tunnels; other users don't. Root's password is exempt from expiry and inactivity locking, because an expired root password breaks key-based cluster logins and `root@pam` in the web UI.
 * **Firewall.** pve-firewall stays the firewall and UFW is never installed. With `PVE_FIREWALL_ENABLE=1` the datacenter firewall is turned on, with SSH and port 8006 allowed first and existing rules kept.
 * **Repositories.** Without a subscription, the enterprise repositories (which return HTTP 401) are swapped for the no-subscription ones, so updates keep working.
 * **Kernel, boot and banner.** IP forwarding is left to the node's network setup. rpcbind (NFS storage), dnsmasq (SDN DHCP), postfix and overlayfs stay. No kernel `fips=1` (Proxmox doesn't support it; user-space FIPS stays). `/etc/kernel/cmdline` and `proxmox-boot-tool refresh` are handled. `pvebanner` no longer overwrites the login banner.
@@ -141,7 +141,8 @@ The table describes the Debian family; the RHEL-family equivalents follow it.
 | `K8S_TRUSTED_CIDRS` | *(empty)* | Node/management networks allowed to reach the cluster ports (API server, etcd, kubelet, CNI). Empty = any source (a warning is printed) |
 | `K8S_EXTRA_PORTS` | *(empty)* | More inbound ports on Kubernetes nodes, e.g. `"9100/tcp 7946/tcp 7946/udp"` (node exporter, MetalLB) |
 | `PROXMOX_MODE` | `auto` | `auto` = Proxmox mode when `pve-manager` is installed; `1` force; `0` treat the node as plain Debian (not recommended) |
-| `PVE_ROOT_SSH` | `auto` | Proxmox: `auto` = `yes` (root password and keys); `prohibit-password` restricts root to keys |
+| `PVE_ROOT_SSH` | `auto` | Proxmox: `auto` = `prohibit-password` when a non-root sudo admin exists, else `yes`; or set `yes` / `prohibit-password` |
+| `PVE_ROOT_PASSWORD_FROM` | *(empty)* | Proxmox: CIDRs (comma or space separated, e.g. `192.168.0.0/16`) root may still SSH from with a password (`Match User root Address …` → `PermitRootLogin yes`). Everywhere else root stays key-only. Empty = no exception, and the run warns when root ends up key-only |
 | `PVE_REPO` | `auto` | Proxmox: `auto` = enterprise repositories with an active subscription, otherwise no-subscription; `enterprise`, `no-subscription` or `keep` (leave the repositories alone) |
 | `PVE_FIREWALL_ENABLE` | `0` | Proxmox: `1` turns the datacenter firewall on (SSH and 8006 accept rules first, existing rules kept). **Cluster-wide** setting |
 | `PVE_FIREWALL_MGMT_SOURCE` | *(empty)* | Proxmox: source CIDR(s) for those SSH/8006 rules (empty = any) |

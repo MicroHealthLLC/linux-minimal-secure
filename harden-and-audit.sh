@@ -77,7 +77,8 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${FIREWALL_EXTRA_OUT:=${UFW_EXTRA_OUT}}"
 : "${DESKTOP_MODE:=auto}"           # auto|0|1 - 1 keeps the desktop experience (auto: a display manager is installed)
 : "${PROXMOX_MODE:=auto}"           # auto|0|1 - Proxmox VE node (auto: pve-manager is installed)
-: "${PVE_ROOT_SSH:=auto}"           # auto|yes|prohibit-password - root SSH on Proxmox VE (auto: yes, password and keys)
+: "${PVE_ROOT_SSH:=auto}"           # auto|yes|prohibit-password - root SSH on Proxmox VE (auto: keys only if a sudo admin exists)
+: "${PVE_ROOT_PASSWORD_FROM:=}"     # Proxmox VE: CIDR(s) root may still SSH from with a password, e.g. 192.168.0.0/16 (empty = keys only)
 : "${PVE_REPO:=auto}"               # auto|enterprise|no-subscription|keep - Proxmox repositories (auto: by subscription status)
 : "${PVE_FIREWALL_ENABLE:=0}"       # 1 = turn the Proxmox datacenter firewall on (SSH + web UI allowed first)
 : "${PVE_FIREWALL_MGMT_SOURCE:=}"   # source CIDR(s) allowed to SSH/8006 when enabling (empty = any)
@@ -886,17 +887,18 @@ preflight_admin() {
 pve_root_ssh() {
     case $PVE_ROOT_SSH in
         yes|prohibit-password) ROOT_SSH=$PVE_ROOT_SSH ;;
-        # Root password SSH is how operators reach a node (and recover a
-        # cluster), so auto keeps it; prohibit-password is an explicit opt-in.
-        auto) ROOT_SSH=yes ;;
+        auto) if [[ $1 == 1 ]]; then ROOT_SSH=prohibit-password; else ROOT_SSH=yes; fi ;;
         *) die "PVE_ROOT_SSH must be auto, yes or prohibit-password (got '${PVE_ROOT_SSH}')" ;;
     esac
     log "Proxmox VE: root SSH login stays enabled (PermitRootLogin ${ROOT_SSH}); cluster, migration and replication use root keys"
-    if [[ $ROOT_SSH == yes && $1 != 1 ]]; then
-        warn "Proxmox VE: no non-root ${ADMIN_GROUP} administrator with a key or password; root is the only way in"
+    if [[ $ROOT_SSH == yes ]]; then
+        warn "Proxmox VE: no non-root ${ADMIN_GROUP} administrator with a key or password, so root keeps SSH password login (PermitRootLogin yes). Add one to restrict root to keys (PVE_ROOT_SSH=prohibit-password)"
     fi
-    if [[ $SSH_DISABLE_PASSWORD == 1 || $ROOT_SSH == prohibit-password ]] && [[ ! -s /root/.ssh/authorized_keys ]]; then
-        warn "Proxmox VE: root has no authorized_keys - root SSH (and therefore cluster operations) needs keys; the web UI and console are unaffected"
+    # /root/.ssh/authorized_keys links to /etc/pve/priv/authorized_keys, which
+    # always holds the cluster nodes' keys, so it says nothing about whether
+    # an operator can still log in as root. Warn whenever root is key-only.
+    if [[ $ROOT_SSH == prohibit-password && -z $PVE_ROOT_PASSWORD_FROM ]]; then
+        warn "Proxmox VE: root SSH is key-only (PermitRootLogin prohibit-password); root password SSH logins will be refused after sshd reloads. Add your key to root, or set PVE_ROOT_PASSWORD_FROM=<CIDRs> to keep root password login from trusted networks"
     fi
     local hash
     hash=$(getent shadow root | cut -d: -f2)
@@ -1522,27 +1524,29 @@ EOF
     if is_ubuntu; then
         # Ubuntu security pocket, plus the ESM pockets (used only when the
         # host is attached to Ubuntu Pro; harmless otherwise).
-        origins='#clear Unattended-Upgrade::Allowed-Origins;
-#clear Unattended-Upgrade::Origins-Pattern;
-Unattended-Upgrade::Origins-Pattern {
+        origins='Unattended-Upgrade::Origins-Pattern {
         "origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu";
         "origin=UbuntuESMApps,archive=${distro_codename}-apps-security";
         "origin=UbuntuESM,archive=${distro_codename}-infra-security";
 };'
         check='Unattended-Upgrade::Origins-Pattern:: "origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu"'
     else
-        origins='#clear Unattended-Upgrade::Origins-Pattern;
-Unattended-Upgrade::Origins-Pattern {
+        local pve_origin=""
+        # Proxmox VE: the Proxmox repositories (enterprise or no-subscription).
+        is_pve && pve_origin='
+        "origin=Proxmox,codename=${distro_codename}";'
+        origins='Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
-        "origin=Debian,codename=${distro_codename},label=Debian-Security";
+        "origin=Debian,codename=${distro_codename},label=Debian-Security";'"${pve_origin}"'
 };'
         check='Unattended-Upgrade::Origins-Pattern:: "origin=Debian,codename=${distro_codename}-security,label=Debian-Security"'
     fi
     {
         echo "// Managed by ${SCRIPT_NAME} - apply official ${OS_ID^} security updates daily."
         printf '%s\n' "$origins"
+        # No clear directives: these lists add to the ones in other apt.conf.d
+        # files (50unattended-upgrades, other tools) instead of replacing them.
         cat <<'EOF'
-#clear Unattended-Upgrade::Package-Blacklist;
 Unattended-Upgrade::Package-Blacklist {
 };
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
@@ -2821,12 +2825,6 @@ MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,h
 KexAlgorithms ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256
 '
     fi
-    # Proxmox VE: DisableForwarding yes overrides every Allow*Forwarding, and
-    # secure migration tunnels through root's ssh -L. Leave it unset on a node
-    # instead of relying on the Match block to undo it; the Allow* lines below
-    # still deny every forwarding type to non-root users.
-    local disfwd="DisableForwarding yes"
-    is_pve && disfwd="# DisableForwarding: unset on Proxmox VE (root migration tunnels); Allow*Forwarding no applies"
     local block
     block=$(cat <<EOF
 # BEGIN ${MARK} managed block - first match wins in sshd, keep this at the top
@@ -2838,7 +2836,7 @@ AllowAgentForwarding no
 AllowStreamLocalForwarding no
 PermitTunnel no
 GatewayPorts no
-${disfwd}
+DisableForwarding yes
 MaxAuthTries 4
 MaxSessions 10
 MaxStartups 10:30:60
@@ -2873,11 +2871,21 @@ EOF
     # QEMU/NBD streams through root SSH port and unix-socket forwarding
     # (ssh -L), so root - and only root - keeps those two forwarding types.
     # A Match block must be last in the file; it is appended after the rest.
-    local pve_match=""
+    local pve_match="" pve_pw_match=""
     if is_pve; then
+        # PVE_ROOT_PASSWORD_FROM: root keeps password login from these
+        # networks only; everywhere else root stays key-only.
+        if [[ -n $PVE_ROOT_PASSWORD_FROM ]]; then
+            local pw_from
+            pw_from=$(tr -s ' ,' ',' <<<"$PVE_ROOT_PASSWORD_FROM" | sed 's/^,//; s/,$//')
+            [[ $pw_from =~ ^[0-9A-Fa-f:.,/]+$ ]] || die "PVE_ROOT_PASSWORD_FROM must be a list of CIDRs (got '${PVE_ROOT_PASSWORD_FROM}')"
+            pve_pw_match="Match User root Address ${pw_from}
+    PermitRootLogin yes
+"
+        fi
         pve_match=$(cat <<EOF
 # BEGIN ${MARK} proxmox root match - must stay at the end of the file
-Match User root
+${pve_pw_match}Match User root
     DisableForwarding no
     AllowTcpForwarding yes
     AllowStreamLocalForwarding yes
@@ -3297,12 +3305,13 @@ enforcing = 1
 enforce_for_root
 retry = 3
 EOF
-    # Proxmox VE: root@pam is the web UI's administrator and root is the
-    # cluster's SSH account, so failed logins (anyone can send them to port
-    # 8006 or 22) must not lock root out. Other accounts are still locked.
     local deny_root="even_deny_root
 root_unlock_time = ${FAILLOCK_UNLOCK_TIME}"
-    is_pve && deny_root="# even_deny_root: not set on Proxmox VE (root@pam web UI and cluster SSH)"
+    if is_pve; then
+        deny_root="# even_deny_root / root_unlock_time: not set on Proxmox VE. The web UI login
+# (root@pam) uses this same PAM stack, so locking root would let anyone on the
+# network lock root out of both SSH and the web UI. Other users are still locked."
+    fi
     write_file 0644 /etc/security/faillock.conf <<EOF
 # Managed by ${SCRIPT_NAME} - temporary lockout (auto-unlocks; never permanent).
 dir = /var/run/faillock

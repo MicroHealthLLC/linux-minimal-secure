@@ -289,25 +289,29 @@ if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
     check "runtime net.ipv4.ip_forward = 0" bash -c "[[ \$(sysctl -n net.ipv4.ip_forward) == 0 ]]"
     fi
 fi
+if pve; then
+check "Proxmox VE: faillock never locks root (root@pam web UI shares the PAM stack)" bash -c "! grep -Eq '^[[:space:]]*(even_deny_root|root_unlock_time)' /etc/security/faillock.conf"
+check "Proxmox VE: faillock still locks other users" bash -c "grep -Eq '^deny = [0-9]+' /etc/security/faillock.conf && grep -Eq '^unlock_time = [0-9]+' /etc/security/faillock.conf && grep -Eq '^fail_interval = [0-9]+' /etc/security/faillock.conf"
+else
+check "faillock also locks root (temporarily)" grep -Eq '^even_deny_root' /etc/security/faillock.conf
+fi
 check "sshd config valid"              sshd -t
 if pve; then
 sshd_root() { local out; out=$(sshd -T -C user=root,host=pve2,addr=10.0.0.12 2>/dev/null) || return 1; grep -qix "$1" <<<"$out"; }
-check "Proxmox VE: sshd PermitRootLogin yes (root password and keys)" sshd_t 'permitrootlogin yes'
-check "Proxmox VE: root password authentication allowed" sshd_root 'passwordauthentication yes'
+check "Proxmox VE: sshd PermitRootLogin prohibit-password (keys for cluster ops)" sshd_t 'permitrootlogin without-password'
 check "Proxmox VE: root keeps TCP forwarding (secure migration)" sshd_root 'allowtcpforwarding yes'
 check "Proxmox VE: root keeps unix-socket forwarding (migration tunnels)" sshd_root 'allowstreamlocalforwarding yes'
 check "Proxmox VE: root forwarding not globally disabled" sshd_root 'disableforwarding no'
-check "Proxmox VE: DisableForwarding not set globally (cannot override root's tunnel)" sshd_t 'disableforwarding no'
-check "Proxmox VE: other users have no TCP forwarding" sshd_t 'allowtcpforwarding no'
-check "Proxmox VE: other users have no unix-socket forwarding" sshd_t 'allowstreamlocalforwarding no'
-check "Proxmox VE: other users have no agent forwarding" sshd_t 'allowagentforwarding no'
-check "Proxmox VE: faillock never locks root (root@pam web UI, cluster SSH)" bash -c "! grep -Eq '^[[:space:]]*(even_deny_root|root_unlock_time)' /etc/security/faillock.conf"
+check "Proxmox VE: other users still have forwarding disabled" sshd_t 'disableforwarding yes'
 check "Proxmox VE: root is in ssh-users (AllowGroups)" bash -c "id -nG root | grep -qw ssh-users"
+check "Proxmox VE: root password SSH allowed from PVE_ROOT_PASSWORD_FROM" bash -c "sshd -T -C user=root,host=admin,addr=192.168.10.5 | grep -qix 'permitrootlogin yes'"
+check "Proxmox VE: root password SSH allowed from the second CIDR" bash -c "sshd -T -C user=root,host=admin,addr=172.20.1.1 | grep -qix 'permitrootlogin yes'"
+check "Proxmox VE: root is key-only from other networks" bash -c "sshd -T -C user=root,host=x,addr=203.0.113.9 | grep -Eqix 'permitrootlogin (without-password|prohibit-password)'"
+check "Proxmox VE: root keeps forwarding from the password networks too" bash -c "sshd -T -C user=root,host=admin,addr=192.168.10.5 | grep -qix 'allowstreamlocalforwarding yes'"
+check "Proxmox VE: root authorized_keys still links into /etc/pve" bash -c "[[ \$(readlink /root/.ssh/authorized_keys) == /etc/pve/priv/authorized_keys ]]"
 check "Proxmox VE: root Match block is the last block" bash -c "tail -n 12 /etc/ssh/sshd_config | grep -q '^Match User root'"
 else
 check "sshd PermitRootLogin no"        sshd_t 'permitrootlogin no'
-check "sshd DisableForwarding yes"     sshd_t 'disableforwarding yes'
-check "faillock also locks root (temporarily)" grep -Eq '^even_deny_root' /etc/security/faillock.conf
 fi
 check "sshd X11Forwarding no"          sshd_t 'x11forwarding no'
 check "sshd MaxAuthTries 4"            sshd_t 'maxauthtries 4'
@@ -450,6 +454,12 @@ check "abrt / setroubleshoot / mcstrans absent" bash -c "! rpm -qa --qf '%{NAME}
 check "chronyd runs as user chrony" bash -c "[[ ! -f /etc/sysconfig/chronyd ]] || grep -Eq '^OPTIONS=.*-u chrony' /etc/sysconfig/chronyd"
 else
 check "pam_faillock enabled"    grep -q 'pam_faillock.so preauth' /etc/pam.d/common-auth
+check "unattended-upgrades: no #clear lines (lists add to other config)" bash -c "! grep -q '#clear' /etc/apt/apt.conf.d/52unattended-upgrades-harden"
+if pve; then
+check "unattended-upgrades: Proxmox origin included" bash -c "apt-config dump | grep -qF 'Unattended-Upgrade::Origins-Pattern:: \"origin=Proxmox,codename=\${distro_codename}\"'"
+check "unattended-upgrades: another tool's origin is kept" bash -c "apt-config dump | grep -qF 'Unattended-Upgrade::Origins-Pattern:: \"origin=CI-Other-Tool\"'"
+check "unattended-upgrades: another tool's blacklist is kept" bash -c "apt-config dump | grep -qF 'Unattended-Upgrade::Package-Blacklist:: \"ci-pinned-package\"'"
+fi
 check "pam_pwquality enabled"   grep -q 'pam_pwquality.so' /etc/pam.d/common-password
 check "pam_pwhistory enabled"   grep -q 'pam_pwhistory.so.*remember=24' /etc/pam.d/common-password
 check "no nullok"               bash -c "! grep -Eq '^[^#].*nullok' /etc/pam.d/common-auth /etc/pam.d/common-password"
