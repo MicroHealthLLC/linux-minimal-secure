@@ -528,7 +528,14 @@ fi
 # CI seeds a later profile.d file and root .bashrc line that also set TMOUT.
 LOGIN_SH=(env -i HOME=/root TERM=dumb PATH=/usr/sbin:/usr/bin:/sbin:/bin bash -lic)
 check "root login shell prints no 'TMOUT: readonly variable'" bash -c "! ${LOGIN_SH[*]} true 2>&1 </dev/null | grep -q 'readonly variable'"
-desktop || check "TMOUT stays 900 for a root login shell" bash -c "${LOGIN_SH[*]} 'echo TMOUT=\$TMOUT' 2>/dev/null </dev/null | grep -qx 'TMOUT=900'"
+if ! desktop; then
+    check "TMOUT stays 900 for a root login shell" bash -c "${LOGIN_SH[*]} 'echo TMOUT=\$TMOUT' 2>/dev/null </dev/null | grep -qx 'TMOUT=900'"
+    if ! bash -c "${LOGIN_SH[*]} 'echo TMOUT=\$TMOUT' 2>/dev/null </dev/null | grep -qx 'TMOUT=900'"; then
+        echo "    >>> login shell output: $("${LOGIN_SH[@]}" 'echo TMOUT=$TMOUT' 2>&1 </dev/null | tail -n 3 | tr '\n' '|' || true)"
+        echo "    >>> startup files and TMOUT lines (bash -x):"
+        { env -i HOME=/root TERM=dumb PATH=/usr/sbin:/usr/bin:/sbin:/bin bash -lixc true 2>&1 </dev/null | grep -E 'TMOUT|^\++ \. ' | head -40 | sed 's/^/        /'; } || true
+    fi
+fi
 if [[ $OS == ubuntu ]]; then
     check "TMOUT readonly+exported (POSIX form)" grep -Pzq 'TMOUT=[0-9]+\s+readonly TMOUT\s+export TMOUT' /etc/profile.d/60-harden.sh
 fi

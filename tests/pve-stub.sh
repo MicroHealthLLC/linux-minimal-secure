@@ -205,9 +205,10 @@ install -d -m 0700 /root/.ssh
 # As on a real node: root's authorized_keys is a link into the cluster file
 # system and always holds the other nodes' keys.
 install -d -m 0700 /etc/pve/priv
-ssh-keygen -q -t ed25519 -N "" -C root@pve2 -f /tmp/pve2_key
-install -m 0600 /tmp/pve2_key.pub /etc/pve/priv/authorized_keys
-rm -f /tmp/pve2_key /tmp/pve2_key.pub
+# (a fixed public key of another node; its private key was discarded and
+# ssh-keygen is not installed yet at this point)
+printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFeLrje+W9GzhuqM3BvrG6vcjTUgyHYZKC/V50+6hBTo root@pve2' >/etc/pve/priv/authorized_keys
+chmod 0600 /etc/pve/priv/authorized_keys
 ln -sf /etc/pve/priv/authorized_keys /root/.ssh/authorized_keys
 # Another tool's unattended-upgrades lists: the hardening must add to them.
 cat >/etc/apt/apt.conf.d/51ci-other-tool <<'EOF'
