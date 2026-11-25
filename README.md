@@ -209,6 +209,6 @@ tests/run-ci.sh rocky 9 k8s         # Podman + kubeadm node on the RHEL family
 * [docs/PLAN.md](docs/PLAN.md): analysis and implementation plan (Debian)
 * [docs/PLAN-UBUNTU.md](docs/PLAN-UBUNTU.md): analysis and implementation plan for Ubuntu 22.04 / 24.04 / 26.04
 * [docs/PLAN-RHEL.md](docs/PLAN-RHEL.md): analysis and implementation plan for the RHEL family and the linux-minimal-secure rename
-* [docs/PLAN-PROXMOX-CONTAINERS.md](docs/PLAN-PROXMOX-CONTAINERS.md): Proxmox VE nodes, container and Kubernetes hosts
+* [docs/PLAN-PROXMOX-CONTAINERS.md](docs/PLAN-PROXMOX-CONTAINERS.md) / [docs/GAP-ANALYSIS-PROXMOX-CONTAINERS.md](docs/GAP-ANALYSIS-PROXMOX-CONTAINERS.md): Proxmox VE nodes, container and Kubernetes hosts (plan and delivery)
 * [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md): deviations from CIS/ANSSI/STIG and the reason for each
 * [docs/GAP-ANALYSIS.md](docs/GAP-ANALYSIS.md) / [docs/GAP-ANALYSIS-UBUNTU.md](docs/GAP-ANALYSIS-UBUNTU.md) / [docs/GAP-ANALYSIS-RHEL.md](docs/GAP-ANALYSIS-RHEL.md): what was delivered against each plan

@@ -1182,11 +1182,14 @@ configure_repositories_pve() {
     done
     [[ -n $keyring ]] || die "Proxmox VE: no Proxmox archive keyring found (proxmox-archive-keyring); cannot configure the no-subscription repository safely"
     local -a ceph=()
-    # One-line format: comment out enterprise entries, remember Ceph releases.
+    # One-line format: comment out enterprise entries, remember Ceph releases
+    # (also from entries a previous run already disabled - re-runs must keep
+    # the Ceph no-subscription repository).
     for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
         [[ -f $f ]] || continue
+        grep -q 'enterprise\.proxmox\.com' "$f" || continue
+        while read -r c; do ceph+=("$c"); done < <(grep -Eo 'enterprise\.proxmox\.com/debian/ceph-[a-z]+' "$f" | grep -Eo 'ceph-[a-z]+$')
         grep -Eq '^[[:space:]]*deb[[:space:]].*enterprise\.proxmox\.com' "$f" || continue
-        while read -r c; do ceph+=("$c"); done < <(grep -Eo '^[[:space:]]*deb[[:space:]].*enterprise\.proxmox\.com/debian/(ceph-[a-z]+)' "$f" | grep -Eo 'ceph-[a-z]+$')
         backup_file "$f"
         sed -i -E 's@^([[:space:]]*deb[[:space:]].*enterprise\.proxmox\.com.*)$@# disabled by harden-and-audit (no Proxmox subscription, see harden-proxmox.sources): \1@' "$f"
         log "Proxmox VE: enterprise repository disabled in ${f}"

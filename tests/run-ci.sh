@@ -79,7 +79,8 @@ run_flags=(--detach --name "$NAME" --hostname "ci-${TAG}" --tmpfs /run --tmpfs /
            --cgroupns=private)
 # Container runtimes inside the test container need a real filesystem for
 # their storage (overlay on the container's own overlay root is refused).
-[[ $VARIANT == k8s ]] && run_flags+=(--volume /var/lib/docker --volume /var/lib/containers)
+# (Docker 29+ keeps image layers in containerd's snapshotter: /var/lib/containerd.)
+[[ $VARIANT == k8s ]] && run_flags+=(--volume /var/lib/docker --volume /var/lib/containerd --volume /var/lib/containers)
 if [[ $CI_PRIVILEGED == 1 ]]; then
     run_flags+=(--privileged)
 else
