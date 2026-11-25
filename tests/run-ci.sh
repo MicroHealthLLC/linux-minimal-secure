@@ -22,12 +22,12 @@
 # =============================================================================
 set -Eeuo pipefail
 
-usage() { echo "usage: tests/run-ci.sh <debian|ubuntu|rocky|almalinux|centos|fedora> <version> [desktop]   (or: tests/run-ci.sh <12|13>)" >&2; exit 64; }
+usage() { echo "usage: tests/run-ci.sh <debian|ubuntu|rocky|almalinux|centos|fedora> <version> [desktop|proxmox|k8s]   (or: tests/run-ci.sh <12|13>)" >&2; exit 64; }
 VARIANT=""
 case $# in
     1) DISTRO=debian; VER=$1 ;;
     2) DISTRO=$1; VER=$2 ;;
-    3) DISTRO=$1; VER=$2; VARIANT=$3; [[ $VARIANT == desktop ]] || usage ;;
+    3) DISTRO=$1; VER=$2; VARIANT=$3; [[ $VARIANT =~ ^(desktop|proxmox|k8s)$ ]] || usage ;;
     *) usage ;;
 esac
 FAMILY=deb
@@ -48,6 +48,8 @@ case $DISTRO in
         ;;
     *) usage ;;
 esac
+# Proxmox VE runs on Debian 12 (PVE 8) and 13 (PVE 9) only.
+[[ $VARIANT == proxmox && ! ( $DISTRO == debian && $VER =~ ^1[23]$ ) ]] && usage
 TAG="${DISTRO}${VER/./}${VARIANT}"      # debian12, ubuntu2404, fedora45desktop
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMG="dms-test:${TAG}"
@@ -69,11 +71,15 @@ mkdir -p "$OUT_DIR"
 
 log "building test image ${IMG}"
 docker build --build-arg "BASE_IMAGE=${BASE_IMAGE}" --build-arg "DESKTOP=$([[ $VARIANT == desktop ]] && echo 1 || echo 0)" \
+    --build-arg "VARIANT=$([[ $VARIANT =~ ^(proxmox|k8s)$ ]] && echo "$VARIANT")" \
     -f "${REPO}/tests/${DOCKERFILE}" -t "$IMG" "${REPO}/tests"
 
 cleanup
 run_flags=(--detach --name "$NAME" --hostname "ci-${TAG}" --tmpfs /run --tmpfs /run/lock
            --cgroupns=private)
+# Container runtimes inside the test container need a real filesystem for
+# their storage (overlay on the container's own overlay root is refused).
+[[ $VARIANT == k8s ]] && run_flags+=(--volume /var/lib/docker --volume /var/lib/containers)
 if [[ $CI_PRIVILEGED == 1 ]]; then
     run_flags+=(--privileged)
 else
@@ -112,7 +118,9 @@ docker exec -e FAMILY="$FAMILY" "$NAME" bash -euo pipefail -c '
     if [ "$FAMILY" = rhel ]; then
         dnf -y -q install openssh-clients >/dev/null
     else
-        apt-get update -qq >/dev/null
+        # Proxmox look-alike: the enterprise repository answers 401 until the
+        # script switches to no-subscription, so this update may fail.
+        apt-get update -qq >/dev/null 2>&1 || true
         apt-get install -y -qq --no-install-recommends openssh-client >/dev/null
     fi
     install -d -m 0700 -o ciadmin -g ciadmin /home/ciadmin/.ssh
@@ -132,6 +140,7 @@ run_script() {
         -e SCAP_ENFORCE_MIN=0 \
         -e AIDE_INIT="${AIDE_INIT:-1}" \
         -e PROGRESS_INTERVAL=10 \
+        -e PVE_FIREWALL_ENABLE="$([[ $VARIANT == proxmox ]] && echo 1 || echo 0)" \
         "$NAME" bash /src/harden-and-audit.sh 2>&1 | tee "${OUT_DIR}/harden-${label}.log"
     local rc=${PIPESTATUS[0]}
     set -e
@@ -191,6 +200,8 @@ case $DISTRO in
     fedora)    os_label="Fedora ${VER}" ;;
 esac
 [[ $VARIANT == desktop ]] && os_label+=" desktop"
+[[ $VARIANT == proxmox ]] && os_label="Proxmox VE $([[ $VER == 12 ]] && echo 8 || echo 9) (${os_label})"
+[[ $VARIANT == k8s ]] && os_label+=" + containers/Kubernetes"
 profile_label() {
     case $1 in
         anssi_bp28_high) echo "ANSSI BP-028 High" ;;

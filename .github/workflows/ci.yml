@@ -47,7 +47,7 @@ jobs:
       - name: shellcheck
         run: |
           docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d \
-            -x --severity=warning harden-and-audit.sh tests/run-ci.sh tests/assertions.sh tests/container-init.sh
+            -x --severity=warning harden-and-audit.sh tests/run-ci.sh tests/assertions.sh tests/container-init.sh tests/pve-stub.sh tests/k8s-stub.sh
 
   harden-and-scan:
     name: ${{ matrix.distro }} ${{ matrix.version }} ${{ matrix.variant }} - harden + SCAP
@@ -60,6 +60,10 @@ jobs:
         include:
           - { distro: debian, version: "12",    tag: debian12 }
           - { distro: debian, version: "13",    tag: debian13 }
+          - { distro: debian, version: "12",    tag: debian12proxmox, variant: proxmox }
+          - { distro: debian, version: "13",    tag: debian13proxmox, variant: proxmox }
+          - { distro: ubuntu, version: "24.04", tag: ubuntu2404k8s, variant: k8s }
+          - { distro: rocky,  version: "9",     tag: rocky9k8s, variant: k8s }
           - { distro: ubuntu, version: "22.04", tag: ubuntu2204 }
           - { distro: ubuntu, version: "24.04", tag: ubuntu2404 }
           - { distro: ubuntu, version: "26.04", tag: ubuntu2604 }

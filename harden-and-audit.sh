@@ -10,6 +10,10 @@
 #                  Fedora 41+ (server and desktop)
 # Desktops (a display manager is installed) keep their graphical session,
 # printing, Bluetooth, USB storage and network discovery: DESKTOP_MODE.
+# Proxmox VE 8/9 nodes keep root SSH, pve-firewall, guest storage and their
+# repositories working (PROXMOX_MODE). Docker/containerd/Podman hosts and
+# Kubernetes nodes keep container networking and cluster traffic working
+# (ALLOW_CONTAINERS, KUBERNETES_MODE); all three are detected automatically.
 #
 # Design rules (in priority order):
 #   1. Never lock the operator out. Anti-lockout checks run BEFORE anything
@@ -26,7 +30,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly SCRIPT_VERSION="2.1.3"
+readonly SCRIPT_VERSION="2.2.0"
 readonly SCRIPT_NAME="harden-and-audit.sh"
 readonly LOG_FILE="/var/log/harden-and-audit.log"
 readonly STATE_DIR="/var/lib/harden-and-audit"
@@ -62,13 +66,22 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${SSH_LOGLEVEL:=}"                # empty = INFO (Debian family CIS) / VERBOSE (EL CIS: logs key fingerprints)
 : "${FAILLOCK_DENY:=4}"
 : "${FAILLOCK_UNLOCK_TIME:=900}"
-: "${ALLOW_CONTAINERS:=0}"           # 1 keeps overlayfs + IPv4 forwarding for Docker/Podman hosts
+: "${ALLOW_CONTAINERS:=auto}"        # auto|0|1 - keep overlayfs, IP forwarding and routed traffic for containers (auto: Docker/containerd/Podman/Kubernetes found)
+: "${KUBERNETES_MODE:=auto}"        # auto|0|1 - Kubernetes node: open cluster/CNI ports, trust pod networks (auto: kubelet/k3s/rke2/k0s/microk8s found)
+: "${K8S_TRUSTED_CIDRS:=}"          # node/pod/service CIDRs allowed to reach the cluster ports (empty = cluster ports open to any source)
+: "${K8S_EXTRA_PORTS:=}"            # extra inbound ports on Kubernetes nodes, e.g. "9100/tcp 7946/udp"
 : "${KEEP_IPV6_RA:=auto}"            # auto|0|1 - keep IPv6 router advertisements (SLAAC)
 : "${UFW_OUTBOUND_POLICY:=allow}"    # allow|deny (deny adds an explicit egress allow-list)
 : "${UFW_EXTRA_OUT:=}"               # extra egress rules for deny mode, e.g. "514/tcp 636/tcp"
 : "${FIREWALL_OUTBOUND_POLICY:=${UFW_OUTBOUND_POLICY}}"  # generic name (UFW and firewalld)
 : "${FIREWALL_EXTRA_OUT:=${UFW_EXTRA_OUT}}"
 : "${DESKTOP_MODE:=auto}"           # auto|0|1 - 1 keeps the desktop experience (auto: a display manager is installed)
+: "${PROXMOX_MODE:=auto}"           # auto|0|1 - Proxmox VE node (auto: pve-manager is installed)
+: "${PVE_ROOT_SSH:=auto}"           # auto|yes|prohibit-password - root SSH on Proxmox VE (auto: keys only if a sudo admin exists)
+: "${PVE_REPO:=auto}"               # auto|enterprise|no-subscription|keep - Proxmox repositories (auto: by subscription status)
+: "${PVE_FIREWALL_ENABLE:=0}"       # 1 = turn the Proxmox datacenter firewall on (SSH + web UI allowed first)
+: "${PVE_FIREWALL_MGMT_SOURCE:=}"   # source CIDR(s) allowed to SSH/8006 when enabling (empty = any)
+: "${PVE_KERNEL_FIPS:=0}"           # 1 = also boot a Proxmox VE kernel with fips=1 (not supported by Proxmox)
 : "${EPEL_ENABLE:=1}"                # RHEL family: EPEL provides fail2ban, dkms and some media libraries
 : "${FAIL2BAN_IGNOREIP:=}"           # space separated CIDRs never banned (jump hosts)
 : "${SSH_DISABLE_PASSWORD:=0}"       # 1 forces key-only SSH (only if every admin has a key)
@@ -117,6 +130,13 @@ SSG_PRODUCT=""      # debian12, ubuntu2404, rl9, almalinux9, cs10, rhel9 ...
 DEB_ARCH=""         # amd64 | arm64 ... (dpkg names, also used on the RHEL family)
 ADMIN_GROUP=sudo    # sudo (Debian family) | wheel (RHEL family)
 DESKTOP=0           # 1 = desktop mode (resolved from DESKTOP_MODE in preflight)
+PVE=0               # 1 = Proxmox VE node (resolved from PROXMOX_MODE in preflight)
+PVE_VERSION=""      # e.g. 8.4.1
+ROOT_SSH=no         # effective PermitRootLogin (yes|prohibit-password on Proxmox VE)
+K8S=0               # 1 = Kubernetes node (resolved from KUBERNETES_MODE in preflight)
+K8S_DISTRO=""       # kubeadm | k3s | rke2 | k0s | microk8s
+K8S_CONTROL=0       # 1 = control-plane node (API server / etcd run here)
+CONTAINER_RUNTIMES=""
 DNF5=0              # 1 = dnf is dnf5 (Fedora 41+)
 SSH_UNIT=ssh        # ssh (Debian family) | sshd (RHEL family)
 SSH_PORTS=()
@@ -291,6 +311,116 @@ is_debian() { [[ $OS_ID == debian ]]; }
 is_rhel()   { [[ $OS_FAMILY == rhel ]]; }
 is_fedora() { [[ $OS_ID == fedora ]]; }
 is_desktop() { [[ $DESKTOP == 1 ]]; }
+is_pve()     { [[ $PVE == 1 ]]; }
+is_k8s()     { [[ $K8S == 1 ]]; }
+containers_on() { [[ $ALLOW_CONTAINERS == 1 ]]; }
+
+# Container runtimes in use (space separated): docker, containerd, podman.
+# Podman counts only when it runs rootful containers or its API socket is on
+# (rootless Podman needs neither forwarding nor routed firewall traffic).
+container_runtimes_detected() {
+    local -a rt=()
+    { command -v dockerd || [[ -e /var/lib/docker ]]; } >/dev/null 2>&1 && rt+=(docker)
+    { command -v containerd || [[ -e /var/lib/containerd ]]; } >/dev/null 2>&1 && rt+=(containerd)
+    if command -v podman >/dev/null 2>&1; then
+        if systemctl is-enabled --quiet podman.socket 2>/dev/null \
+            || [[ -n $(podman ps -aq 2>/dev/null) ]] \
+            || compgen -G '/etc/containers/systemd/*.container' >/dev/null; then
+            rt+=(podman)
+        fi
+    fi
+    echo "${rt[*]}"
+}
+
+# Kubernetes distribution on this node (empty = none).
+k8s_detected() {
+    if command -v k3s >/dev/null 2>&1 || [[ -d /etc/rancher/k3s ]]; then echo k3s; return; fi
+    if command -v rke2 >/dev/null 2>&1 || [[ -d /etc/rancher/rke2 ]]; then echo rke2; return; fi
+    if command -v k0s >/dev/null 2>&1 || [[ -d /etc/k0s ]]; then echo k0s; return; fi
+    if [[ -d /var/snap/microk8s ]]; then echo microk8s; return; fi
+    if command -v kubelet >/dev/null 2>&1 || [[ -f /var/lib/kubelet/config.yaml || -f /etc/kubernetes/kubelet.conf ]]; then
+        echo kubeadm; return
+    fi
+}
+
+k8s_control_plane_detected() {
+    [[ -f /etc/kubernetes/manifests/kube-apiserver.yaml ]] && return 0
+    systemctl list-unit-files --no-legend k3s.service rke2-server.service k0scontroller.service 2>/dev/null | qgrep . && return 0
+    [[ -d /var/snap/microk8s ]] && return 0
+    return 1
+}
+
+# Network interfaces created by container runtimes and CNI plugins (iptables
+# wildcard form): pods and containers reach node services through them.
+CNI_IFACES=(cni0 flannel.1 flannel-wg cali+ vxlan.calico tunl0 cilium_+ lxc+ weave vxlan-+ kube-bridge kube-ipvs0 genev_sys_+ docker0 br-+ podman+)
+
+# Pod and service CIDRs of the local cluster (best effort): kubeadm manifests,
+# k3s/rke2 configuration (or their defaults), flannel, routes over CNI links.
+k8s_cluster_cidrs() {
+    local f
+    {
+        for f in /etc/kubernetes/manifests/kube-controller-manager.yaml /etc/kubernetes/manifests/kube-apiserver.yaml; do
+            [[ -f $f ]] && sed -n -E 's/.*--(cluster-cidr|service-cluster-ip-range)=([^"[:space:]]+).*/\2/p' "$f" | tr ',' '\n'
+        done
+        for f in /etc/rancher/k3s/config.yaml /etc/rancher/rke2/config.yaml; do
+            [[ -f $f ]] && sed -n -E 's/^[[:space:]]*(cluster-cidr|service-cidr):[[:space:]]*"?([^"[:space:]]+)"?.*/\2/p' "$f" | tr ',' '\n'
+        done
+        case $K8S_DISTRO in
+            k3s|rke2) printf '10.42.0.0/16\n10.43.0.0/16\n' ;;
+            k0s) printf '10.244.0.0/16\n10.96.0.0/12\n' ;;
+            microk8s) printf '10.1.0.0/16\n10.152.183.0/24\n' ;;
+        esac
+        [[ -f /run/flannel/subnet.env ]] && sed -n 's/^FLANNEL_NETWORK=//p' /run/flannel/subnet.env
+        ip -4 route show 2>/dev/null | awk '$1 ~ /^[0-9.]+\/[0-9]+$/ && $0 ~ / dev (cni0|flannel\.1|cali|vxlan\.calico|tunl0|cilium_|weave|kube-bridge)/ {print $1}'
+    } | awk 'NF' | sort -u
+}
+
+# Proxmox VE: pve-manager (the node's management stack) is installed.
+pve_detected() {
+    pkg_installed pve-manager || [[ -x /usr/bin/pveversion && -d /etc/pve ]]
+}
+
+# Guest storage on a Proxmox VE node: container root filesystems, VM disks,
+# backups, ISO/template stores and Ceph data belong to the guests, not to
+# this host - permission sweeps, setuid discovery and AIDE stay out of them.
+PVE_GUEST_PATH_RE='^(/var/lib/(vz|lxc|ceph)|/mnt/pve)(/|$)|/(subvol|basevol)-[0-9]+-disk-[0-9]+(/|$)'
+
+# pve_storage_paths - directory-backed storage paths from storage.cfg.
+pve_storage_paths() {
+    [[ -r /etc/pve/storage.cfg ]] || return 0
+    awk '/^[a-z0-9]+:/ { t = $1 } /^[[:space:]]+path[[:space:]]/ && t ~ /^(dir|btrfs|nfs|cifs|cephfs|glusterfs):$/ && $2 != "/" { print $2 }' \
+        /etc/pve/storage.cfg
+}
+
+# Container runtime storage: image layers and running containers' root
+# filesystems (overlay mounts) belong to the workloads, never to the host.
+CONTAINER_PATH_RE='^(/var/lib/(docker|containerd|containers|kubelet|rancher|k0s|longhorn|etcd)|/run/(containerd|k3s|docker|netns)|/var/snap/microk8s|/var/openebs)(/|$)'
+
+# host_fs_mounts FSTYPE_REGEX - local mount points to scan: never container
+# storage, and on Proxmox VE never guest storage.
+host_fs_mounts() {
+    local -a m=() all
+    local t
+    mapfile -t all < <(findmnt -rn -o TARGET,FSTYPE | awk -v re="$1" '$2 ~ re {print $1}' | sort -u)
+    for t in "${all[@]}"; do
+        [[ $t =~ $CONTAINER_PATH_RE ]] || m+=("$t")
+    done
+    if is_pve; then
+        local p skip
+        local -a paths
+        mapfile -t paths < <(pve_storage_paths)
+        for p in "${m[@]}"; do
+            [[ $p =~ $PVE_GUEST_PATH_RE ]] && continue
+            skip=0
+            local s
+            for s in "${paths[@]}"; do [[ $p == "$s" || $p == "$s"/* ]] && skip=1; done
+            [[ $skip == 1 ]] || printf '%s\n' "$p"
+        done
+    else
+        [[ ${#m[@]} -gt 0 ]] && printf '%s\n' "${m[@]}"
+    fi
+    return 0
+}
 
 # A display manager (GDM, SDDM, LightDM, ...) is installed or configured.
 desktop_detected() {
@@ -582,7 +712,37 @@ preflight_os() {
         0) DESKTOP=0 ;;
         *) if desktop_detected; then DESKTOP=1; fi ;;
     esac
+    if [[ $OS_ID == debian ]]; then
+        case $PROXMOX_MODE in
+            1) PVE=1 ;;
+            0) PVE=0 ;;
+            *) if pve_detected; then PVE=1; fi ;;
+        esac
+    elif [[ $PROXMOX_MODE == 1 ]]; then
+        die "PROXMOX_MODE=1 but this is ${OS_ID}: Proxmox VE runs on Debian only"
+    fi
+    if is_pve; then
+        PVE_VERSION=$(pveversion 2>/dev/null | sed -n -E 's#^pve-manager/([0-9][0-9.]*).*#\1#p' | head -n1)
+        OS_NAME="Proxmox VE ${PVE_VERSION:-(version unknown)} on ${OS_NAME}"
+    fi
     if is_rhel && dnf --version 2>/dev/null | head -n1 | qgrep -i dnf5; then DNF5=1; fi
+    # Container and Kubernetes hosts: resolved before any change is made, so
+    # forwarding, overlayfs, routed firewall traffic and cluster ports survive.
+    CONTAINER_RUNTIMES=$(container_runtimes_detected)
+    case $KUBERNETES_MODE in
+        1) K8S=1; K8S_DISTRO=$(k8s_detected); K8S_DISTRO=${K8S_DISTRO:-kubeadm} ;;
+        0) K8S=0 ;;
+        *) K8S_DISTRO=$(k8s_detected); [[ -n $K8S_DISTRO ]] && K8S=1 ;;
+    esac
+    if is_k8s && k8s_control_plane_detected; then K8S_CONTROL=1; fi
+    case $ALLOW_CONTAINERS in
+        1|0) ;;
+        *) if is_k8s || [[ -n $CONTAINER_RUNTIMES ]]; then ALLOW_CONTAINERS=1; else ALLOW_CONTAINERS=0; fi ;;
+    esac
+    if is_k8s && [[ $ALLOW_CONTAINERS != 1 ]]; then
+        warn "ALLOW_CONTAINERS=0 on a Kubernetes node would cut pod networking: kept at 1"
+        ALLOW_CONTAINERS=1
+    fi
     if [[ -z $SCAP_PROFILE ]]; then
         if is_desktop; then
             if is_rhel; then SCAP_PROFILE=cis_workstation_l2; else SCAP_PROFILE=cis_level2_workstation; fi
@@ -611,6 +771,15 @@ preflight_os() {
     if is_desktop; then
         log "desktop mode: the graphical session, printing, Bluetooth, USB storage, network discovery and toolbox/podman stay (DESKTOP_MODE=0 hardens it as a server)"
     fi
+    if is_pve; then
+        log "Proxmox VE mode: root keeps SSH (cluster/migration), pve-firewall stays the firewall (no UFW), guest storage, IP forwarding, NFS/rpcbind and Proxmox repositories are respected (PROXMOX_MODE=0 disables)"
+    fi
+    if containers_on; then
+        log "container host (${CONTAINER_RUNTIMES:-runtime not installed yet}): overlayfs, IP forwarding and routed container traffic are kept; container storage is never scanned or modified (ALLOW_CONTAINERS=0 disables)"
+    fi
+    if is_k8s; then
+        log "Kubernetes node (${K8S_DISTRO}, $( ((K8S_CONTROL)) && echo control plane || echo worker)): cluster and CNI ports stay open, pod networks are trusted, rp_filter is loose, SELinux mode is not raised (KUBERNETES_MODE=0 disables)"
+    fi
 }
 
 # Interactive accounts that may log in (UID >= UID_MIN, real shell, not locked).
@@ -620,7 +789,12 @@ interactive_users() {
 
 preflight_admin() {
     step "preflight: anti-lockout administrator check"
+    ROOT_SSH=no
     if [[ $HARDEN_SKIP_ADMIN_CHECK == 1 ]]; then
+        if is_pve; then
+            pve_root_ssh 0
+            return 0
+        fi
         warn "HARDEN_SKIP_ADMIN_CHECK=1: root SSH login will be disabled without verifying another administrator exists"
         return 0
     fi
@@ -638,7 +812,10 @@ preflight_admin() {
             ok=1
         fi
     done
-    if [[ $ok -ne 1 ]]; then
+    if is_pve; then
+        # Root must keep SSH on a Proxmox VE node, so no lockout is possible.
+        pve_root_ssh "$ok"
+    elif [[ $ok -ne 1 ]]; then
         die "no non-root member of group '${ADMIN_GROUP}' with an SSH key or password exists. Root SSH login is about to be disabled, which would lock you out. Create one first, e.g.: useradd -m admin && passwd admin && usermod -aG ${ADMIN_GROUP} admin"
     fi
     if [[ $SSH_DISABLE_PASSWORD == 1 ]]; then
@@ -648,6 +825,28 @@ preflight_admin() {
             [[ -s ${home}/.ssh/authorized_keys ]] || die "SSH_DISABLE_PASSWORD=1 but ${ADMIN_GROUP} user '${u}' has no authorized_keys"
         done
     fi
+}
+
+# pve_root_ssh ADMIN_OK - effective PermitRootLogin on Proxmox VE. Cluster
+# join, live/secure migration, replication, the node shell and console
+# proxying all run as root over SSH between nodes (key based), and root@pam
+# is the web UI's built-in administrator, so root is never disabled.
+pve_root_ssh() {
+    case $PVE_ROOT_SSH in
+        yes|prohibit-password) ROOT_SSH=$PVE_ROOT_SSH ;;
+        auto) if [[ $1 == 1 ]]; then ROOT_SSH=prohibit-password; else ROOT_SSH=yes; fi ;;
+        *) die "PVE_ROOT_SSH must be auto, yes or prohibit-password (got '${PVE_ROOT_SSH}')" ;;
+    esac
+    log "Proxmox VE: root SSH login stays enabled (PermitRootLogin ${ROOT_SSH}); cluster, migration and replication use root keys"
+    if [[ $ROOT_SSH == yes ]]; then
+        warn "Proxmox VE: no non-root ${ADMIN_GROUP} administrator with a key or password, so root keeps SSH password login (PermitRootLogin yes). Add one to restrict root to keys (PVE_ROOT_SSH=prohibit-password)"
+    fi
+    if [[ $SSH_DISABLE_PASSWORD == 1 || $ROOT_SSH == prohibit-password ]] && [[ ! -s /root/.ssh/authorized_keys ]]; then
+        warn "Proxmox VE: root has no authorized_keys - root SSH (and therefore cluster operations) needs keys; the web UI and console are unaffected"
+    fi
+    local hash
+    hash=$(getent shadow root | cut -d: -f2)
+    [[ $hash == \$* ]] || warn "Proxmox VE: root has no usable password - the web UI login root@pam will not work"
 }
 
 detect_ssh_ports() {
@@ -789,7 +988,9 @@ purge_graphical() {
         systemctl set-default multi-user.target >/dev/null
         return 0
     fi
-    apt-get "${APT_LOCK_WAIT[@]}" autoremove --purge -y -q
+    # Proxmox VE: no autoremove - kernels pinned with proxmox-boot-tool can be
+    # marked automatic, and removing them changes what the node boots.
+    is_pve || apt-get "${APT_LOCK_WAIT[@]}" autoremove --purge -y -q
     local -a residual
     mapfile -t residual < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1=="rc"{print $2}')
     if [[ ${#residual[@]} -gt 0 ]]; then
@@ -814,6 +1015,9 @@ purge_insecure_services() {
     for p in "${legacy[@]}"; do
         # Desktops print, discover printers/shares and use Bluetooth devices.
         if is_desktop && [[ $p =~ ^(cups.*|avahi.*|bluez)$ ]]; then continue; fi
+        # Proxmox VE: rpcbind serves NFSv3 storage (nfs-common), dnsmasq the
+        # SDN DHCP; both are dependencies of the management stack.
+        if is_pve && [[ $p =~ ^(rpcbind|dnsmasq)$ ]]; then continue; fi
         pkg_installed "$p" && present+=("$p")
     done
     if [[ ${#present[@]} -gt 0 ]]; then
@@ -822,7 +1026,11 @@ purge_insecure_services() {
         log "no legacy network services installed"
     fi
     # rsync is a common admin tool: keep the client but never run the daemon.
-    if is_desktop; then
+    if is_pve; then
+        log "Proxmox VE: rpcbind stays available for NFS storage"
+        disable_service rsync.service bluetooth.service avahi-daemon.service avahi-daemon.socket cups.service \
+            cups.socket nfs-server.service snmpd.service
+    elif is_desktop; then
         disable_service rsync.service rpcbind.service rpcbind.socket nfs-server.service snmpd.service
     else
         disable_service rsync.service bluetooth.service avahi-daemon.service avahi-daemon.socket cups.service \
@@ -903,6 +1111,9 @@ configure_repositories() {
         return 0
     fi
     step "2.1 official Debian repositories (stable, -updates, -security)"
+    # Proxmox VE first: an enterprise repository without a subscription key
+    # answers 401 and makes every "apt-get update" fail.
+    is_pve && configure_repositories_pve
     apt_update
     apt_install ca-certificates debian-archive-keyring
     local keyring=/usr/share/keyrings/debian-archive-keyring.pgp
@@ -929,6 +1140,96 @@ EOF
         sed -i -E 's/^([[:space:]]*deb(-src)?[[:space:]]+cdrom:)/# disabled by harden-and-audit: \1/' /etc/apt/sources.list
     fi
     apt_update
+}
+
+pve_subscription_active() {
+    command -v pvesubscription >/dev/null 2>&1 || return 1
+    pvesubscription get 2>/dev/null | grep -Eiq '^[[:space:]]*status:[[:space:]]*active'
+}
+
+# Proxmox VE repositories. The enterprise repositories (PVE and Ceph) need a
+# subscription; without one the node gets no updates at all and apt-get
+# update fails. auto: keep enterprise with an active subscription, else
+# switch to the matching no-subscription repositories (Proxmox's own
+# recommendation for nodes without a subscription). Signed by the same key.
+configure_repositories_pve() {
+    local mode=$PVE_REPO f keyring="" c
+    case $mode in auto|enterprise|no-subscription|keep) ;; *) die "PVE_REPO must be auto, enterprise, no-subscription or keep" ;; esac
+    if [[ $mode == keep ]]; then
+        log "Proxmox VE: repositories left as configured (PVE_REPO=keep)"
+        return 0
+    fi
+    if [[ $mode == auto ]]; then
+        if pve_subscription_active; then mode=enterprise; else mode=no-subscription; fi
+    fi
+    if [[ $mode == enterprise ]]; then
+        log "Proxmox VE: enterprise repositories kept (subscription active or PVE_REPO=enterprise)"
+        return 0
+    fi
+    for f in /usr/share/keyrings/proxmox-archive-keyring.gpg /etc/apt/trusted.gpg.d/proxmox-release-"${OS_CODENAME}".gpg /etc/apt/trusted.gpg.d/proxmox-*.gpg; do
+        [[ -f $f ]] && { keyring=$f; break; }
+    done
+    [[ -n $keyring ]] || die "Proxmox VE: no Proxmox archive keyring found (proxmox-archive-keyring); cannot configure the no-subscription repository safely"
+    local -a ceph=()
+    # One-line format: comment out enterprise entries, remember Ceph releases.
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [[ -f $f ]] || continue
+        grep -Eq '^[[:space:]]*deb[[:space:]].*enterprise\.proxmox\.com' "$f" || continue
+        while read -r c; do ceph+=("$c"); done < <(grep -Eo '^[[:space:]]*deb[[:space:]].*enterprise\.proxmox\.com/debian/(ceph-[a-z]+)' "$f" | grep -Eo 'ceph-[a-z]+$')
+        backup_file "$f"
+        sed -i -E 's@^([[:space:]]*deb[[:space:]].*enterprise\.proxmox\.com.*)$@# disabled by harden-and-audit (no Proxmox subscription, see harden-proxmox.sources): \1@' "$f"
+        log "Proxmox VE: enterprise repository disabled in ${f}"
+    done
+    # deb822: "Enabled: no" in every stanza that points at the enterprise server.
+    for f in /etc/apt/sources.list.d/*.sources; do
+        [[ -f $f && $f != */harden-proxmox.sources ]] || continue
+        grep -q 'enterprise\.proxmox\.com' "$f" || continue
+        while read -r c; do ceph+=("$c"); done < <(grep -Eo 'enterprise\.proxmox\.com/debian/ceph-[a-z]+' "$f" | grep -Eo 'ceph-[a-z]+$')
+        if awk 'BEGIN { RS = ""; bad = 0 } /enterprise\.proxmox\.com/ && !/(^|\n)Enabled:[[:space:]]*no/ { bad = 1 } END { exit !bad }' "$f"; then
+            backup_file "$f"
+            awk 'BEGIN { RS = ""; ORS = "\n\n" } /enterprise\.proxmox\.com/ { gsub(/(^|\n)Enabled:[^\n]*/, ""); sub(/^\n/, ""); $0 = $0 "\nEnabled: no" } { print }' "$f" >"${f}.harden.tmp"
+            cat "${f}.harden.tmp" >"$f"
+            rm -f "${f}.harden.tmp"
+            log "Proxmox VE: enterprise repository disabled in ${f}"
+        fi
+    done
+    # Existing enabled no-subscription entries are not duplicated.
+    local have_pve=0 enabled
+    enabled=$(apt_enabled_sources)
+    grep -Eq 'download\.proxmox\.com/debian/pve[[:space:]].*pve-no-subscription' <<<"$enabled" && have_pve=1
+    {
+        echo "# Managed by ${SCRIPT_NAME} - Proxmox VE ${OS_CODENAME} without a subscription."
+        echo "# Set PVE_REPO=enterprise (or buy a subscription and re-run) for the enterprise repositories."
+        if [[ $have_pve == 0 ]]; then
+            printf '\nTypes: deb\nURIs: http://download.proxmox.com/debian/pve\nSuites: %s\nComponents: pve-no-subscription\nSigned-By: %s\n' "$OS_CODENAME" "$keyring"
+        fi
+        local r
+        for r in $(printf '%s\n' "${ceph[@]}" | sort -u); do
+            grep -Eq "download\.proxmox\.com/debian/${r}[[:space:]].*no-subscription" <<<"$enabled" && continue
+            printf '\nTypes: deb\nURIs: http://download.proxmox.com/debian/%s\nSuites: %s\nComponents: no-subscription\nSigned-By: %s\n' "$r" "$OS_CODENAME" "$keyring"
+        done
+    } | write_file 0644 /etc/apt/sources.list.d/harden-proxmox.sources
+    log "Proxmox VE: no subscription - using the pve-no-subscription repository$( [[ ${#ceph[@]} -gt 0 ]] && echo " and Ceph no-subscription")"
+}
+
+# Enabled apt entries as "URI suite components" lines (one-line and deb822).
+apt_enabled_sources() {
+    local f
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [[ -f $f ]] && awk '$1 == "deb" { $1 = ""; sub(/\[[^]]*\][[:space:]]*/, ""); print }' "$f"
+    done
+    for f in /etc/apt/sources.list.d/*.sources; do
+        [[ -f $f && $f != */harden-proxmox.sources ]] || continue
+        awk 'BEGIN { RS = "" } !/(^|\n)Enabled:[[:space:]]*no/ {
+            u = ""; su = ""; c = ""
+            n = split($0, l, "\n")
+            for (i = 1; i <= n; i++) {
+                if (l[i] ~ /^URIs:/) { u = l[i]; sub(/^URIs:[[:space:]]*/, "", u) }
+                if (l[i] ~ /^Suites:/) { su = l[i]; sub(/^Suites:[[:space:]]*/, "", su) }
+                if (l[i] ~ /^Components:/) { c = l[i]; sub(/^Components:[[:space:]]*/, "", c) }
+            }
+            print u, su, c }' "$f"
+    done
 }
 
 # current_ubuntu_mirror SUITE - print the first enabled, configured Ubuntu
@@ -1099,6 +1400,12 @@ install_base_stack() {
         procps iproute2 kmod e2fsprogs)
     local opt
     opt=$(first_available libpam-apparmor) && pkgs+=("$opt")
+    # Proxmox VE: pve-firewall owns netfilter; UFW would fight it.
+    if is_pve; then
+        local -a nf=()
+        for opt in "${pkgs[@]}"; do [[ $opt == ufw ]] || nf+=("$opt"); done
+        pkgs=("${nf[@]}")
+    fi
     if pkg_installed chrony; then
         log "chrony is installed - it stays the time synchronisation service"
     else
@@ -1528,9 +1835,10 @@ EOF
     fi
     # Privileged (setuid/setgid) commands on every local filesystem.
     local -a mounts files
-    mapfile -t mounts < <(findmnt -rn -o TARGET,FSTYPE | awk '$2 ~ /^(ext[234]|xfs|btrfs|overlay|zfs|f2fs|jfs|reiserfs)$/ {print $1}' | sort -u)
+    # Never container layers or guest storage: their setuid files are not the host's.
+    mapfile -t mounts < <(host_fs_mounts '^(ext[234]|xfs|btrfs|overlay|zfs|f2fs|jfs|reiserfs)$')
     [[ ${#mounts[@]} -eq 0 ]] && mounts=(/)
-    mapfile -t files < <(for m in "${mounts[@]}"; do find "$m" -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null || true; done | sort -u)
+    mapfile -t files < <(for m in "${mounts[@]}"; do find "$m" -xdev \( -regextype posix-extended -regex "$CONTAINER_PATH_RE" -o -regex "$(is_pve && echo "$PVE_GUEST_PATH_RE" || echo '^$')" \) -prune -o -type f \( -perm -4000 -o -perm -2000 \) -print 2>/dev/null || true; done | sort -u)
     {
         echo "## Managed by ${SCRIPT_NAME} - generated $(ts): setuid/setgid binaries"
         local f
@@ -1622,6 +1930,11 @@ configure_grub() {
         configure_grub_rhel
         return 0
     fi
+    # Proxmox VE on ZFS/UEFI boots with systemd-boot through proxmox-boot-tool:
+    # its command line is /etc/kernel/cmdline, synced to every ESP on refresh.
+    if is_pve && [[ -f /etc/kernel/cmdline ]]; then
+        pve_kernel_cmdline
+    fi
     if [[ ! -f /etc/default/grub ]]; then
         warn "GRUB is not installed (/etc/default/grub missing): kernel arguments (fips=1, audit=1, ...) must be set in this host's bootloader manually"
         return 0
@@ -1635,7 +1948,11 @@ configure_grub() {
     if kernel_fips_ok; then
         grub_set_args GRUB_CMDLINE_LINUX_DEFAULT fips=1
     else
-        log "desktop mode: kernel FIPS mode (fips=1) not set (it breaks Wi-Fi/Bluetooth algorithms); user-space FIPS provider stays"
+        if is_pve; then
+            log "Proxmox VE: kernel FIPS mode (fips=1) not set (unsupported by Proxmox; PVE_KERNEL_FIPS=1 forces it); user-space FIPS provider stays"
+        else
+            log "desktop mode: kernel FIPS mode (fips=1) not set (it breaks Wi-Fi/Bluetooth algorithms); user-space FIPS provider stays"
+        fi
         sed -i -E 's/(^GRUB_CMDLINE_LINUX(_DEFAULT)?="[^"]*)\bfips=1\b ?/\1/' /etc/default/grub
     fi
     grub_set_args GRUB_CMDLINE_LINUX "${kargs[@]}"
@@ -1732,6 +2049,9 @@ EOF
     else
         warn "update-grub not found; regenerate the GRUB configuration manually"
     fi
+    # Proxmox VE with proxmox-boot-tool (GRUB on several ESPs): copy the
+    # regenerated configuration to every ESP, or the change never boots.
+    is_pve && pve_boot_refresh
     local cfg
     for cfg in /boot/grub/grub.cfg /boot/grub/user.cfg /boot/efi/EFI/debian/grub.cfg /boot/efi/EFI/ubuntu/grub.cfg; do
         if [[ -f $cfg ]]; then
@@ -1739,6 +2059,40 @@ EOF
             chmod 0400 "$cfg"
         fi
     done
+}
+
+# Proxmox VE: hardening arguments in /etc/kernel/cmdline (systemd-boot).
+pve_kernel_cmdline() {
+    local f=/etc/kernel/cmdline a w
+    local -a words kargs out
+    backup_file "$f"
+    read -r -a words <"$f"
+    mapfile -t kargs < <(kargs_for_host)
+    kargs+=(apparmor=1 security=apparmor)
+    kernel_fips_ok || words=("${words[@]/fips=1/}")
+    for a in "${kargs[@]}"; do
+        out=()
+        for w in "${words[@]}"; do
+            [[ -n $w && ${w%%=*} != "${a%%=*}" ]] && out+=("$w")
+        done
+        words=("${out[@]}" "$a")
+    done
+    out=()
+    for w in "${words[@]}"; do [[ -n $w ]] && out+=("$w"); done
+    printf '%s\n' "${out[*]}" >"$f"
+    log "Proxmox VE: kernel arguments written to ${f}"
+    [[ -f /etc/default/grub ]] || pve_boot_refresh
+}
+
+# proxmox-boot-tool refresh when the node boots from proxmox-boot-tool ESPs.
+PVE_BOOT_REFRESHED=0
+pve_boot_refresh() {
+    [[ $PVE_BOOT_REFRESHED == 1 ]] && return 0
+    command -v proxmox-boot-tool >/dev/null 2>&1 || return 0
+    [[ -s /etc/kernel/proxmox-boot-uuids ]] || return 0
+    host_only "proxmox-boot-tool refresh" proxmox-boot-tool refresh >/dev/null
+    PVE_BOOT_REFRESHED=1
+    log "Proxmox VE: boot configuration synced to every ESP (proxmox-boot-tool refresh)"
 }
 
 # Kernel arguments shared by both families (the Debian family adds AppArmor;
@@ -1752,6 +2106,10 @@ KARGS_COMMON=(fips=1 audit=1 audit_backlog_limit=8192 slab_nomerge=yes pti=on pa
 # breaks Wi-Fi/Bluetooth algorithms. User-space FIPS stays in both cases.
 kernel_fips_ok() {
     is_fedora && return 1
+    # Proxmox VE does not support kernel FIPS mode: its kernel is untested
+    # with fips=1, and corosync/knet (NSS) switching to FIPS mode at boot can
+    # keep a node out of the cluster quorum. User-space FIPS stays.
+    is_pve && [[ $PVE_KERNEL_FIPS != 1 ]] && return 1
     is_deb && is_desktop && return 1
     return 0
 }
@@ -2164,9 +2522,11 @@ harden_file_permissions() {
     # World-writable regular files on local filesystems lose o+w.
     local m
     while read -r m; do
-        find "$m" -xdev -type f -perm -0002 -exec chmod o-w {} + 2>/dev/null || true
-        find "$m" -xdev -type d -perm -0002 ! -perm -1000 -exec chmod +t {} + 2>/dev/null || true
-    done < <(findmnt -rn -o TARGET,FSTYPE | awk '$2 ~ /^(ext[234]|xfs|btrfs|overlay|zfs|f2fs)$/ {print $1}')
+        find "$m" -xdev \( -regextype posix-extended -regex "$CONTAINER_PATH_RE" -o -regex "$(is_pve && echo "$PVE_GUEST_PATH_RE" || echo '^$')" \) -prune \
+            -o -type f -perm -0002 -exec chmod o-w {} + 2>/dev/null || true
+        find "$m" -xdev \( -regextype posix-extended -regex "$CONTAINER_PATH_RE" -o -regex "$(is_pve && echo "$PVE_GUEST_PATH_RE" || echo '^$')" \) -prune \
+            -o -type d -perm -0002 ! -perm -1000 -exec chmod +t {} + 2>/dev/null || true
+    done < <(host_fs_mounts '^(ext[234]|xfs|btrfs|overlay|zfs|f2fs)$')
 
     # Home directories and dot files.
     local u home
@@ -2249,13 +2609,34 @@ configure_sysctl() {
     [[ $ALLOW_CONTAINERS == 1 ]] && fwd=1
     local ra=0
     [[ $KEEP_RA == 1 ]] && ra=1
+    # Forwarding: off on plain servers, on for container/Kubernetes hosts, and
+    # left to the node's own network configuration on Proxmox VE (NAT, routed
+    # and SDN guests need it; bridged guests do not care).
+    local fwd4 fwd6
+    if is_pve && ! containers_on; then
+        fwd4="# IPv4 forwarding: managed by the Proxmox VE network configuration (not set here)"
+        fwd6="# IPv6 forwarding: managed by the Proxmox VE network configuration (not set here)"
+    else
+        fwd4=$(printf 'net.ipv4.ip_forward = %s\nnet.ipv4.conf.all.forwarding = %s\nnet.ipv4.conf.default.forwarding = %s' "$fwd" "$fwd" "$fwd")
+        # IPv6: only dual-stack Kubernetes nodes (an IPv6 default route) route
+        # IPv6 permanently; Docker turns it on itself for IPv6 networks.
+        local f6=0
+        is_k8s && [[ -n $(ip -6 route show default 2>/dev/null) ]] && f6=1
+        fwd6=$(printf 'net.ipv6.conf.all.forwarding = %s\nnet.ipv6.conf.default.forwarding = %s' "$f6" "$f6")
+    fi
+    # rp_filter: strict (CIS) except where traffic is legitimately asymmetric:
+    # Kubernetes CNIs (Cilium/Calico eBPF, multi-NIC) and Proxmox SDN EVPN.
+    local rpf=1
+    if is_k8s || { is_pve && grep -Eqs '^evpn:' /etc/pve/sdn/zones.cfg; }; then rpf=2; fi
+    # Gratuitous ARP announces moved IPs: VM live migration, HA/keepalived,
+    # kube-vip and MetalLB L2 virtual IPs. Dropping it leaves stale ARP entries.
+    local garp="net.ipv4.conf.all.drop_gratuitous_arp = 1"
+    if is_pve || is_k8s; then garp="# drop_gratuitous_arp not set: migrating VMs / floating virtual IPs announce themselves by gratuitous ARP"; fi
     write_file 0644 /etc/sysctl.d/60-harden.conf <<EOF
 # Managed by ${SCRIPT_NAME} - CIS Debian L2 / ANSSI BP-028 / DISA STIG aligned.
 
 # --- IPv4: no routing, no redirects, no source routing, spoofing protection
-net.ipv4.ip_forward = ${fwd}
-net.ipv4.conf.all.forwarding = ${fwd}
-net.ipv4.conf.default.forwarding = ${fwd}
+${fwd4}
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.all.accept_redirects = 0
@@ -2266,15 +2647,15 @@ net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.rp_filter = ${rpf}
+net.ipv4.conf.default.rp_filter = ${rpf}
 net.ipv4.conf.all.accept_local = 0
 net.ipv4.conf.all.route_localnet = 0
 net.ipv4.conf.all.shared_media = 0
 net.ipv4.conf.default.shared_media = 0
 net.ipv4.conf.all.arp_filter = 1
 net.ipv4.conf.all.arp_ignore = 2
-net.ipv4.conf.all.drop_gratuitous_arp = 1
+${garp}
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 net.ipv4.tcp_syncookies = 1
@@ -2282,8 +2663,7 @@ net.ipv4.tcp_rfc1337 = 1
 net.ipv4.ip_local_port_range = 32768 65535
 
 # --- IPv6: no routing, no redirects, no source routing, no router advertisements
-net.ipv6.conf.all.forwarding = 0
-net.ipv6.conf.default.forwarding = 0
+${fwd6}
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_source_route = 0
@@ -2323,7 +2703,7 @@ EOF
     # Systemd ships rp_filter=2 (loose) in /usr/lib/sysctl.d/50-default.conf;
     # an /etc file of the same name masks it so only one value exists.
     if [[ -f /usr/lib/sysctl.d/50-default.conf ]] && grep -q 'rp_filter' /usr/lib/sysctl.d/50-default.conf; then
-        sed -E 's/^(-?net\.ipv4\.conf\.[a-z*]+\.rp_filter[[:space:]]*=[[:space:]]*).*/\11/' /usr/lib/sysctl.d/50-default.conf \
+        sed -E "s/^(-?net\\.ipv4\\.conf\\.[a-z*]+\\.rp_filter[[:space:]]*=[[:space:]]*).*/\\1${rpf}/" /usr/lib/sysctl.d/50-default.conf \
             | write_file 0644 /etc/sysctl.d/50-default.conf
     fi
     neutralize_sysctl_conflicts /etc/sysctl.d/60-harden.conf
@@ -2369,6 +2749,8 @@ configure_sshd() {
     while read -r u; do
         usermod -aG ssh-users "$u"
     done < <(interactive_users)
+    # Proxmox VE: root logs in between cluster nodes (AllowGroups applies to root too).
+    is_pve && usermod -aG ssh-users root
     local pwauth="# PasswordAuthentication: unchanged (set SSH_DISABLE_PASSWORD=1 for key-only)"
     [[ $SSH_DISABLE_PASSWORD == 1 ]] && pwauth="PasswordAuthentication no"
     # Debian family: explicit FIPS algorithms. RHEL family: the system crypto
@@ -2387,7 +2769,7 @@ KexAlgorithms ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-he
     block=$(cat <<EOF
 # BEGIN ${MARK} managed block - first match wins in sshd, keep this at the top
 LogLevel ${SSH_LOGLEVEL}
-PermitRootLogin no
+PermitRootLogin ${ROOT_SSH}
 X11Forwarding no
 AllowTcpForwarding no
 AllowAgentForwarding no
@@ -2425,11 +2807,31 @@ EOF
     is_rhel && keys+="|Ciphers|MACs|KexAlgorithms"
     local tmp
     tmp=$(mktemp "${cfg}.XXXXXX")
+    # Proxmox VE: secure live migration and storage migration tunnel the
+    # QEMU/NBD streams through root SSH port and unix-socket forwarding
+    # (ssh -L), so root - and only root - keeps those two forwarding types.
+    # A Match block must be last in the file; it is appended after the rest.
+    local pve_match=""
+    if is_pve; then
+        pve_match=$(cat <<EOF
+# BEGIN ${MARK} proxmox root match - must stay at the end of the file
+Match User root
+    DisableForwarding no
+    AllowTcpForwarding yes
+    AllowStreamLocalForwarding yes
+    AllowAgentForwarding no
+    X11Forwarding no
+    PermitTunnel no
+# END ${MARK} proxmox root match
+EOF
+)
+    fi
     {
         printf '%s\n\n' "$block"
-        # Drop the previous managed block; comment out managed keys elsewhere.
-        sed "/^# BEGIN ${MARK} managed block/,/^# END ${MARK} managed block/d" "$cfg" \
+        # Drop the previous managed blocks; comment out managed keys elsewhere.
+        sed "/^# BEGIN ${MARK} managed block/,/^# END ${MARK} managed block/d; /^# BEGIN ${MARK} proxmox root match/,/^# END ${MARK} proxmox root match/d" "$cfg" \
             | sed -E "s/^([[:space:]]*(${keys})[[:space:]].*)/# overridden by ${MARK}: \1/I"
+        if [[ -n $pve_match ]]; then printf '\n%s\n' "$pve_match"; fi
     } >"$tmp"
     chown root:root "$tmp"
     chmod 0600 "$tmp"
@@ -2483,7 +2885,11 @@ EOF
 }
 
 configure_ufw() {
-    step "5.4 host firewall: default deny inbound (UFW / firewalld)"
+    step "5.4 host firewall: default deny inbound (UFW / firewalld / pve-firewall)"
+    if is_pve; then
+        configure_pve_firewall
+        return 0
+    fi
     if is_rhel; then
         configure_firewalld
         return 0
@@ -2518,6 +2924,8 @@ configure_ufw() {
     else
         ufw default allow outgoing >/dev/null
     fi
+    if is_k8s; then ufw_kubernetes_rules; fi
+    if containers_on; then ufw_container_ifaces; else ufw_container_ifaces_remove; fi
     ufw logging low >/dev/null
     # UFW re-applies /etc/ufw/sysctl.conf whenever it starts; its stock file
     # turns martian logging OFF, silently undoing the CIS setting each boot.
@@ -2528,6 +2936,183 @@ configure_ufw() {
     # 'ufw enable' loads the rules but leaves the oneshot unit inactive.
     host_only "start ufw.service" systemctl start ufw.service
     ufw status verbose || true
+}
+
+# Inbound ports a Kubernetes node needs (control plane: API server, etcd,
+# controller-manager, scheduler, k3s/rke2 supervisor; every node: kubelet,
+# NodePorts; CNI overlays: VXLAN (flannel/Cilium/Calico), Geneve, WireGuard,
+# Calico BGP/Typha, Cilium health/Hubble).
+k8s_ports() {
+    local -a p=(10250/tcp 30000:32767/tcp 30000:32767/udp 8472/udp 4789/udp 6081/udp 51820:51821/udp
+        179/tcp 5473/tcp 4240/tcp 4244/tcp)
+    if [[ $K8S_CONTROL == 1 ]]; then
+        p+=(6443/tcp 2379:2380/tcp 10257/tcp 10259/tcp)
+        [[ $K8S_DISTRO == rke2 ]] && p+=(9345/tcp)
+        [[ $K8S_DISTRO == k0s ]] && p+=(9443/tcp 8132/tcp)
+        [[ $K8S_DISTRO == microk8s ]] && p+=(16443/tcp 25000/tcp 19001/tcp)
+    fi
+    local x
+    for x in $K8S_EXTRA_PORTS; do p+=("$x"); done
+    printf '%s\n' "${p[@]}"
+}
+
+# Sources allowed to reach the cluster ports: K8S_TRUSTED_CIDRS plus the
+# detected pod/service CIDRs; nothing printed means any source.
+k8s_sources() {
+    [[ -n $K8S_TRUSTED_CIDRS ]] || return 0
+    # shellcheck disable=SC2086
+    { printf '%s\n' $K8S_TRUSTED_CIDRS; k8s_cluster_cidrs; } | awk 'NF' | sort -u
+}
+
+# UFW on a Kubernetes node: cluster/CNI ports (restricted to the trusted
+# sources when given) and the pod/service networks.
+ufw_kubernetes_rules() {
+    local port proto src n
+    local -a srcs cidrs
+    mapfile -t srcs < <(k8s_sources)
+    mapfile -t cidrs < <(k8s_cluster_cidrs)
+    # Rules from earlier runs are replaced, so a narrowed source list takes effect.
+    while n=$(ufw status numbered 2>/dev/null | awk -F'[][]' '/Kubernetes.*\(harden-and-audit\)/ {gsub(/ /, "", $2); print $2; exit}') && [[ -n $n ]]; do
+        ufw --force delete "$n" >/dev/null || break
+    done
+    while read -r port; do
+        proto=${port##*/}; port=${port%/*}
+        if [[ ${#srcs[@]} -eq 0 ]]; then
+            ufw allow in proto "$proto" to any port "$port" comment 'Kubernetes (harden-and-audit)' >/dev/null
+        else
+            for src in "${srcs[@]}"; do
+                ufw allow in proto "$proto" from "$src" to any port "$port" comment 'Kubernetes (harden-and-audit)' >/dev/null
+            done
+        fi
+    done < <(k8s_ports)
+    for src in "${cidrs[@]}"; do
+        ufw allow in from "$src" comment 'Kubernetes pod/service network (harden-and-audit)' >/dev/null
+    done
+    if [[ ${#srcs[@]} -eq 0 ]]; then
+        warn "Kubernetes: cluster ports (kubelet$( [[ $K8S_CONTROL == 1 ]] && echo ', API server, etcd')) accept any source; set K8S_TRUSTED_CIDRS to the node network to narrow them"
+    fi
+    log "Kubernetes (${K8S_DISTRO}): cluster and CNI ports allowed; pod/service networks: ${cidrs[*]:-none detected}"
+}
+
+# Container/CNI interfaces: pods and containers reach node services (DNS,
+# kubelet, host-published ports) and route through them. UFW has no
+# interface wildcards, so the rules go in a managed block of before.rules
+# (iptables syntax, "+" = prefix match), read whenever UFW starts.
+ufw_container_ifaces() {
+    local f i block
+    for f in /etc/ufw/before.rules /etc/ufw/before6.rules; do
+        [[ -f $f ]] || continue
+        block="# BEGIN ${MARK} container interfaces"$'\n'
+        for i in "${CNI_IFACES[@]}"; do
+            block+="-A ufw-before-input -i ${i} -j ACCEPT"$'\n'
+            block+="-A ufw-before-forward -i ${i} -j ACCEPT"$'\n'
+            block+="-A ufw-before-forward -o ${i} -j ACCEPT"$'\n'
+        done
+        # Calico IP-in-IP (protocol 4) between nodes, IPv4 only.
+        if [[ $f == */before.rules ]] && is_k8s; then block+="-A ufw-before-input -p 4 -j ACCEPT"$'\n'; fi
+        block+="# END ${MARK} container interfaces"
+        backup_file "$f"
+        sed -i "/^# BEGIN ${MARK} container interfaces/,/^# END ${MARK} container interfaces/d" "$f"
+        # Insert before the filter table's COMMIT (the last COMMIT in the file).
+        awk -v blk="$block" '{ l[NR] = $0 } /^COMMIT/ { c = NR } END { for (i = 1; i <= NR; i++) { if (i == c) print blk; print l[i] } }' "$f" >"${f}.harden.tmp"
+        cat "${f}.harden.tmp" >"$f"
+        rm -f "${f}.harden.tmp"
+    done
+    log "UFW: container/CNI interfaces (${CNI_IFACES[*]}) may reach node services and route"
+}
+
+ufw_container_ifaces_remove() {
+    local f
+    for f in /etc/ufw/before.rules /etc/ufw/before6.rules; do
+        [[ -f $f ]] && grep -q "^# BEGIN ${MARK} container interfaces" "$f" || continue
+        sed -i "/^# BEGIN ${MARK} container interfaces/,/^# END ${MARK} container interfaces/d" "$f"
+    done
+    return 0
+}
+
+# Proxmox VE: pve-firewall is the host firewall (datacenter / node / guest
+# levels, cluster-wide config in /etc/pve). UFW is never installed: both
+# would rewrite the same netfilter tables. Rules are only changed on request
+# (PVE_FIREWALL_ENABLE=1), and then SSH and the web UI are allowed first.
+configure_pve_firewall() {
+    log "Proxmox VE: the host firewall is pve-firewall; UFW is not used"
+    if pkg_installed ufw; then
+        ufw --force disable >/dev/null 2>&1 || true
+        disable_service ufw.service
+        warn "Proxmox VE: UFW was installed and has been disabled (it conflicts with pve-firewall); remove it with: apt purge ufw"
+    fi
+    if ! pkg_installed pve-firewall; then
+        warn "Proxmox VE: pve-firewall is not installed - the node has no host firewall"
+        return 0
+    fi
+    systemctl unmask pve-firewall.service >/dev/null 2>&1 || true
+    systemctl enable pve-firewall.service >/dev/null 2>&1 || true
+    host_only "start pve-firewall" systemctl start pve-firewall.service
+    local fw=/etc/pve/firewall/cluster.fw
+    if [[ $PVE_FIREWALL_ENABLE == 1 ]]; then
+        pve_firewall_enable "$fw"
+    fi
+    if [[ -f $fw ]] && awk '/^\[/ { s = $0 } s == "[OPTIONS]" && /^[[:space:]]*enable:[[:space:]]*1/ { f = 1 } END { exit !f }' "$fw"; then
+        log "Proxmox VE: datacenter firewall enabled"
+    else
+        warn "Proxmox VE: the datacenter firewall is OFF - enable it in Datacenter > Firewall, or re-run with PVE_FIREWALL_ENABLE=1 (SSH and port 8006 are allowed first)"
+    fi
+    if [[ $FIREWALL_OUTBOUND_POLICY == deny ]]; then
+        warn "Proxmox VE: FIREWALL_OUTBOUND_POLICY=deny is not applied - set policy_out in Datacenter > Firewall > Options (it must allow corosync, Ceph and migration traffic)"
+    fi
+}
+
+# pve_firewall_enable FILE - turn the datacenter firewall on without
+# clobbering existing rules: enable: 1 in [OPTIONS], and SSH + web UI accept
+# rules (marked, replaced on re-runs) at the top of [RULES]. Corosync and
+# the local management network are allowed by pve-firewall itself.
+pve_firewall_enable() {
+    local fw=$1 p src rules="" orig
+    if [[ ! -d ${fw%/*} ]] && ! install -d -m 0750 "${fw%/*}" 2>/dev/null; then
+        warn "Proxmox VE: ${fw%/*} is not writable (cluster not quorate?) - datacenter firewall not enabled"
+        return 0
+    fi
+    local -a sources=("")
+    [[ -n $PVE_FIREWALL_MGMT_SOURCE ]] && read -r -a sources <<<"$PVE_FIREWALL_MGMT_SOURCE"
+    for src in "${sources[@]}"; do
+        for p in "${SSH_PORTS[@]}" 8006; do
+            rules+="IN ACCEPT${src:+ -source ${src}} -p tcp -dport ${p} -log nolog # ${MARK}: $( [[ $p == 8006 ]] && echo 'web UI' || echo SSH)"$'\n'
+        done
+    done
+    orig=$(mktemp)
+    if [[ -f $fw ]]; then
+        cat "$fw" >"$orig"
+        backup_file "$fw"
+    fi
+    awk -v rules="$rules" -v mark="$MARK" '
+        BEGIN { hasopt = 0; hasrules = 0; en = 0; sec = "" }
+        index($0, "# " mark ":") { next }
+        /^\[/ {
+            if (sec == "[OPTIONS]" && !en) { print "enable: 1"; print ""; en = 1 }
+            sec = $0; print
+            if (sec == "[OPTIONS]") hasopt = 1
+            if (sec == "[RULES]") { hasrules = 1; printf "\n%s", rules; skip = 1 }
+            next
+        }
+        skip && /^[[:space:]]*$/ { next }
+        { skip = 0 }
+        sec == "[OPTIONS]" && /^[[:space:]]*enable:/ { if (!en) print "enable: 1"; en = 1; next }
+        { print }
+        END {
+            if (sec == "[OPTIONS]" && !en) { print "enable: 1"; en = 1 }
+            if (!hasopt) printf "\n[OPTIONS]\n\nenable: 1\n"
+            if (!hasrules) printf "\n[RULES]\n\n%s", rules
+        }' "$orig" >"${fw}.harden.tmp"
+    cat "${fw}.harden.tmp" >"$fw"
+    rm -f "${fw}.harden.tmp"
+    if command -v pve-firewall >/dev/null 2>&1 && ! pve-firewall compile >/dev/null 2>&1; then
+        if [[ -s $orig ]]; then cat "$orig" >"$fw"; else rm -f "$fw"; fi
+        rm -f "$orig"
+        warn "Proxmox VE: the firewall configuration did not compile - ${fw} restored, firewall NOT enabled"
+        return 0
+    fi
+    rm -f "$orig"
+    log "Proxmox VE: datacenter firewall enabled; SSH (${SSH_PORTS[*]}) and 8006 allowed from ${PVE_FIREWALL_MGMT_SOURCE:-any source}"
 }
 
 # RHEL family: firewalld, default zone public with only SSH (and DHCPv6
@@ -2575,6 +3160,37 @@ configure_firewalld() {
         fw --zone="$zr" --add-rich-rule='rule family="ipv4" source address="127.0.0.1" destination not address="127.0.0.1" drop' 2>/dev/null || true
         fw --zone="$zr" --add-rich-rule='rule family="ipv6" source address="::1" destination not address="::1" drop' 2>/dev/null || true
     done
+    # Kubernetes: cluster/CNI ports in the default zone; pod/service
+    # networks and existing CNI interfaces in the trusted zone (pods reach
+    # node services and route through the node). Docker manages its own
+    # "docker" zone.
+    if is_k8s; then
+        local port src i fam
+        local -a srcs
+        mapfile -t srcs < <(k8s_sources)
+        while read -r port; do
+            port=${port/:/-}
+            if [[ ${#srcs[@]} -eq 0 ]]; then
+                fw --zone="$zone" --add-port="$port"
+            else
+                for src in "${srcs[@]}"; do
+                    fam=ipv4; [[ $src == *:* ]] && fam=ipv6
+                    fw --zone="$zone" --add-rich-rule="rule family=\"${fam}\" source address=\"${src}\" port port=\"${port%/*}\" protocol=\"${port##*/}\" accept" 2>/dev/null || true
+                done
+            fi
+        done < <(k8s_ports)
+        fw --zone="$zone" --add-protocol=ipip 2>/dev/null || true
+        while read -r src; do
+            fw --zone=trusted --add-source="$src" 2>/dev/null || true
+        done < <(k8s_cluster_cidrs)
+        while read -r i; do
+            fw --zone=trusted --add-interface="$i" 2>/dev/null || true
+        done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -E '^(cni0|flannel|cali|vxlan|tunl0|cilium_|weave|kube-bridge)' || true)
+        if [[ ${#srcs[@]} -eq 0 ]]; then
+            warn "Kubernetes: cluster ports accept any source; set K8S_TRUSTED_CIDRS to the node network to narrow them"
+        fi
+        log "Kubernetes (${K8S_DISTRO}): cluster and CNI ports open in zone ${zone}, pod/service networks trusted"
+    fi
     # firewalld drives nftables itself: a second ruleset service would conflict (CIS).
     systemctl disable --now nftables.service >/dev/null 2>&1 || true
     systemctl mask nftables.service >/dev/null 2>&1 || true
@@ -2845,6 +3461,10 @@ configure_login_defs() {
     chage --help 2>&1 | qgrep -- '--mindays' && minday=(--mindays "$PASS_MIN_DAYS")
     while IFS=: read -r u hash lastchg _; do
         [[ $hash == \$* ]] || continue
+        # Proxmox VE: an expired root password makes PAM's account phase fail
+        # for root's non-interactive key logins between nodes (migration,
+        # replication, cluster tasks) and blocks root@pam in the web UI.
+        if is_pve && [[ $u == root ]]; then continue; fi
         if [[ -n $lastchg && $lastchg =~ ^[0-9]+$ && $(( lastchg + PASS_MAX_DAYS )) -lt $today ]]; then
             warn "password of '${u}' is older than ${PASS_MAX_DAYS} days: aging NOT applied to avoid immediate expiry - change it, then re-run"
             continue
@@ -2858,6 +3478,10 @@ configure_login_defs() {
             passwd -n "$PASS_MIN_DAYS" "$u" >/dev/null 2>&1 || warn "could not set the minimum password age of ${u}"
         fi
     done < /etc/shadow
+    if is_pve; then
+        chage --maxdays 99999 --inactive -1 --expiredate -1 root
+        log "Proxmox VE: root is exempt from password expiry and inactivity locking (cluster operations run as root)"
+    fi
 
     # Interactive shells: umask 027, idle timeout. Desktops: no TMOUT (it would
     # close idle terminal tabs); the desktop's own screen lock covers idleness.
@@ -3007,6 +3631,11 @@ configure_sudo() {
 
 configure_banners() {
     step "5.8 login warning banner (${BANNER_STYLE})"
+    # Proxmox VE: pvebanner.service rewrites /etc/issue at every boot (web UI
+    # URL), which would replace the login banner.
+    if is_pve; then
+        disable_service pvebanner.service
+    fi
     local banner org=${BANNER_ORG:-the owner of this system}
     # Plain printable text only; no OS/kernel details (CIS 1.7.x).
     org=${org//[^[:print:]]/}; org=${org//\\/}
@@ -3116,7 +3745,9 @@ configure_kernel_modules() {
     local -a mods=(cramfs freevxfs hfs hfsplus jffs2 udf dccp rds sctp tipc atm can firewire-core firewire-ohci)
     # Desktops keep USB drives and overlay (toolbox / podman / flatpak builders).
     is_desktop || mods+=(usb-storage)
-    [[ $ALLOW_CONTAINERS != 1 ]] && ! is_desktop && mods+=(overlay overlayfs)
+    # overlayfs: container image layers (Docker, containerd, Podman, Kubernetes,
+    # Docker inside Proxmox LXC containers).
+    if ! containers_on && ! is_desktop && ! is_pve; then mods+=(overlay overlayfs); fi
     # Ubuntu and EL CIS also disable squashfs, which every snap is mounted
     # from: only where snapd is absent.
     if is_ubuntu || is_rhel; then
@@ -3126,6 +3757,16 @@ configure_kernel_modules() {
             mods+=(squashfs)
         fi
     fi
+    # SCTP: corosync's knet transport can run over it (Proxmox VE), and
+    # Kubernetes Services/CNIs may use it when the cluster declares it.
+    if grep -Eqs '^[[:space:]]*knet_transport:[[:space:]]*sctp' /etc/pve/corosync.conf /etc/corosync/corosync.conf \
+        || { is_k8s && grep -RIqs 'protocol:[[:space:]]*SCTP' /etc/kubernetes/manifests /var/lib/rancher/k3s/server/manifests; }; then
+        local -a keep=()
+        local x
+        for x in "${mods[@]}"; do [[ $x == sctp ]] || keep+=("$x"); done
+        mods=("${keep[@]}")
+        log "SCTP stays available (corosync knet / Kubernetes uses it)"
+    fi
     {
         echo "# Managed by ${SCRIPT_NAME}"
         local m
@@ -3134,8 +3775,8 @@ configure_kernel_modules() {
             echo "blacklist ${m}"
         done
     } | write_file 0644 /etc/modprobe.d/60-harden-blacklist.conf
-    if [[ $ALLOW_CONTAINERS != 1 ]] && ! is_desktop; then
-        log "overlayfs disabled (set ALLOW_CONTAINERS=1 on Docker/Podman hosts)"
+    if ! containers_on && ! is_desktop && ! is_pve; then
+        log "overlayfs disabled (no container runtime found; set ALLOW_CONTAINERS=1 before installing Docker/Podman/Kubernetes)"
     fi
 }
 
@@ -3556,6 +4197,14 @@ configure_selinux() {
     local cfg=/etc/selinux/config want=enforcing cur
     pkg_installed selinux-policy-targeted || dnf_install selinux-policy-targeted
     cur=$(getenforce 2>/dev/null || echo Disabled)
+    # Kubernetes nodes: kubeadm/k3s/rke2 installs are often set up with SELinux
+    # permissive; raising it can stop kubelet, CNI or hostPath workloads at the
+    # next boot. Enforcing is kept where it already is, never raised here.
+    if is_k8s && [[ $cur != Enforcing ]]; then
+        warn "Kubernetes node: SELinux stays ${cur} (raising it can stop kubelet/CNI pods); install container-selinux and the distribution's k8s SELinux policy, then run with KUBERNETES_MODE=0 or setenforce 1 yourself"
+        log "SELinux: ${cur} (left unchanged on a Kubernetes node)"
+        return 0
+    fi
     if [[ $cur == Disabled ]] && ! in_container; then
         want=permissive
         touch /.autorelabel
@@ -3575,6 +4224,23 @@ configure_selinux() {
     log "SELinux: ${cur} now, ${want} (targeted) configured"
 }
 
+# Cluster peers never get banned: Proxmox corosync ring addresses and,
+# when given, the Kubernetes trusted networks.
+fail2ban_cluster_peers() {
+    local -a peers=()
+    local f
+    for f in /etc/pve/corosync.conf /etc/corosync/corosync.conf; do
+        [[ -r $f ]] || continue
+        while read -r a; do peers+=("$a"); done < <(awk '$1 ~ /^ring[0-9]+_addr:$/ {print $2}' "$f")
+    done
+    if is_k8s && [[ -n $K8S_TRUSTED_CIDRS ]]; then
+        # shellcheck disable=SC2206
+        peers+=($K8S_TRUSTED_CIDRS)
+    fi
+    [[ ${#peers[@]} -gt 0 ]] && printf ' %s' "$(printf '%s\n' "${peers[@]}" | sort -u | paste -sd' ')"
+    return 0
+}
+
 configure_fail2ban() {
     step "5.15 fail2ban (SSH brute-force protection)"
     if ! command -v fail2ban-client >/dev/null 2>&1; then
@@ -3590,13 +4256,32 @@ bantime  = 1h
 findtime = 10m
 maxretry = 5
 backend  = systemd
-ignoreip = 127.0.0.1/8 ::1 ${FAIL2BAN_IGNOREIP}
+ignoreip = 127.0.0.1/8 ::1 ${FAIL2BAN_IGNOREIP}$(fail2ban_cluster_peers)
 
 [sshd]
 enabled  = true
 port     = ${ports}
 mode     = aggressive
 EOF
+    # Proxmox VE: brute force against the web UI / API (root@pam lives there).
+    if is_pve; then
+        write_file 0644 /etc/fail2ban/filter.d/harden-proxmox.conf <<'EOF'
+# Managed by harden-and-audit.sh - failed Proxmox VE web UI / API logins.
+[Definition]
+failregex = pvedaemon\[[0-9]+\]: authentication (verification )?failure; rhost=(::ffff:)?<HOST> user=\S+ msg=.*
+ignoreregex =
+journalmatch = _SYSTEMD_UNIT=pvedaemon.service
+EOF
+        cat >>/etc/fail2ban/jail.d/60-harden.local <<'EOF'
+
+[proxmox]
+enabled  = true
+port     = https,http,8006
+filter   = harden-proxmox
+EOF
+    else
+        rm -f /etc/fail2ban/filter.d/harden-proxmox.conf
+    fi
     fail2ban-client -t >/dev/null || die "fail2ban configuration test failed"
     systemctl enable fail2ban.service >/dev/null 2>&1 || true
     systemctl restart fail2ban.service
@@ -3661,6 +4346,33 @@ aide_bulk_excludes() {
 # Swap files (contents change with every page out)
 !/(swap\.img|swapfile)$
 EOF
+    cat <<'EOF'
+# Kubernetes: etcd data, block storage (Longhorn/OpenEBS), pod and container logs
+!/var/lib/(etcd|k0s|longhorn|kubelet)(/|$)
+!/var/openebs(/|$)
+!/var/snap/microk8s/common(/|$)
+!/var/log/(pods|containers)(/|$)
+!/run/(containerd|k3s|netns)(/|$)
+EOF
+    if is_pve; then
+        cat <<'EOF'
+# Proxmox VE: guest storage (VM disks, container root filesystems, backups,
+# ISOs), cluster database and metrics, and the volatile parts of /etc/pve
+# (virtual status files, daily-rotated auth keys, HA state, locks).
+!/var/lib/(vz|lxc|ceph|rrdcached|pve-cluster|pve-manager|pve-firewall|qemu-server)(/|$)
+!/mnt/pve(/|$)
+!/.*/(subvol|basevol)-[0-9]+-disk-[0-9]+(/|$)
+!/etc/pve/(.+/)?\.[^/]+$
+!/etc/pve/(priv/)?authkey\.(key|pub)(\.old)?$
+!/etc/pve/nodes/[^/]+/lrm_status(\.tmp\.[0-9]+)?$
+!/etc/pve/priv/lock(/|$)
+!/var/log/pve(/|$)
+EOF
+        local sp
+        while read -r sp; do
+            printf '!%s(/|$)\n' "$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<<"$sp")"
+        done < <(pve_storage_paths)
+    fi
     # Any other active swap file, wherever it lives.
     local sw t
     while read -r sw t _; do
@@ -4226,9 +4938,16 @@ aide_estimate_total() {
     local -a dirs=(/var/lib/containerd /var/lib/docker /var/lib/containers /var/lib/kubelet /var/lib/rancher
                    /var/lib/libvirt/images /var/lib/snapd/snaps /var/lib/snapd/cache
                    /var/lib/flatpak/repo /var/lib/flatpak/app /var/lib/flatpak/runtime
-                   /usr/share/ollama/.ollama/models /var/cache /var/tmp /tmp /swap.img /swapfile)
-    total=$(df -l -B1 --output=used -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null \
-        | awk 'NR > 1 { s += $1 } END { printf "%d\n", s }')
+                   /usr/share/ollama/.ollama/models /var/cache /var/tmp /tmp /swap.img /swapfile
+                   /var/lib/etcd /var/lib/k0s /var/lib/longhorn /var/openebs /var/snap/microk8s/common /var/log/pods)
+    if is_pve; then
+        dirs+=(/var/lib/vz /var/lib/lxc /var/lib/ceph /var/lib/rrdcached /mnt/pve)
+        while read -r d; do dirs+=("$d"); done < <(pve_storage_paths)
+    fi
+    # Separately mounted container / guest storage is left out of the total.
+    total=$(df -l -B1 --output=used,target -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null \
+        | awk -v c="$CONTAINER_PATH_RE" -v g="$( is_pve && echo "$PVE_GUEST_PATH_RE")" \
+            'NR > 1 && $2 !~ c && (g == "" || $2 !~ g) { s += $1 } END { printf "%d\n", s }')
     for h in /root /home/*; do [[ -d $h ]] && dirs+=("$h"); done
     while read -r d b _; do
         [[ $b == file && $d == /* && $d != /swap.img && $d != /swapfile && $d != /root/* && $d != /home/* ]] && dirs+=("$d")
@@ -4411,7 +5130,7 @@ main() {
         local w
         for w in "${WARNINGS[@]}"; do printf '  - %s\n' "$w"; done
     fi
-    log "A reboot is required to activate fips=1, audit=1$(is_rhel && echo ', SELinux enforcing') and the other kernel arguments."
+    log "A reboot is required to activate $(kernel_fips_ok && echo 'fips=1, ')audit=1$(is_rhel && echo ', SELinux enforcing') and the other kernel arguments."
     exit "$rc"
 }
 

@@ -6,8 +6,25 @@
 |---|---|
 | Debian | **Debian 12 (bookworm)**, **Debian 13 (trixie)**, **Ubuntu 22.04 / 24.04 / 26.04 LTS** |
 | RHEL | **RHEL**, **CentOS Stream**, **Rocky Linux**, **AlmaLinux**, **Oracle Linux**: releases **8, 9 and 10** (any distribution with `ID_LIKE=rhel`), and **Fedora 41+** (server and Workstation) |
+| Hypervisor | **Proxmox VE 8 (Debian 12) and 9 (Debian 13)**: detected automatically (see below) |
 
 **Servers and desktops.** When a display manager is installed (GDM, SDDM, LightDM …), the script runs in **desktop mode**: it hardens the machine without breaking the desktop. The graphical session, printing, Bluetooth, USB drives, network discovery (mDNS) and toolbox/podman keep working; sshd stays off if it was off; terminals get no idle timeout (the screen lock covers that); the gate profile is CIS Level 2 **Workstation**. Force it with `DESKTOP_MODE=1`, or harden a desktop as a server with `DESKTOP_MODE=0`.
+
+**Proxmox VE nodes.** When `pve-manager` is installed the script runs in **Proxmox mode** and keeps everything a node and its cluster need:
+
+* **Root stays usable.** Root keeps SSH: cluster join, live and secure migration, replication and the node shell all run as root over SSH. With a non-root sudo admin present it is `PermitRootLogin prohibit-password` (keys only); otherwise `yes`. Root keeps TCP and unix-socket forwarding for migration tunnels; other users don't. Root's password is exempt from expiry and inactivity locking, because an expired root password breaks key-based cluster logins and `root@pam` in the web UI.
+* **Firewall.** pve-firewall stays the firewall and UFW is never installed. With `PVE_FIREWALL_ENABLE=1` the datacenter firewall is turned on, with SSH and port 8006 allowed first and existing rules kept.
+* **Repositories.** Without a subscription, the enterprise repositories (which return HTTP 401) are swapped for the no-subscription ones, so updates keep working.
+* **Kernel, boot and banner.** IP forwarding is left to the node's network setup. rpcbind (NFS storage), dnsmasq (SDN DHCP), postfix and overlayfs stay. No kernel `fips=1` (Proxmox doesn't support it; user-space FIPS stays). `/etc/kernel/cmdline` and `proxmox-boot-tool refresh` are handled. `pvebanner` no longer overwrites the login banner.
+* **Hands off guest data.** VM disks, container subvolumes, backup and NFS storage and the volatile parts of `/etc/pve` are never scanned, chmod-ed or checksummed. Failed web UI logins get a fail2ban jail, and cluster peers are never banned.
+
+**Container and Kubernetes hosts (every distribution).** Docker, containerd, rootful Podman and Kubernetes (kubeadm, k3s, RKE2, k0s, MicroK8s) are detected **before** anything changes, so hardening never breaks them:
+
+* **Networking.** IP forwarding stays on, overlayfs stays loaded, and routed container traffic and container/CNI interfaces are allowed through UFW/firewalld.
+* **Kubernetes.** Nodes also get the cluster and CNI ports (API server, etcd, kubelet, NodePorts, VXLAN/Geneve/WireGuard/BGP), trusted pod/service networks, loose `rp_filter`, and gratuitous ARP for floating VIPs. SELinux is never raised from permissive on a Kubernetes node.
+* **Container storage.** Image layers, container root filesystems and etcd are never scanned, chmod-ed or checksummed.
+
+Set `K8S_TRUSTED_CIDRS` to restrict the cluster ports to your node network.
 
 | | |
 |---|---|
@@ -33,7 +50,8 @@ sha256sum -c harden-and-audit.sh.sha256
 
 # Prerequisite: a NON-ROOT administrator in the sudo group (Debian/Ubuntu) or the
 # wheel group (RHEL family) with an SSH key or password. The script refuses to
-# run without one, because it disables root SSH login.
+# run without one, because it disables root SSH login. (Proxmox VE nodes keep
+# root SSH for the cluster, so there it is recommended, not required.)
 sudo bash harden-and-audit.sh
 sudo reboot     # activates fips=1, audit=1, SELinux enforcing (EL) and the other kernel arguments
 ```
@@ -118,7 +136,16 @@ The table describes the Debian family; the RHEL-family equivalents follow it.
 | `PASS_MAX_DAYS` | `365` | DoD sites commonly use `60` |
 | `FAILLOCK_DENY` / `FAILLOCK_UNLOCK_TIME` | `4` / `900` | Temporary lockout |
 | `SHELL_TMOUT` | `900` | Idle shell timeout and tmux lock (seconds) |
-| `ALLOW_CONTAINERS` | `0` | `1` keeps overlayfs and IPv4 forwarding for Docker/Podman hosts |
+| `ALLOW_CONTAINERS` | `auto` | `auto` = on when Docker, containerd, rootful Podman or Kubernetes is found: keeps overlayfs, IP forwarding, routed container traffic and container/CNI interfaces. `1` force (set it **before** installing a runtime on an already-hardened host), `0` off |
+| `KUBERNETES_MODE` | `auto` | `auto` = on when kubelet, k3s, RKE2, k0s or MicroK8s is found: cluster/CNI ports, trusted pod/service networks, loose rp_filter, SELinux mode not raised. `1` force, `0` off |
+| `K8S_TRUSTED_CIDRS` | *(empty)* | Node/management networks allowed to reach the cluster ports (API server, etcd, kubelet, CNI). Empty = any source (a warning is printed) |
+| `K8S_EXTRA_PORTS` | *(empty)* | More inbound ports on Kubernetes nodes, e.g. `"9100/tcp 7946/tcp 7946/udp"` (node exporter, MetalLB) |
+| `PROXMOX_MODE` | `auto` | `auto` = Proxmox mode when `pve-manager` is installed; `1` force; `0` treat the node as plain Debian (not recommended) |
+| `PVE_ROOT_SSH` | `auto` | Proxmox: `auto` = `prohibit-password` when a non-root sudo admin exists, else `yes`; or set `yes` / `prohibit-password` |
+| `PVE_REPO` | `auto` | Proxmox: `auto` = enterprise repositories with an active subscription, otherwise no-subscription; `enterprise`, `no-subscription` or `keep` (leave the repositories alone) |
+| `PVE_FIREWALL_ENABLE` | `0` | Proxmox: `1` turns the datacenter firewall on (SSH and 8006 accept rules first, existing rules kept). **Cluster-wide** setting |
+| `PVE_FIREWALL_MGMT_SOURCE` | *(empty)* | Proxmox: source CIDR(s) for those SSH/8006 rules (empty = any) |
+| `PVE_KERNEL_FIPS` | `0` | Proxmox: `1` also boots the node with `fips=1` (unsupported by Proxmox; may keep corosync out of quorum) |
 | `KEEP_IPV6_RA` | `auto` | `auto` keeps RA when SLAAC is in use |
 | `FIREWALL_OUTBOUND_POLICY` / `FIREWALL_EXTRA_OUT` | `allow` / *(empty)* | `deny` + allow-list for egress filtering (UFW or firewalld). The old names `UFW_OUTBOUND_POLICY` / `UFW_EXTRA_OUT` still work |
 | `EPEL_ENABLE` | `1` | RHEL family: enable CRB/PowerTools + EPEL (fail2ban, dkms, some media libraries). Not used on Fedora |
@@ -172,6 +199,9 @@ tests/run-ci.sh ubuntu 24.04
 tests/run-ci.sh ubuntu 26.04
 tests/run-ci.sh rocky 9          # also: rocky 8|10, almalinux 8|9|10, centos 9|10 (Stream), fedora 44|45
 tests/run-ci.sh fedora 45 desktop   # GNOME desktop: proves desktop mode keeps the desktop
+tests/run-ci.sh debian 12 proxmox   # Proxmox VE 8 look-alike (also: debian 13 proxmox = PVE 9)
+tests/run-ci.sh ubuntu 24.04 k8s    # Docker + kubeadm node: containers must still run (privileged CI only)
+tests/run-ci.sh rocky 9 k8s         # Podman + kubeadm node on the RHEL family
 ```
 
 ## Documentation
@@ -179,5 +209,6 @@ tests/run-ci.sh fedora 45 desktop   # GNOME desktop: proves desktop mode keeps t
 * [docs/PLAN.md](docs/PLAN.md): analysis and implementation plan (Debian)
 * [docs/PLAN-UBUNTU.md](docs/PLAN-UBUNTU.md): analysis and implementation plan for Ubuntu 22.04 / 24.04 / 26.04
 * [docs/PLAN-RHEL.md](docs/PLAN-RHEL.md): analysis and implementation plan for the RHEL family and the linux-minimal-secure rename
+* [docs/PLAN-PROXMOX-CONTAINERS.md](docs/PLAN-PROXMOX-CONTAINERS.md): Proxmox VE nodes, container and Kubernetes hosts
 * [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md): deviations from CIS/ANSSI/STIG and the reason for each
 * [docs/GAP-ANALYSIS.md](docs/GAP-ANALYSIS.md) / [docs/GAP-ANALYSIS-UBUNTU.md](docs/GAP-ANALYSIS-UBUNTU.md) / [docs/GAP-ANALYSIS-RHEL.md](docs/GAP-ANALYSIS-RHEL.md): what was delivered against each plan
