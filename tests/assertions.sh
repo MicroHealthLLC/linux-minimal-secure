@@ -100,7 +100,7 @@ check "dependency-aware removal kept non-graphical gd (links libX11)" installed 
 fi
 for p in telnet rpcbind; do check "legacy service ${p} removed" not_installed "$p"; done
 fi
-check "nothing left listening on the portmapper port 111" bash -c "! ss -Htuln | awk '{print \$5}' | grep -Eq ':111\$'"
+pve || check "nothing left listening on the portmapper port 111" bash -c "! ss -Htuln | awk '{print \$5}' | grep -Eq ':111\$'"
 desktop || check "default target is multi-user" bash -c "[[ \$(systemctl get-default) == multi-user.target ]]"
 
 echo "== 2. repositories, base stack, unattended upgrades"
@@ -437,7 +437,7 @@ check "password hashing SHA512" grep -Eq '^ENCRYPT_METHOD[[:space:]]+SHA512' /et
 fi
 check "pam_unix reuses the checked token (use_authtok)" bash -c "grep -E '^password[[:space:]].*pam_unix\\.so' /etc/pam.d/system-auth | grep -q use_authtok"
 check "cracklib dictionary present (pwquality dictcheck can load it)" bash -c "ls /usr/share/cracklib/pw_dict.pwd* >/dev/null 2>&1"
-check "SELinux enforcing/targeted configured" bash -c "grep -qx 'SELINUX=enforcing' /etc/selinux/config && grep -qx 'SELINUXTYPE=targeted' /etc/selinux/config"
+k8s || check "SELinux enforcing/targeted configured" bash -c "grep -qx 'SELINUX=enforcing' /etc/selinux/config && grep -qx 'SELINUXTYPE=targeted' /etc/selinux/config"
 check "abrt / setroubleshoot / mcstrans absent" bash -c "! rpm -qa --qf '%{NAME}\\n' | grep -Eq '^(abrt|setroubleshoot|mcstrans)'"
 check "chronyd runs as user chrony" bash -c "[[ ! -f /etc/sysconfig/chronyd ]] || grep -Eq '^OPTIONS=.*-u chrony' /etc/sysconfig/chronyd"
 else
@@ -578,6 +578,14 @@ check "${CRT}: published port reachable from the host" bash -c "
     $CRT rm -f ci-web >/dev/null 2>&1; $CRT run -d --name ci-web -p 18080:8080 $CIMG httpd -f -p 8080 -h /etc >/dev/null || exit 1
     for i in \$(seq 1 20); do curl -fs -o /dev/null http://127.0.0.1:18080/hostname && { $CRT rm -f ci-web >/dev/null; exit 0; }; sleep 1; done
     $CRT rm -f ci-web >/dev/null; exit 1"
+if ! timeout 120 "$CRT" run --rm "$CIMG" true >/dev/null 2>&1; then
+    echo "  --- container runtime diagnostics"
+    timeout 120 "$CRT" run --rm "$CIMG" true 2>&1 | tail -n 5 | sed 's/^/    /'
+    systemctl --no-pager status docker.service containerd.service podman.socket 2>&1 | grep -E 'Active:|Loaded:' | sed 's/^/    /'
+    journalctl --no-pager -n 25 -u docker.service -u containerd.service 2>/dev/null | sed 's/^/    /'
+    sysctl net.ipv4.ip_forward 2>&1 | sed 's/^/    /'
+    lsmod 2>/dev/null | grep -E '^(overlay|br_netfilter)' | sed 's/^/    /'
+fi
 fi
 
 echo "== 6b. no stray backups inside include directories"

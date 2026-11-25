@@ -434,6 +434,17 @@ desktop_detected() {
 is_deb()    { [[ $OS_FAMILY == deb ]]; }
 
 # --- package layer (dpkg/apt on the Debian family, rpm/dnf on the RHEL family)
+# GitHub release downloads intermittently answer 403/5xx; plain --retry only
+# retries transient errors. --retry-all-errors needs curl 7.71+ (not EL8).
+# set_curl_retry - fill CURL_RETRY_ALL (call right before downloading: curl
+# may only be installed by the base stack).
+CURL_RETRY_ALL=()
+set_curl_retry() {
+    CURL_RETRY_ALL=()
+    if curl --help all 2>/dev/null | qgrep -- '--retry-all-errors'; then CURL_RETRY_ALL=(--retry-all-errors --retry-delay 5); fi
+    return 0
+}
+
 pkg_installed() {
     if is_rhel; then
         rpm -q --quiet "$1" 2>/dev/null
@@ -2262,7 +2273,8 @@ install_fips_provider() {
     install -d -m 0700 "$build"
     local tarball=${CACHE_DIR}/openssl-${FIPS_OPENSSL_VERSION}.tar.gz
     if [[ ! -f $tarball ]] || ! echo "${FIPS_OPENSSL_SHA256}  ${tarball}" | sha256sum -c --status; then
-        curl -fsSL --proto '=https' --tlsv1.2 --retry 5 -o "$tarball" "$FIPS_OPENSSL_URL"
+        set_curl_retry
+        curl -fsSL --proto '=https' --tlsv1.2 --retry 5 "${CURL_RETRY_ALL[@]}" -o "$tarball" "$FIPS_OPENSSL_URL"
     fi
     echo "${FIPS_OPENSSL_SHA256}  ${tarball}" | sha256sum -c --status \
         || die "SHA-256 mismatch for ${tarball}: refusing to build an unverified FIPS module"
@@ -3003,10 +3015,13 @@ ufw_container_ifaces() {
     for f in /etc/ufw/before.rules /etc/ufw/before6.rules; do
         [[ -f $f ]] || continue
         block="# BEGIN ${MARK} container interfaces"$'\n'
+        # before6.rules names its chains ufw6-*.
+        local c=ufw
+        [[ $f == */before6.rules ]] && c=ufw6
         for i in "${CNI_IFACES[@]}"; do
-            block+="-A ufw-before-input -i ${i} -j ACCEPT"$'\n'
-            block+="-A ufw-before-forward -i ${i} -j ACCEPT"$'\n'
-            block+="-A ufw-before-forward -o ${i} -j ACCEPT"$'\n'
+            block+="-A ${c}-before-input -i ${i} -j ACCEPT"$'\n'
+            block+="-A ${c}-before-forward -i ${i} -j ACCEPT"$'\n'
+            block+="-A ${c}-before-forward -o ${i} -j ACCEPT"$'\n'
         done
         # Calico IP-in-IP (protocol 4) between nodes, IPv4 only.
         if [[ $f == */before.rules ]] && is_k8s; then block+="-A ufw-before-input -p 4 -j ACCEPT"$'\n'; fi
@@ -4641,9 +4656,10 @@ find_datastream() {
     if [[ $SSG_DOWNLOAD == 1 && ! -f ${cache}/.unavailable-${name} ]]; then
         install -d -m 0750 "$cache"
         local zip=${CACHE_DIR}/scap-security-guide-${SSG_VERSION}.zip
+        set_curl_retry
         if [[ -f $zip ]] && echo "${SSG_SHA512}  ${zip}" | sha512sum -c --status; then
             :
-        elif ! { curl -fsSL --proto '=https' --tlsv1.2 --retry 5 -o "$zip" "$SSG_URL" \
+        elif ! { curl -fsSL --proto '=https' --tlsv1.2 --retry 5 "${CURL_RETRY_ALL[@]}" -o "$zip" "$SSG_URL" \
                  && echo "${SSG_SHA512}  ${zip}" | sha512sum -c --status; }; then
             rm -f "$zip"
             echo "SSG ${SSG_VERSION} download or SHA-512 verification failed" >&2
