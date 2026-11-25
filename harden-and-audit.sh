@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly SCRIPT_VERSION="2.1.2"
+readonly SCRIPT_VERSION="2.1.3"
 readonly SCRIPT_NAME="harden-and-audit.sh"
 readonly LOG_FILE="/var/log/harden-and-audit.log"
 readonly STATE_DIR="/var/lib/harden-and-audit"
@@ -84,6 +84,9 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${LOG_MIN_FREE_PCT:=15}"          # also prune while the /var/log filesystem has less free space than this
 : "${LOG_ROTATE_KEEP:=14}"           # rotated generations kept per log (logs are shipped off-host)
 : "${LOG_MAXSIZE:=100M}"             # a log larger than this rotates at the next hourly logrotate run
+: "${BANNER_STYLE:=generic}"        # generic|dod - generic notice for any organization; dod = DoD Notice and Consent (USG systems only)
+: "${BANNER_ORG:=}"                  # organization named in the generic notice (empty = "the owner of this system")
+: "${BANNER_FILE:=}"                 # path to custom banner text; overrides BANNER_STYLE
 : "${PROGRESS_INTERVAL:=60}"         # seconds between progress lines during long steps (AIDE, OpenSCAP)
 : "${SSG_VERSION:=0.1.82}"
 : "${SSG_SHA512:=1caea418f0a5aaef7025e1655ca45a80942ea87ee832b943644ba6f9991b14a6ac5b35dddcd04b754e1fc8fbdee7b7f394507d24b123e821cca0354dc4e03cfd}"
@@ -3003,9 +3006,13 @@ configure_sudo() {
 }
 
 configure_banners() {
-    step "5.8 DoD Notice and Consent banner"
-    local banner
-    banner=$(cat <<'EOF'
+    step "5.8 login warning banner (${BANNER_STYLE})"
+    local banner org=${BANNER_ORG:-the owner of this system}
+    # Plain printable text only; no OS/kernel details (CIS 1.7.x).
+    org=${org//[^[:print:]]/}; org=${org//\\/}
+    case ${BANNER_STYLE} in
+        dod)
+            banner=$(cat <<'EOF'
 You are accessing a U.S. Government (USG) Information System (IS) that is provided for USG-authorized use only.
 
 By using this IS (which includes any device attached to this IS), you consent to the following conditions:
@@ -3021,8 +3028,32 @@ By using this IS (which includes any device attached to this IS), you consent to
 -Notwithstanding the above, using this IS does not constitute consent to PM, LE or CI investigative searching or monitoring of the content of privileged communications, or work product, related to personal representation or services by attorneys, psychotherapists, or clergy, and their assistants. Such communications and work product are private and confidential. See User Agreement for details.
 EOF
 )
-    if [[ -n ${BANNER_FILE:-} && -r ${BANNER_FILE:-} ]]; then
-        banner=$(cat "$BANNER_FILE")
+            ;;
+        *)
+            [[ ${BANNER_STYLE} == generic ]] || warn "BANNER_STYLE=${BANNER_STYLE} unknown; using the generic notice"
+            banner=$(cat <<EOF
+WARNING: AUTHORIZED USE ONLY
+
+This computer system is the property of ${org} and is provided for authorized use only.
+
+By using this system you acknowledge and consent to the following:
+
+- All activity on this system may be monitored, recorded, and audited by authorized personnel.
+- You have no expectation of privacy in any communications or data stored on, processed by, or transmitted through this system.
+- Data on this system may be inspected, copied, and disclosed for security, legal, or business purposes, including to law enforcement.
+- Unauthorized access or use is prohibited and may result in disciplinary action and civil or criminal penalties.
+
+If you do not consent to these conditions, disconnect now.
+EOF
+)
+            ;;
+    esac
+    if [[ -n ${BANNER_FILE} ]]; then
+        if [[ -r ${BANNER_FILE} ]]; then
+            banner=$(cat "$BANNER_FILE")
+        else
+            warn "BANNER_FILE=${BANNER_FILE} is not readable; using the ${BANNER_STYLE} notice"
+        fi
     fi
     printf '%s\n' "$banner" | write_file 0644 /etc/issue
     printf '%s\n' "$banner" | write_file 0644 /etc/issue.net
@@ -3033,7 +3064,7 @@ EOF
 }
 
 # Desktop mode, GNOME: lock the screen after 15 idle minutes (5 s grace),
-# DoD banner on the login screen, no user list, no autorun, no window popping
+# Login banner on the login screen, no user list, no autorun, no window popping
 # up on mount (USB drives still mount). Locked so users cannot undo them.
 configure_gnome_desktop() {
     is_desktop || return 0

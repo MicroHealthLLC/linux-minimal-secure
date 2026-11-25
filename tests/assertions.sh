@@ -332,7 +332,8 @@ check "pam_pwhistory enabled"   grep -q 'pam_pwhistory.so.*remember=24' /etc/pam
 check "no nullok"               bash -c "! grep -Eq '^[^#].*nullok' /etc/pam.d/common-auth /etc/pam.d/common-password"
 fi
 check "root can still su to a user (pam_rootok before pam_wheel)" su ciadmin -s /bin/sh -c true
-check "DoD banner on /etc/issue.net" grep -q 'U.S. Government (USG) Information System' /etc/issue.net
+check "login banner on /etc/issue.net" grep -qE 'AUTHORIZED USE ONLY|U\.S\. Government \(USG\) Information System' /etc/issue.net
+check "login banner on /etc/issue" grep -qE 'AUTHORIZED USE ONLY|U\.S\. Government \(USG\) Information System' /etc/issue
 check "sudo log file configured" grep -q '^Defaults logfile="/var/log/sudo.log"' /etc/sudoers.d/60-harden
 check "sudo I/O logging configured" grep -q '^Defaults log_input, log_output' /etc/sudoers.d/60-harden
 if [[ -L /etc/alternatives/sudo ]]; then
