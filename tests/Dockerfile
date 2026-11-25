@@ -8,6 +8,7 @@
 # prove the purge never takes collateral packages with it.
 ARG BASE_IMAGE=debian:12
 FROM ${BASE_IMAGE}
+ARG VARIANT=""
 
 ENV container=docker \
     DEBIAN_FRONTEND=noninteractive
@@ -48,6 +49,17 @@ RUN set -eux; \
         sys-kernel-config.mount sys-kernel-debug.mount sys-kernel-tracing.mount; \
     useradd -m -s /bin/bash -G sudo ciadmin; \
     echo "ciadmin:$(head -c 24 /dev/urandom | base64)Aa1!" | chpasswd
+
+# VARIANT=proxmox: Proxmox VE look-alike (Debian only); VARIANT=k8s: real
+# container runtime + kubeadm control-plane layout. See the stub scripts.
+COPY pve-stub.sh k8s-stub.sh /usr/local/share/ci/
+RUN set -eux; \
+    case "$VARIANT" in \
+        proxmox) sh /usr/local/share/ci/pve-stub.sh ;; \
+        k8s) sh /usr/local/share/ci/k8s-stub.sh ;; \
+        "") ;; \
+        *) echo "unknown VARIANT $VARIANT" >&2; exit 1 ;; \
+    esac
 
 COPY container-init.sh /usr/local/sbin/container-init
 

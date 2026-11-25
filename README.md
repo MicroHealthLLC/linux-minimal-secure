@@ -6,8 +6,25 @@
 |---|---|
 | Debian | **Debian 12 (bookworm)**, **Debian 13 (trixie)**, **Ubuntu 22.04 / 24.04 / 26.04 LTS** |
 | RHEL | **RHEL**, **CentOS Stream**, **Rocky Linux**, **AlmaLinux**, **Oracle Linux**: releases **8, 9 and 10** (any distribution with `ID_LIKE=rhel`), and **Fedora 41+** (server and Workstation) |
+| Hypervisor | **Proxmox VE 8 (Debian 12) and 9 (Debian 13)**: detected automatically (see below) |
 
 **Servers and desktops.** When a display manager is installed (GDM, SDDM, LightDM …), the script runs in **desktop mode**: it hardens the machine without breaking the desktop. The graphical session, printing, Bluetooth, USB drives, network discovery (mDNS) and toolbox/podman keep working; sshd stays off if it was off; terminals get no idle timeout (the screen lock covers that); the gate profile is CIS Level 2 **Workstation**. Force it with `DESKTOP_MODE=1`, or harden a desktop as a server with `DESKTOP_MODE=0`.
+
+**Proxmox VE nodes.** When `pve-manager` is installed the script runs in **Proxmox mode** and keeps everything a node and its cluster need:
+
+* **Root stays usable.** Root keeps SSH: cluster join, live and secure migration, replication and the node shell all run as root over SSH. With a non-root sudo admin present it is `PermitRootLogin prohibit-password` (keys only); otherwise `yes`. Root keeps TCP and unix-socket forwarding for migration tunnels; other users don't. Root's password is exempt from expiry and inactivity locking, because an expired root password breaks key-based cluster logins and `root@pam` in the web UI.
+* **Firewall.** pve-firewall stays the firewall and UFW is never installed. With `PVE_FIREWALL_ENABLE=1` the datacenter firewall is turned on, with SSH and port 8006 allowed first and existing rules kept.
+* **Repositories.** Without a subscription, the enterprise repositories (which return HTTP 401) are swapped for the no-subscription ones, so updates keep working.
+* **Kernel, boot and banner.** IP forwarding is left to the node's network setup. rpcbind (NFS storage), dnsmasq (SDN DHCP), postfix and overlayfs stay. No kernel `fips=1` (Proxmox doesn't support it; user-space FIPS stays). `/etc/kernel/cmdline` and `proxmox-boot-tool refresh` are handled. `pvebanner` no longer overwrites the login banner.
+* **Hands off guest data.** VM disks, container subvolumes, backup and NFS storage and the volatile parts of `/etc/pve` are never scanned, chmod-ed or checksummed. Failed web UI logins get a fail2ban jail, and cluster peers are never banned.
+
+**Container and Kubernetes hosts (every distribution).** Docker, containerd, rootful Podman and Kubernetes (kubeadm, k3s, RKE2, k0s, MicroK8s) are detected **before** anything changes, so hardening never breaks them:
+
+* **Networking.** IP forwarding stays on, overlayfs stays loaded, and routed container traffic and container/CNI interfaces are allowed through UFW/firewalld.
+* **Kubernetes.** Nodes also get the cluster and CNI ports (API server, etcd, kubelet, NodePorts, VXLAN/Geneve/WireGuard/BGP), trusted pod/service networks, loose `rp_filter`, and gratuitous ARP for floating VIPs. SELinux is never raised from permissive on a Kubernetes node.
+* **Container storage.** Image layers, container root filesystems and etcd are never scanned, chmod-ed or checksummed.
+
+Set `K8S_TRUSTED_CIDRS` to restrict the cluster ports to your node network.
 
 | | |
 |---|---|
@@ -17,7 +34,7 @@
 | FIPS | Debian family: kernel `fips=1` plus the **NIST CMVP validated OpenSSL 3.1.2 FIPS provider (FIPS 140-3, cert #4985)**, active alongside the default provider. RHEL family: the distribution's own FIPS module (`fips-mode-setup` on 8/9; crypto policy `FIPS` + `fips=1` on 10) |
 | Reports | `/var/log/scap-results.xml`, `/var/log/scap-report.html`, `/var/log/scap-summary.txt` |
 
-> **About STIGs.** DISA does not publish a STIG for Debian, so no Debian STIG SCAP profile exists. DISA does publish STIGs for Ubuntu 22.04 and 24.04; CI scans and reports them. On every OS the gate is the CIS Level 2 Server benchmark, and the DoD-specific STIG controls are implemented natively: the DoD Notice & Consent banner, FIPS cryptography, FIPS-only SSH algorithms, the STIG audit rule set, account lockout, and session lock.
+> **About STIGs.** DISA does not publish a STIG for Debian, so no Debian STIG SCAP profile exists. DISA does publish STIGs for Ubuntu 22.04 and 24.04; CI scans and reports them. On every OS the gate is the CIS Level 2 Server benchmark, and the DoD-specific STIG controls are implemented natively: the DoD Notice & Consent banner (opt-in, `BANNER_STYLE=dod`), FIPS cryptography, FIPS-only SSH algorithms, the STIG audit rule set, account lockout, and session lock.
 >
 > **About RHEL.** Red Hat Enterprise Linux needs a subscription, so public CI tests its rebuilds (Rocky Linux and AlmaLinux 8/9/10, CentOS Stream 9/10), which take the identical code path. On RHEL the script additionally checks that a repository is enabled (register with `subscription-manager` first) and installs EPEL from the Fedora project.
 >
@@ -33,7 +50,8 @@ sha256sum -c harden-and-audit.sh.sha256
 
 # Prerequisite: a NON-ROOT administrator in the sudo group (Debian/Ubuntu) or the
 # wheel group (RHEL family) with an SSH key or password. The script refuses to
-# run without one, because it disables root SSH login.
+# run without one, because it disables root SSH login. (Proxmox VE nodes keep
+# root SSH for the cluster, so there it is recommended, not required.)
 sudo bash harden-and-audit.sh
 sudo reboot     # activates fips=1, audit=1, SELinux enforcing (EL) and the other kernel arguments
 ```
@@ -72,11 +90,11 @@ The table describes the Debian family; the RHEL-family equivalents follow it.
 | Kernel cmdline | `audit=1 audit_backlog_limit=8192 apparmor=1 security=apparmor slab_nomerge=yes pti=on page_alloc.shuffle=1 vsyscall=none init_on_alloc=1 spectre_v2=on spec_store_bypass_disable=seccomp rng_core.default_quality=500` |
 | Files | passwd/group 0644 root:root, shadow/gshadow 0640 root:shadow, backups, cron, sshd keys, grub.cfg 0400, audit config, logs, home directories 0750, world-writable cleanup |
 | sysctl | No forwarding, redirects, or source routing. rp_filter, martian logging, syncookies, RA off (when safe), ASLR, kptr/dmesg restrict, ptrace scope, BPF hardening, protected links/fifos, no setuid core dumps. Conflicting vendor values (Ubuntu `rp_filter=2`, `sysrq=176`, `protect-links` ordering) are neutralised so they cannot win at boot |
-| SSH | No root, no X11/TCP/agent forwarding, `MaxAuthTries 4`, `ClientAliveInterval 300` × 3, `LoginGraceTime 60`, `AllowGroups ssh-users`, DoD banner, FIPS-approved ciphers/MACs/KEX only, moduli ≥ 3071 bits |
+| SSH | No root, no X11/TCP/agent forwarding, `MaxAuthTries 4`, `ClientAliveInterval 300` × 3, `LoginGraceTime 60`, `AllowGroups ssh-users`, login banner, FIPS-approved ciphers/MACs/KEX only, moduli ≥ 3071 bits |
 | Firewall | UFW default deny inbound/routed, SSH allowed, loopback rules, logging, enabled with `--force` |
 | Accounts | pwquality (15 chars, 4 classes, dictcheck, enforce for root), history 24, faillock (4 tries / 15 min), yescrypt, aging, inactivity 45 days, umask 027, `TMOUT=900`, su limited to the empty `sugroup`, sudo `use_pty` + logfile + I/O logging (Ubuntu 26.04: classic sudo is selected over sudo-rs, which has no log file or I/O logging) |
 | Ubuntu extras | apport / whoopsie / popularity-contest removed (or disabled where a metapackage depends on them), motd-news off, `/etc/netplan` audited, distro-disabled AppArmor profiles loaded in complain mode, socket-activated sshd handled. snapd is kept (cloud agents ship as snaps) |
-| Other | DoD banner, kernel module blacklist (cramfs, udf, usb-storage, dccp, sctp, rds, tipc, overlay…), `/tmp` `/var/tmp` `/dev/shm` nodev/nosuid/noexec, no core dumps, journald persistent + bounded, rsyslog 0640 + no listeners, logrotate hourly (daily/14/compress/100M cap) + hard `/var/log` budget (4G, 15% disk free) that prunes the oldest rotated archives, NTP, AppArmor enforce, AIDE + daily timer, fail2ban, local-only MTA, Ctrl-Alt-Del masked, tmux lock |
+| Other | Login warning banner (generic; DoD text opt-in), kernel module blacklist (cramfs, udf, usb-storage, dccp, sctp, rds, tipc, overlay…), `/tmp` `/var/tmp` `/dev/shm` nodev/nosuid/noexec, no core dumps, journald persistent + bounded, rsyslog 0640 + no listeners, logrotate hourly (daily/14/compress/100M cap) + hard `/var/log` budget (4G, 15% disk free) that prunes the oldest rotated archives, NTP, AppArmor enforce, AIDE + daily timer, fail2ban, local-only MTA, Ctrl-Alt-Del masked, tmux lock |
 | CUDA | `libc6 libc6-dev gcc make build-essential pkg-config dkms` + kernel headers (`linux-headers-amd64` on Debian; on Ubuntu the headers of every installed kernel flavour, e.g. `linux-headers-generic`/`-virtual`/`-aws`) + running kernel headers, nouveau blacklisted, initramfs (or dracut) regenerated. The NVIDIA driver itself is not installed. |
 | coturn / media | Runtime libraries only, with **no coturn and no X11**: libevent (+openssl/pthreads/extra), hiredis, mariadb, pq, sqlite, ssl, systemd, microhttpd, opus, vpx, srtp2, x264, x265, aom, dav1d, ogg, vorbis, speex, webp, theora, flac, lame, sndfile, samplerate, soxr, gsm, usrsctp, jansson, libconfig, websockets, curl. Large UDP socket buffers via sysctl. |
 | OpenSCAP | Debian: `openscap-scanner`, `openscap-utils`, `ssg-debian`. Ubuntu 24.04/26.04: `openscap-scanner`, `openscap-utils`, `ssg-debderived`. Ubuntu 22.04: `libopenscap8` (the only OpenSCAP jammy packages). Scans with the SHA-512-pinned SSG 0.1.82 datastream (the distro packages are older or lack the content), falling back to packaged content offline |
@@ -118,7 +136,16 @@ The table describes the Debian family; the RHEL-family equivalents follow it.
 | `PASS_MAX_DAYS` | `365` | DoD sites commonly use `60` |
 | `FAILLOCK_DENY` / `FAILLOCK_UNLOCK_TIME` | `4` / `900` | Temporary lockout |
 | `SHELL_TMOUT` | `900` | Idle shell timeout and tmux lock (seconds) |
-| `ALLOW_CONTAINERS` | `0` | `1` keeps overlayfs and IPv4 forwarding for Docker/Podman hosts |
+| `ALLOW_CONTAINERS` | `auto` | `auto` = on when Docker, containerd, rootful Podman or Kubernetes is found: keeps overlayfs, IP forwarding, routed container traffic and container/CNI interfaces. `1` force (set it **before** installing a runtime on an already-hardened host), `0` off |
+| `KUBERNETES_MODE` | `auto` | `auto` = on when kubelet, k3s, RKE2, k0s or MicroK8s is found: cluster/CNI ports, trusted pod/service networks, loose rp_filter, SELinux mode not raised. `1` force, `0` off |
+| `K8S_TRUSTED_CIDRS` | *(empty)* | Node/management networks allowed to reach the cluster ports (API server, etcd, kubelet, CNI). Empty = any source (a warning is printed) |
+| `K8S_EXTRA_PORTS` | *(empty)* | More inbound ports on Kubernetes nodes, e.g. `"9100/tcp 7946/tcp 7946/udp"` (node exporter, MetalLB) |
+| `PROXMOX_MODE` | `auto` | `auto` = Proxmox mode when `pve-manager` is installed; `1` force; `0` treat the node as plain Debian (not recommended) |
+| `PVE_ROOT_SSH` | `auto` | Proxmox: `auto` = `prohibit-password` when a non-root sudo admin exists, else `yes`; or set `yes` / `prohibit-password` |
+| `PVE_REPO` | `auto` | Proxmox: `auto` = enterprise repositories with an active subscription, otherwise no-subscription; `enterprise`, `no-subscription` or `keep` (leave the repositories alone) |
+| `PVE_FIREWALL_ENABLE` | `0` | Proxmox: `1` turns the datacenter firewall on (SSH and 8006 accept rules first, existing rules kept). **Cluster-wide** setting |
+| `PVE_FIREWALL_MGMT_SOURCE` | *(empty)* | Proxmox: source CIDR(s) for those SSH/8006 rules (empty = any) |
+| `PVE_KERNEL_FIPS` | `0` | Proxmox: `1` also boots the node with `fips=1` (unsupported by Proxmox; may keep corosync out of quorum) |
 | `KEEP_IPV6_RA` | `auto` | `auto` keeps RA when SLAAC is in use |
 | `FIREWALL_OUTBOUND_POLICY` / `FIREWALL_EXTRA_OUT` | `allow` / *(empty)* | `deny` + allow-list for egress filtering (UFW or firewalld). The old names `UFW_OUTBOUND_POLICY` / `UFW_EXTRA_OUT` still work |
 | `EPEL_ENABLE` | `1` | RHEL family: enable CRB/PowerTools + EPEL (fail2ban, dkms, some media libraries). Not used on Fedora |
@@ -131,7 +158,9 @@ The table describes the Debian family; the RHEL-family equivalents follow it.
 | `LOG_MAX_TOTAL` | `4G` | Hard cap for `/var/log`: after every hourly logrotate run, the oldest *rotated* archives are pruned (never live logs; the journal is capped at 512M by journald). Logs are expected to be shipped off-host |
 | `LOG_MIN_FREE_PCT` | `15` | Also prune while the `/var/log` filesystem has less free space than this, so logs can never fill the disk |
 | `LOG_ROTATE_KEEP` / `LOG_MAXSIZE` | `14` / `100M` | Rotated generations per log / size that triggers rotation at the next hourly run |
-| `BANNER_FILE` | *(DoD banner)* | Custom login banner text |
+| `BANNER_STYLE` | `generic` | `generic` = authorized-use / monitoring / no-privacy notice suitable for any company or agency; `dod` = DoD Notice and Consent banner (USG systems only, matches the DISA STIG check text) |
+| `BANNER_ORG` | *(empty)* | Organization named in the generic notice, e.g. `BANNER_ORG="Example Corp"` (empty = "the owner of this system") |
+| `BANNER_FILE` | *(empty)* | Path to your own banner text; overrides `BANNER_STYLE` |
 
 ## Progress output
 
@@ -170,6 +199,9 @@ tests/run-ci.sh ubuntu 24.04
 tests/run-ci.sh ubuntu 26.04
 tests/run-ci.sh rocky 9          # also: rocky 8|10, almalinux 8|9|10, centos 9|10 (Stream), fedora 44|45
 tests/run-ci.sh fedora 45 desktop   # GNOME desktop: proves desktop mode keeps the desktop
+tests/run-ci.sh debian 12 proxmox   # Proxmox VE 8 look-alike (also: debian 13 proxmox = PVE 9)
+tests/run-ci.sh ubuntu 24.04 k8s    # Docker + kubeadm node: containers must still run (privileged CI only)
+tests/run-ci.sh rocky 9 k8s         # Podman + kubeadm node on the RHEL family
 ```
 
 ## Documentation
@@ -177,5 +209,6 @@ tests/run-ci.sh fedora 45 desktop   # GNOME desktop: proves desktop mode keeps t
 * [docs/PLAN.md](docs/PLAN.md): analysis and implementation plan (Debian)
 * [docs/PLAN-UBUNTU.md](docs/PLAN-UBUNTU.md): analysis and implementation plan for Ubuntu 22.04 / 24.04 / 26.04
 * [docs/PLAN-RHEL.md](docs/PLAN-RHEL.md): analysis and implementation plan for the RHEL family and the linux-minimal-secure rename
+* [docs/PLAN-PROXMOX-CONTAINERS.md](docs/PLAN-PROXMOX-CONTAINERS.md) / [docs/GAP-ANALYSIS-PROXMOX-CONTAINERS.md](docs/GAP-ANALYSIS-PROXMOX-CONTAINERS.md): Proxmox VE nodes, container and Kubernetes hosts (plan and delivery)
 * [docs/EXCEPTIONS.md](docs/EXCEPTIONS.md): deviations from CIS/ANSSI/STIG and the reason for each
 * [docs/GAP-ANALYSIS.md](docs/GAP-ANALYSIS.md) / [docs/GAP-ANALYSIS-UBUNTU.md](docs/GAP-ANALYSIS-UBUNTU.md) / [docs/GAP-ANALYSIS-RHEL.md](docs/GAP-ANALYSIS-RHEL.md): what was delivered against each plan

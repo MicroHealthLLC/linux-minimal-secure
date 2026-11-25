@@ -151,3 +151,34 @@ Fedora content defects (fail on every Fedora host): `ensure_fedora_gpgkey_instal
 ### 9.3 Rules expected to fail in CI containers
 
 As on Debian/Ubuntu (§5), rules that need a booted kernel, a real bootloader or host-global state (kernel FIPS mode, `grub2_*` arguments in BLS entries, SELinux runtime state, auditd/chronyd/firewalld service state in an unprivileged run, separate partitions) fail inside the CI container and pass on a real host or VM. The CI job summary of each EL target lists the failing rules.
+
+## 10. Proxmox VE nodes (Proxmox mode)
+
+Proxmox VE is a Debian 12/13 system, so it is scanned with the CIS Debian profile. The following rules fail **by design** on a node, because satisfying them would break the hypervisor or its cluster:
+
+| Rule(s) | Why it fails |
+|---|---|
+| `sshd_disable_root_login` | Cluster join, live/secure migration, replication, the node shell and console proxying run as root over SSH between nodes. Root is limited to keys (`prohibit-password`) when a non-root sudo admin exists |
+| `sshd_disable_forwarding` / `sshd_disable_tcp_forwarding` (root only, via `Match User root`) | Secure migration tunnels QEMU and NBD streams through SSH port and unix-socket forwarding |
+| `accounts_password_set_max_life_root`, root inactivity | An expired root password makes PAM reject root's key logins between nodes and blocks `root@pam` in the web UI |
+| `package_ufw_installed`, `ufw_*` (Debian 13) and the nftables-path rules (Debian 12) | pve-firewall owns netfilter. UFW or a separate nftables service would overwrite its rules. Datacenter firewall: `PVE_FIREWALL_ENABLE=1` |
+| `sysctl_net_ipv4_ip_forward`, `sysctl_net_ipv6_conf_all_forwarding` | Left to the node's network configuration: NAT, routed and SDN guests need forwarding |
+| `service_rpcbind_disabled`, `package_rpcbind_removed`, `package_dnsmasq_removed` | NFSv3 storage needs rpcbind (nfs-common); SDN DHCP needs dnsmasq. Both are dependencies of the management stack |
+| `kernel_module_overlay_disabled` (where checked), `kernel_module_sctp_disabled` when corosync uses SCTP | Docker inside LXC containers; corosync `knet_transport: sctp` |
+| kernel `fips=1` (FIPS kernel mode) | Proxmox does not support it. corosync/knet (NSS) switching to FIPS mode at boot can keep the node out of quorum. The validated OpenSSL FIPS provider is still installed. `PVE_KERNEL_FIPS=1` forces it |
+| `banner_etc_issue` after a reboot (avoided) | `pvebanner.service` rewrites `/etc/issue` at every boot; the script masks it so the banner stays |
+
+AIDE also leaves out guest storage (`/var/lib/vz`, ZFS `subvol-*`, `/mnt/pve`, `dir` storage paths from `storage.cfg`), the cluster database and metrics, and the volatile parts of `/etc/pve` (virtual dot files, the auth keys that rotate daily, HA `lrm_status`, locks). Configuration files in `/etc/pve` (`storage.cfg`, `user.cfg`, firewall and guest configs) stay monitored.
+
+## 11. Container and Kubernetes hosts
+
+| Rule(s) | Why it fails |
+|---|---|
+| `sysctl_net_ipv4_ip_forward` | Container and pod networks are routed through the host. Kubernetes requires `ip_forward=1` |
+| `kernel_module_overlay_disabled` (where checked) | overlayfs stores image layers for Docker, containerd and Podman |
+| `ufw_default_forward`-style rules / routed policy | Routed container traffic is allowed (`DEFAULT_FORWARD_POLICY="ACCEPT"`); container/CNI interfaces may reach node services |
+| `sysctl_net_ipv4_conf_all_rp_filter` (Kubernetes) | Loose mode (2): CNIs (Cilium, Calico eBPF, multi-NIC nodes) route asymmetrically, and strict mode drops pod traffic |
+| open ports | Kubernetes nodes open the API server, etcd, kubelet, NodePort and CNI overlay ports. Restrict them with `K8S_TRUSTED_CIDRS` |
+| `selinux_state` (RHEL family, Kubernetes) | Raising SELinux from permissive can stop kubelet, CNI or hostPath workloads after the next boot. The mode is kept; enable it once `container-selinux` and your distribution's policy are in place |
+
+Unattended security updates stay mandatory. Updates to `docker.io`/`containerd` from the distribution's security pocket restart the daemon. Set `"live-restore": true` in `/etc/docker/daemon.json` so containers keep running across those restarts.

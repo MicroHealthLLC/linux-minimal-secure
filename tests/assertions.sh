@@ -51,6 +51,16 @@ desktop() { [[ $DESKTOP == 1 ]]; }
 echo "== desktop mode: ${DESKTOP}"
 deb()  { [[ $FAMILY == deb ]]; }
 rhel() { [[ $FAMILY == rhel ]]; }
+# Proxmox VE node (pve-manager), Kubernetes node (kubelet), container host.
+PVE=0; K8S=0; CTR=0
+deb && [[ "$(dpkg-query -W -f='${db:Status-Status}' pve-manager 2>/dev/null)" == installed ]] && PVE=1
+{ command -v kubelet || command -v k3s; } >/dev/null 2>&1 && K8S=1
+{ command -v dockerd || systemctl is-enabled --quiet podman.socket; } >/dev/null 2>&1 && CTR=1
+[[ $K8S == 1 ]] && CTR=1
+pve() { [[ $PVE == 1 ]]; }
+k8s() { [[ $K8S == 1 ]]; }
+ctr() { [[ $CTR == 1 ]]; }
+echo "== proxmox: ${PVE}  kubernetes: ${K8S}  container host: ${CTR}"
 echo "== target: ${PRETTY_NAME} (${FAMILY} family)"
 
 echo "== 1. minimalism"
@@ -60,7 +70,14 @@ check "apt Install-Suggests disabled"   bash -c "apt-config dump | grep -Eq 'APT
 for p in xserver-xorg-core xterm xauth x11-utils; do check "graphical package ${p} purged" not_installed "$p"; done
 avc=$(dpkg-query -W -f='${Package}\n' 'libavcodec[0-9]*' 2>/dev/null | head -n1)
 check "dependency-aware purge kept non-graphical ${avc:-libavcodec}" installed "${avc:-libavcodec-missing}"
+if pve; then
+check "legacy service inetutils-telnet purged" not_installed inetutils-telnet
+check "Proxmox VE: rpcbind kept for NFS storage" installed rpcbind
+check "Proxmox VE: rpcbind not masked" bash -c "[[ \$(systemctl is-enabled rpcbind.service 2>/dev/null) != masked ]]"
+check "Proxmox VE: management stack intact (proxmox-ve, pve-manager, postfix, nfs-common)" bash -c "for p in proxmox-ve pve-manager pve-firewall postfix nfs-common; do dpkg-query -W -f='\${db:Status-Status}' \$p | grep -qx installed || exit 1; done"
+else
 for p in inetutils-telnet rpcbind; do check "legacy service ${p} purged" not_installed "$p"; done
+fi
 else
 check "dnf: no weak dependencies"      grep -Eq '^install_weak_deps=(False|0)$' /etc/dnf/dnf.conf
 check "dnf: gpgcheck=1"                grep -Eq '^gpgcheck=1$' /etc/dnf/dnf.conf
@@ -83,7 +100,7 @@ check "dependency-aware removal kept non-graphical gd (links libX11)" installed 
 fi
 for p in telnet rpcbind; do check "legacy service ${p} removed" not_installed "$p"; done
 fi
-check "nothing left listening on the portmapper port 111" bash -c "! ss -Htuln | awk '{print \$5}' | grep -Eq ':111\$'"
+pve || check "nothing left listening on the portmapper port 111" bash -c "! ss -Htuln | awk '{print \$5}' | grep -Eq ':111\$'"
 desktop || check "default target is multi-user" bash -c "[[ \$(systemctl get-default) == multi-user.target ]]"
 
 echo "== 2. repositories, base stack, unattended upgrades"
@@ -117,9 +134,12 @@ if [[ $OS == ubuntu ]]; then
     check "Ubuntu components main restricted universe multiverse" grep -q '^Components: main restricted universe multiverse$' "$SRC"
     check "no active duplicate official one-line entries" bash -c "! grep -Eq '^[[:space:]]*deb[[:space:]].*ubuntu\.com' /etc/apt/sources.list 2>/dev/null"
 fi
-for p in openssh-server tmux curl git ufw fail2ban libpam-pwquality auditd unattended-upgrades sudo rsyslog aide apparmor; do
+BASE_PKGS=(openssh-server tmux curl git fail2ban libpam-pwquality auditd unattended-upgrades sudo rsyslog aide apparmor)
+pve || BASE_PKGS+=(ufw)
+for p in "${BASE_PKGS[@]}"; do
     check "package ${p} installed" installed "$p"
 done
+pve && check "Proxmox VE: UFW not installed (pve-firewall owns netfilter)" not_installed ufw
 check "unattended-upgrade enabled daily" bash -c "apt-config dump | grep -q 'APT::Periodic::Unattended-Upgrade \"1\"'"
 if [[ $OS == ubuntu ]]; then
     check "unattended-upgrade security origin" bash -c "apt-config dump | grep -qF 'origin=Ubuntu,archive=\${distro_codename}-security,label=Ubuntu'"
@@ -178,6 +198,15 @@ check "TLS client works under the FIPS policy (curl https)" curl -fsS -o /dev/nu
 check "SHA-256 available"               bash -c "echo x | openssl dgst -sha256"
 # EL8 passes the policy to sshd as -o options (CRYPTO_POLICY); EL9+ includes a config snippet.
 check "sshd offers FIPS-approved ciphers only" bash -c "CRYPTO_POLICY=; f=/etc/crypto-policies/back-ends/opensshserver.config; grep -q '^CRYPTO_POLICY=' \$f && . \$f; sshd -T \$CRYPTO_POLICY 2>/dev/null | awk '\$1==\"ciphers\"{print \$2}' | tr , '\\n' | grep -vxE 'aes(128|192|256)-(ctr|cbc)|aes(128|256)-gcm@openssh.com' | wc -l | grep -qx 0"
+elif pve; then
+check "Proxmox VE: no kernel fips=1 in GRUB (unsupported by Proxmox)" bash -c "! grep -q 'fips=1' /etc/default/grub"
+check "Proxmox VE: no kernel fips=1 in /etc/kernel/cmdline" bash -c "! grep -q 'fips=1' /etc/kernel/cmdline"
+check "audit=1 on the GRUB command line" grep -Eq '^GRUB_CMDLINE_LINUX=".*\baudit=1\b' /etc/default/grub
+check "Proxmox VE: audit=1 and apparmor=1 in /etc/kernel/cmdline (systemd-boot)" bash -c "grep -qw 'audit=1' /etc/kernel/cmdline && grep -qw 'apparmor=1' /etc/kernel/cmdline"
+check "Proxmox VE: original root= argument kept in /etc/kernel/cmdline" grep -q 'root=ZFS=rpool/ROOT/pve-1' /etc/kernel/cmdline
+check "Proxmox VE: kernel arguments not duplicated" bash -c "[[ \$(tr ' ' '\n' </etc/kernel/cmdline | sort | uniq -d | wc -l) == 0 ]]"
+check "Proxmox VE: proxmox-boot-tool refresh ran" grep -q refresh /var/log/pbt-stub.log
+check "GRUB entries remain bootable without password (--unrestricted)" grep -q -- '--unrestricted' /etc/grub.d/10_linux
 else
 check "fips=1 on the GRUB command line" grep -Eq '^GRUB_CMDLINE_LINUX=".*\bfips=1\b' /etc/default/grub
 check "fips=1 on the default GRUB command line string" grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=".*\bfips=1\b' /etc/default/grub
@@ -188,6 +217,8 @@ check "effective GRUB command line keeps fips=1 and audit=1 after drop-ins" bash
     . /etc/default/grub; for f in /etc/default/grub.d/*.cfg; do [ -f "$f" ] && . "$f"; done
     [[ " $GRUB_CMDLINE_LINUX_DEFAULT " == *" fips=1 "* && " $GRUB_CMDLINE_LINUX " == *" fips=1 "* && " $GRUB_CMDLINE_LINUX " == *" audit=1 "* ]]'
 check "GRUB entries remain bootable without password (--unrestricted)" grep -q -- '--unrestricted' /etc/grub.d/10_linux
+fi
+if deb; then
 check "OpenSSL FIPS provider active"    bash -c "openssl list -providers | grep -A3 -E '^[[:space:]]*fips' | grep -q 'status: active'"
 check "OpenSSL default provider active" bash -c "openssl list -providers | grep -A3 -E '^[[:space:]]*default' | grep -q 'status: active'"
 check "FIPS provider is the validated ${FIPS_VER:=3.1.2}" bash -c "openssl list -providers | grep -A3 -E '^[[:space:]]*fips' | grep -q 'version: ${FIPS_VER}'"
@@ -223,21 +254,54 @@ fi
 check "/etc/passwd root:root 0644"    bash -c "[[ \$(stat -c '%U:%G %a' /etc/passwd) == 'root:root 644' ]]"
 check "/etc/group root:root 0644"     bash -c "[[ \$(stat -c '%U:%G %a' /etc/group) == 'root:root 644' ]]"
 S=/etc/sysctl.d/60-harden.conf
-for kv in 'net.ipv4.ip_forward = 0' 'net.ipv4.conf.all.accept_redirects = 0' 'net.ipv4.conf.all.accept_source_route = 0' \
+FWD_KV='net.ipv4.ip_forward = 0'
+ctr && FWD_KV='net.ipv4.ip_forward = 1'
+pve && ! ctr && FWD_KV='net.ipv4.conf.all.send_redirects = 0'   # forwarding is not set on Proxmox VE
+for kv in "$FWD_KV" 'net.ipv4.conf.all.accept_redirects = 0' 'net.ipv4.conf.all.accept_source_route = 0' \
           'net.ipv4.conf.all.send_redirects = 0' 'net.ipv6.conf.all.accept_redirects = 0' 'net.ipv4.tcp_syncookies = 1'; do
     check "sysctl file: ${kv}" grep -qx "$kv" "$S"
 done
 # Vendor files (Ubuntu 10-/55-network-security, *protect-links*) must not
 # override the hardening at boot.
+if k8s; then
+check "Kubernetes: boot-time rp_filter loose (2) for CNI traffic" sysctl_is net.ipv4.conf.all.rp_filter 2
+else
 check "boot-time net.ipv4.conf.all.rp_filter = 1" sysctl_is net.ipv4.conf.all.rp_filter 1
+fi
+if pve; then
+check "Proxmox VE: forwarding not set by the hardening file" bash -c "! grep -Eq '^net\.ipv4\.(ip_forward|conf\.all\.forwarding)' /etc/sysctl.d/60-harden.conf"
+check "Proxmox VE: admin's ip_forward = 1 (NAT guests) kept at boot" sysctl_is net.ipv4.ip_forward 1
+fi
+if pve || k8s; then
+check "gratuitous ARP accepted (VM migration / floating IPs)" bash -c "! grep -q '^net.ipv4.conf.all.drop_gratuitous_arp = 1' /etc/sysctl.d/60-harden.conf"
+fi
+if ctr; then
+check "container host: boot-time ip_forward = 1" sysctl_is net.ipv4.ip_forward 1
+check "container host: overlay not blacklisted" bash -c "! grep -q 'install overlay ' /etc/modprobe.d/60-harden-blacklist.conf"
+fi
 check "boot-time kernel.sysrq = 0"               sysctl_is kernel.sysrq 0
 check "boot-time fs.protected_fifos = 2"         sysctl_is fs.protected_fifos 2
 if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
     check "runtime net.ipv4.conf.all.accept_redirects = 0" bash -c "[[ \$(sysctl -n net.ipv4.conf.all.accept_redirects) == 0 ]]"
+    if ctr || pve; then
+    check "runtime net.ipv4.ip_forward = 1 (containers / guests keep routing)" bash -c "[[ \$(sysctl -n net.ipv4.ip_forward) == 1 ]]"
+    else
     check "runtime net.ipv4.ip_forward = 0" bash -c "[[ \$(sysctl -n net.ipv4.ip_forward) == 0 ]]"
+    fi
 fi
 check "sshd config valid"              sshd -t
+if pve; then
+sshd_root() { local out; out=$(sshd -T -C user=root,host=pve2,addr=10.0.0.12 2>/dev/null) || return 1; grep -qix "$1" <<<"$out"; }
+check "Proxmox VE: sshd PermitRootLogin prohibit-password (keys for cluster ops)" sshd_t 'permitrootlogin without-password'
+check "Proxmox VE: root keeps TCP forwarding (secure migration)" sshd_root 'allowtcpforwarding yes'
+check "Proxmox VE: root keeps unix-socket forwarding (migration tunnels)" sshd_root 'allowstreamlocalforwarding yes'
+check "Proxmox VE: root forwarding not globally disabled" sshd_root 'disableforwarding no'
+check "Proxmox VE: other users still have forwarding disabled" sshd_t 'disableforwarding yes'
+check "Proxmox VE: root is in ssh-users (AllowGroups)" bash -c "id -nG root | grep -qw ssh-users"
+check "Proxmox VE: root Match block is the last block" bash -c "tail -n 12 /etc/ssh/sshd_config | grep -q '^Match User root'"
+else
 check "sshd PermitRootLogin no"        sshd_t 'permitrootlogin no'
+fi
 check "sshd X11Forwarding no"          sshd_t 'x11forwarding no'
 check "sshd MaxAuthTries 4"            sshd_t 'maxauthtries 4'
 check "sshd ClientAliveInterval 300"   sshd_t 'clientaliveinterval 300'
@@ -281,8 +345,21 @@ if ! ssh -i /root/ciadmin_key -o BatchMode=yes -o StrictHostKeyChecking=no -o Us
         done
     fi
 fi
+if pve; then
+check "Proxmox VE: root key SSH login works (cluster / migration path)" \
+    ssh -i /root/root_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@127.0.0.1 true
+# A real tunnel: an SSH login carried through root's port forward proves the
+# server accepts root's forwarding channels (what secure migration needs).
+check "Proxmox VE: root SSH port forwarding works end to end (secure migration path)" bash -c '
+    o="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    ssh $o -i /root/root_key -o ExitOnForwardFailure=yes -L 127.0.0.1:18022:127.0.0.1:22 -f root@127.0.0.1 sleep 15 || exit 1
+    ssh $o -i /root/ciadmin_key -p 18022 ciadmin@127.0.0.1 true'
+check "Proxmox VE: root password never expires (cluster logins)" bash -c "chage -l root | grep -Ei 'maximum number of days' | grep -q 99999"
+check "Proxmox VE: root account has no inactivity lock" bash -c "chage -l root | grep -Ei 'password inactive' | grep -qi never"
+else
 check "root SSH login is rejected" \
     bash -c "! ssh -i /root/root_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@127.0.0.1 true"
+fi
 if rhel; then
 check "firewalld enabled at boot"      systemctl is-enabled --quiet firewalld
 if ! desktop; then
@@ -292,10 +369,34 @@ check "firewalld: cockpit not open"    bash -c "! grep -q '<service name=\"cockp
 fi
 check "firewalld: loopback anti-spoofing rule (trusted zone)" bash -c "grep -q 'source address=\"127.0.0.1\"' /etc/firewalld/zones/trusted.xml"
 check "nftables.service masked beside firewalld" bash -c "[[ \$(systemctl is-enabled nftables.service 2>/dev/null) == masked ]]"
+if k8s; then
+check "firewalld: Kubernetes API server 6443 open" bash -c "grep -q 'port port=\"6443\" protocol=\"tcp\"' /etc/firewalld/zones/public.xml"
+check "firewalld: kubelet 10250 open" bash -c "grep -q 'port port=\"10250\" protocol=\"tcp\"' /etc/firewalld/zones/public.xml"
+check "firewalld: pod network trusted" bash -c "grep -q 'source address=\"10.244.0.0/16\"' /etc/firewalld/zones/trusted.xml"
+check "SELinux mode not raised on a Kubernetes node" bash -c "grep -q '^SELINUX=permissive' /etc/selinux/config"
+fi
 if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
     check "firewalld running" systemctl is-active --quiet firewalld
     check "firewalld runtime allows SSH" bash -c "firewall-cmd --list-services | grep -qw ssh"
 fi
+elif pve; then
+FW=/etc/pve/firewall/cluster.fw
+check "Proxmox VE: pve-firewall enabled" systemctl is-enabled --quiet pve-firewall.service
+check "Proxmox VE: pve-firewall active" systemctl is-active --quiet pve-firewall.service
+check "Proxmox VE: datacenter firewall enabled (PVE_FIREWALL_ENABLE=1)" bash -c "awk '/^\\[/ {s=\$0} s==\"[OPTIONS]\" && /^enable: 1\$/ {f=1} END {exit !f}' $FW"
+check "Proxmox VE: exactly one enable option" bash -c "[[ \$(grep -c '^enable:' $FW) == 1 ]]"
+check "Proxmox VE: SSH allowed first in [RULES]" bash -c "awk '/^\\[RULES\\]/ {r=1; next} r && NF {print; exit}' $FW | grep -q -- '-dport 22 .*harden-and-audit'"
+check "Proxmox VE: web UI 8006 allowed" grep -q -- '-dport 8006 -log nolog # harden-and-audit' "$FW"
+check "Proxmox VE: management rules not duplicated by re-runs" bash -c "[[ \$(grep -c -- '-dport 8006 -log nolog # harden-and-audit' $FW) == 1 ]]"
+check "Proxmox VE: admin's own rules and ipsets kept" bash -c "grep -q 'dport 3128 # ci admin rule' $FW && grep -q '^\\[IPSET management\\]' $FW && grep -q '^policy_in: DROP' $FW"
+check "Proxmox VE: pvebanner cannot overwrite the login banner" bash -c "[[ \$(systemctl is-enabled pvebanner.service 2>/dev/null) == masked ]]"
+check "Proxmox VE: enterprise repositories disabled without a subscription" bash -c "! grep -Rhs '^[^#]*enterprise\.proxmox\.com' /etc/apt/sources.list.d/*.list; for f in /etc/apt/sources.list.d/*.sources; do awk 'BEGIN{RS=\"\"} /enterprise\\.proxmox\\.com/ && !/Enabled: no/ {exit 1}' \$f || exit 1; done"
+check "Proxmox VE: pve-no-subscription repository configured" grep -q '^Components: pve-no-subscription' /etc/apt/sources.list.d/harden-proxmox.sources
+check "Proxmox VE: Ceph no-subscription repository configured" grep -q '^URIs: http://download.proxmox.com/debian/ceph-' /etc/apt/sources.list.d/harden-proxmox.sources
+check "Proxmox VE: apt-get update succeeds" apt-get update -qq
+check "Proxmox VE: fail2ban web UI jail" bash -c "fail2ban-client status proxmox"
+check "Proxmox VE: cluster peers never banned" bash -c "grep -E '^ignoreip' /etc/fail2ban/jail.d/60-harden.local | grep -q '10.0.0.12'"
+check "Proxmox VE: overlay kept (Docker inside LXC)" bash -c "! grep -q 'install overlay ' /etc/modprobe.d/60-harden-blacklist.conf"
 else
 check "UFW enabled at boot" bash -c "grep -q '^ENABLED=yes' /etc/ufw/ufw.conf"
 check "UFW default deny incoming" bash -c "grep -q '^DEFAULT_INPUT_POLICY=\"DROP\"' /etc/default/ufw"
@@ -305,6 +406,20 @@ if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
     check "UFW active" bash -c "ufw status | grep -q 'Status: active'"
     check "ufw.service unit active" systemctl is-active ufw.service
     check "runtime log_martians = 1 after UFW start" bash -c "[[ \$(sysctl -n net.ipv4.conf.all.log_martians) == 1 ]]"
+fi
+if ctr; then
+check "UFW: routed (container) traffic allowed" bash -c "grep -q '^DEFAULT_FORWARD_POLICY=\"ACCEPT\"' /etc/default/ufw"
+check "UFW: container/CNI interfaces trusted (before.rules)" bash -c "grep -q -- '-A ufw-before-input -i cni0 -j ACCEPT' /etc/ufw/before.rules && grep -q -- '-A ufw-before-forward -i docker0 -j ACCEPT' /etc/ufw/before.rules"
+check "UFW: container block not duplicated" bash -c "[[ \$(grep -c 'BEGIN harden-and-audit container interfaces' /etc/ufw/before.rules) == 1 ]]"
+fi
+if k8s; then
+UR=/etc/ufw/user.rules
+check "UFW: Kubernetes API server 6443 allowed (control plane)" grep -q -- '-p tcp --dport 6443 -j ACCEPT' "$UR"
+check "UFW: kubelet 10250 allowed" grep -q -- '-p tcp --dport 10250 -j ACCEPT' "$UR"
+check "UFW: flannel VXLAN 8472/udp allowed" grep -q -- '-p udp --dport 8472 -j ACCEPT' "$UR"
+check "UFW: NodePort range allowed" grep -q -- '-p tcp -m multiport --dports 30000:32767 -j ACCEPT' "$UR"
+check "UFW: pod network trusted" grep -q -- '-s 10.244.0.0/16 -j ACCEPT' "$UR"
+check "UFW: Kubernetes rules not duplicated by re-runs" bash -c "[[ \$(grep -c -- '-p tcp --dport 6443 -j ACCEPT' $UR) == 1 ]]"
 fi
 fi
 check "login.defs has no unknown items" bash -c "! chage -l root 2>&1 | grep -q 'configuration error'"
@@ -322,7 +437,7 @@ check "password hashing SHA512" grep -Eq '^ENCRYPT_METHOD[[:space:]]+SHA512' /et
 fi
 check "pam_unix reuses the checked token (use_authtok)" bash -c "grep -E '^password[[:space:]].*pam_unix\\.so' /etc/pam.d/system-auth | grep -q use_authtok"
 check "cracklib dictionary present (pwquality dictcheck can load it)" bash -c "ls /usr/share/cracklib/pw_dict.pwd* >/dev/null 2>&1"
-check "SELinux enforcing/targeted configured" bash -c "grep -qx 'SELINUX=enforcing' /etc/selinux/config && grep -qx 'SELINUXTYPE=targeted' /etc/selinux/config"
+k8s || check "SELinux enforcing/targeted configured" bash -c "grep -qx 'SELINUX=enforcing' /etc/selinux/config && grep -qx 'SELINUXTYPE=targeted' /etc/selinux/config"
 check "abrt / setroubleshoot / mcstrans absent" bash -c "! rpm -qa --qf '%{NAME}\\n' | grep -Eq '^(abrt|setroubleshoot|mcstrans)'"
 check "chronyd runs as user chrony" bash -c "[[ ! -f /etc/sysconfig/chronyd ]] || grep -Eq '^OPTIONS=.*-u chrony' /etc/sysconfig/chronyd"
 else
@@ -332,7 +447,8 @@ check "pam_pwhistory enabled"   grep -q 'pam_pwhistory.so.*remember=24' /etc/pam
 check "no nullok"               bash -c "! grep -Eq '^[^#].*nullok' /etc/pam.d/common-auth /etc/pam.d/common-password"
 fi
 check "root can still su to a user (pam_rootok before pam_wheel)" su ciadmin -s /bin/sh -c true
-check "DoD banner on /etc/issue.net" grep -q 'U.S. Government (USG) Information System' /etc/issue.net
+check "login banner on /etc/issue.net" grep -qE 'AUTHORIZED USE ONLY|U\.S\. Government \(USG\) Information System' /etc/issue.net
+check "login banner on /etc/issue" grep -qE 'AUTHORIZED USE ONLY|U\.S\. Government \(USG\) Information System' /etc/issue
 check "sudo log file configured" grep -q '^Defaults logfile="/var/log/sudo.log"' /etc/sudoers.d/60-harden
 check "sudo I/O logging configured" grep -q '^Defaults log_input, log_output' /etc/sudoers.d/60-harden
 if [[ -L /etc/alternatives/sudo ]]; then
@@ -362,6 +478,19 @@ check "AIDE skips snap images" bash -c "aide --config $AC -p f:/snap/core24/1/us
 check "AIDE still watches shell dotfiles" bash -c "aide --config $AC -p f:/root/.bashrc 2>&1 | grep -qi '^\\[x\\]'"
 check "AIDE still watches .local/bin" bash -c "aide --config $AC -p f:/root/.local/bin/x 2>&1 | grep -qi '^\\[x\\]'"
 check "AIDE still watches authorized_keys" bash -c "aide --config $AC -p f:/root/.ssh/authorized_keys 2>&1 | grep -qi '^\\[x\\]'"
+if pve; then
+check "Proxmox VE: AIDE skips VM disks" bash -c "aide --config $AC -p f:/var/lib/vz/images/100/vm-100-disk-0.raw 2>&1 | grep -Eq 'negative rule|no matching rule'"
+check "Proxmox VE: AIDE skips container subvolumes" bash -c "aide --config $AC -p f:/rpool/data/subvol-101-disk-0/etc/passwd 2>&1 | grep -Eq 'negative rule|no matching rule'"
+check "Proxmox VE: AIDE skips NFS backup storage" bash -c "aide --config $AC -p f:/mnt/pve/backup/dump/x.vma.zst 2>&1 | grep -Eq 'negative rule|no matching rule'"
+check "Proxmox VE: AIDE skips extra dir storage from storage.cfg" bash -c "aide --config $AC -p f:/data/vmstore/images/x 2>&1 | grep -Eq 'negative rule|no matching rule'"
+check "Proxmox VE: AIDE skips /etc/pve virtual files" bash -c "aide --config $AC -p f:/etc/pve/.members 2>&1 | grep -Eq 'negative rule|no matching rule'"
+check "Proxmox VE: AIDE skips rotating auth keys" bash -c "aide --config $AC -p f:/etc/pve/priv/authkey.key 2>&1 | grep -Eq 'negative rule|no matching rule'"
+check "Proxmox VE: AIDE still watches storage.cfg" bash -c "aide --config $AC -p f:/etc/pve/storage.cfg 2>&1 | grep -qi '^\\[x\\]'"
+fi
+if ctr; then
+check "AIDE skips etcd data" bash -c "aide --config $AC -p f:/var/lib/etcd/member/wal/x 2>&1 | grep -Eq 'negative rule|no matching rule'"
+check "AIDE skips docker storage" bash -c "aide --config $AC -p f:/var/lib/docker/overlay2/x 2>&1 | grep -Eq 'negative rule|no matching rule'"
+fi
 check "AIDE still watches system binaries" bash -c "aide --config $AC -p f:/usr/bin/ls 2>&1 | grep -qi '^\\[x\\]'"  # 0.18 prints [X], 0.19 [x]
 fi
 if [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
@@ -437,6 +566,26 @@ for r in '^libx264-[0-9]+$' '^libx265-[0-9]+$' '^libvpx[0-9]+' '^libdav1d[0-9]+$
 done
 check "libevent openssl (coturn TLS) present" bash -c "dpkg-query -W -f='\${db:Status-Status}\n' 'libevent-openssl-2.1-7*' | grep -q installed"
 check "no X server present" bash -c "! dpkg-query -W -f='\${db:Status-Status} \${Package}\n' 'xserver-*' 2>/dev/null | grep -q '^installed'"
+fi
+
+if ctr && [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
+echo "== 6a. containers still run after hardening"
+CIMG=public.ecr.aws/docker/library/busybox:1.36
+if command -v docker >/dev/null 2>&1; then CRT=docker; else CRT=podman; fi
+check "${CRT}: a container starts" timeout 300 "$CRT" run --rm "$CIMG" true
+check "${CRT}: container reaches the network through the host (forwarding + NAT)" timeout 120 "$CRT" run --rm "$CIMG" wget -q -T 20 -O /dev/null http://deb.debian.org/debian/
+check "${CRT}: published port reachable from the host" bash -c "
+    $CRT rm -f ci-web >/dev/null 2>&1; $CRT run -d --name ci-web -p 18080:8080 $CIMG httpd -f -p 8080 -h /etc >/dev/null || exit 1
+    for i in \$(seq 1 20); do curl -fs -o /dev/null http://127.0.0.1:18080/hostname && { $CRT rm -f ci-web >/dev/null; exit 0; }; sleep 1; done
+    $CRT rm -f ci-web >/dev/null; exit 1"
+if ! timeout 120 "$CRT" run --rm "$CIMG" true >/dev/null 2>&1; then
+    echo "  --- container runtime diagnostics"
+    timeout 120 "$CRT" run --rm "$CIMG" true 2>&1 | tail -n 5 | sed 's/^/    /'
+    systemctl --no-pager status docker.service containerd.service podman.socket 2>&1 | grep -E 'Active:|Loaded:' | sed 's/^/    /'
+    journalctl --no-pager -n 25 -u docker.service -u containerd.service 2>/dev/null | sed 's/^/    /'
+    sysctl net.ipv4.ip_forward 2>&1 | sed 's/^/    /'
+    lsmod 2>/dev/null | grep -E '^(overlay|br_netfilter)' | sed 's/^/    /'
+fi
 fi
 
 echo "== 6b. no stray backups inside include directories"
