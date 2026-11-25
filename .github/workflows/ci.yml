@@ -41,6 +41,14 @@ jobs:
       - name: workflow security audit (zizmor)
         run: |
           docker run --rm -v "$PWD:/repo:ro" -w /repo ghcr.io/zizmorcore/zizmor:1.5.2@sha256:2eec97e326025cebb147a380011ff40402866275cbb9e85968a471ca592c00a3 --offline .github/workflows
+      - name: VERSION matches SCRIPT_VERSION (release gate)
+        run: |
+          version=$(tr -d '[:space:]' < VERSION)
+          script_version=$(sed -n 's/^readonly SCRIPT_VERSION="\(.*\)"$/\1/p' harden-and-audit.sh)
+          if [[ "$version" != "$script_version" ]]; then
+            echo "::error::VERSION ($version) != SCRIPT_VERSION in harden-and-audit.sh ($script_version)"
+            exit 1
+          fi
       - name: bash syntax
         run: |
           for f in harden-and-audit.sh tests/*.sh; do bash -n "$f"; done
