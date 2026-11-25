@@ -158,8 +158,9 @@ Proxmox VE is a Debian 12/13 system, so it is scanned with the CIS Debian profil
 
 | Rule(s) | Why it fails |
 |---|---|
-| `sshd_disable_root_login` | Cluster join, live/secure migration, replication, the node shell and console proxying run as root over SSH between nodes. Root is limited to keys (`prohibit-password`) when a non-root sudo admin exists |
-| `sshd_disable_forwarding` / `sshd_disable_tcp_forwarding` (root only, via `Match User root`) | Secure migration tunnels QEMU and NBD streams through SSH port and unix-socket forwarding |
+| `sshd_disable_root_login` | Cluster join, live/secure migration, replication, the node shell and console proxying run as root over SSH between nodes. Root keeps password and key login (`PermitRootLogin yes`); `PVE_ROOT_SSH=prohibit-password` restricts it to keys |
+| `sshd_disable_forwarding`; `sshd_disable_tcp_forwarding` for root only (`Match User root`) | Secure migration tunnels QEMU and NBD streams through SSH port and unix-socket forwarding. `DisableForwarding yes` overrides every `Allow*Forwarding`, so it is not set on a node; non-root users still have TCP, unix-socket, agent and X11 forwarding and tunnels turned off |
+| `accounts_passwords_pam_faillock_deny_root` / `even_deny_root` | Anyone who can reach port 22 or 8006 could lock root, and with it `root@pam` and the cluster's SSH account, for 15 minutes at a time. Other accounts are still locked after 4 failures; fail2ban bans the source address |
 | `accounts_password_set_max_life_root`, root inactivity | An expired root password makes PAM reject root's key logins between nodes and blocks `root@pam` in the web UI |
 | `package_ufw_installed`, `ufw_*` (Debian 13) and the nftables-path rules (Debian 12) | pve-firewall owns netfilter. UFW or a separate nftables service would overwrite its rules. Datacenter firewall: `PVE_FIREWALL_ENABLE=1` |
 | `sysctl_net_ipv4_ip_forward`, `sysctl_net_ipv6_conf_all_forwarding` | Left to the node's network configuration: NAT, routed and SDN guests need forwarding |

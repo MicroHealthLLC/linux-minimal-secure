@@ -292,15 +292,22 @@ fi
 check "sshd config valid"              sshd -t
 if pve; then
 sshd_root() { local out; out=$(sshd -T -C user=root,host=pve2,addr=10.0.0.12 2>/dev/null) || return 1; grep -qix "$1" <<<"$out"; }
-check "Proxmox VE: sshd PermitRootLogin prohibit-password (keys for cluster ops)" sshd_t 'permitrootlogin without-password'
+check "Proxmox VE: sshd PermitRootLogin yes (root password and keys)" sshd_t 'permitrootlogin yes'
+check "Proxmox VE: root password authentication allowed" sshd_root 'passwordauthentication yes'
 check "Proxmox VE: root keeps TCP forwarding (secure migration)" sshd_root 'allowtcpforwarding yes'
 check "Proxmox VE: root keeps unix-socket forwarding (migration tunnels)" sshd_root 'allowstreamlocalforwarding yes'
 check "Proxmox VE: root forwarding not globally disabled" sshd_root 'disableforwarding no'
-check "Proxmox VE: other users still have forwarding disabled" sshd_t 'disableforwarding yes'
+check "Proxmox VE: DisableForwarding not set globally (cannot override root's tunnel)" sshd_t 'disableforwarding no'
+check "Proxmox VE: other users have no TCP forwarding" sshd_t 'allowtcpforwarding no'
+check "Proxmox VE: other users have no unix-socket forwarding" sshd_t 'allowstreamlocalforwarding no'
+check "Proxmox VE: other users have no agent forwarding" sshd_t 'allowagentforwarding no'
+check "Proxmox VE: faillock never locks root (root@pam web UI, cluster SSH)" bash -c "! grep -Eq '^[[:space:]]*(even_deny_root|root_unlock_time)' /etc/security/faillock.conf"
 check "Proxmox VE: root is in ssh-users (AllowGroups)" bash -c "id -nG root | grep -qw ssh-users"
 check "Proxmox VE: root Match block is the last block" bash -c "tail -n 12 /etc/ssh/sshd_config | grep -q '^Match User root'"
 else
 check "sshd PermitRootLogin no"        sshd_t 'permitrootlogin no'
+check "sshd DisableForwarding yes"     sshd_t 'disableforwarding yes'
+check "faillock also locks root (temporarily)" grep -Eq '^even_deny_root' /etc/security/faillock.conf
 fi
 check "sshd X11Forwarding no"          sshd_t 'x11forwarding no'
 check "sshd MaxAuthTries 4"            sshd_t 'maxauthtries 4'

@@ -77,7 +77,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${FIREWALL_EXTRA_OUT:=${UFW_EXTRA_OUT}}"
 : "${DESKTOP_MODE:=auto}"           # auto|0|1 - 1 keeps the desktop experience (auto: a display manager is installed)
 : "${PROXMOX_MODE:=auto}"           # auto|0|1 - Proxmox VE node (auto: pve-manager is installed)
-: "${PVE_ROOT_SSH:=auto}"           # auto|yes|prohibit-password - root SSH on Proxmox VE (auto: keys only if a sudo admin exists)
+: "${PVE_ROOT_SSH:=auto}"           # auto|yes|prohibit-password - root SSH on Proxmox VE (auto: yes, password and keys)
 : "${PVE_REPO:=auto}"               # auto|enterprise|no-subscription|keep - Proxmox repositories (auto: by subscription status)
 : "${PVE_FIREWALL_ENABLE:=0}"       # 1 = turn the Proxmox datacenter firewall on (SSH + web UI allowed first)
 : "${PVE_FIREWALL_MGMT_SOURCE:=}"   # source CIDR(s) allowed to SSH/8006 when enabling (empty = any)
@@ -886,12 +886,14 @@ preflight_admin() {
 pve_root_ssh() {
     case $PVE_ROOT_SSH in
         yes|prohibit-password) ROOT_SSH=$PVE_ROOT_SSH ;;
-        auto) if [[ $1 == 1 ]]; then ROOT_SSH=prohibit-password; else ROOT_SSH=yes; fi ;;
+        # Root password SSH is how operators reach a node (and recover a
+        # cluster), so auto keeps it; prohibit-password is an explicit opt-in.
+        auto) ROOT_SSH=yes ;;
         *) die "PVE_ROOT_SSH must be auto, yes or prohibit-password (got '${PVE_ROOT_SSH}')" ;;
     esac
     log "Proxmox VE: root SSH login stays enabled (PermitRootLogin ${ROOT_SSH}); cluster, migration and replication use root keys"
-    if [[ $ROOT_SSH == yes ]]; then
-        warn "Proxmox VE: no non-root ${ADMIN_GROUP} administrator with a key or password, so root keeps SSH password login (PermitRootLogin yes). Add one to restrict root to keys (PVE_ROOT_SSH=prohibit-password)"
+    if [[ $ROOT_SSH == yes && $1 != 1 ]]; then
+        warn "Proxmox VE: no non-root ${ADMIN_GROUP} administrator with a key or password; root is the only way in"
     fi
     if [[ $SSH_DISABLE_PASSWORD == 1 || $ROOT_SSH == prohibit-password ]] && [[ ! -s /root/.ssh/authorized_keys ]]; then
         warn "Proxmox VE: root has no authorized_keys - root SSH (and therefore cluster operations) needs keys; the web UI and console are unaffected"
@@ -2819,6 +2821,12 @@ MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,h
 KexAlgorithms ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256
 '
     fi
+    # Proxmox VE: DisableForwarding yes overrides every Allow*Forwarding, and
+    # secure migration tunnels through root's ssh -L. Leave it unset on a node
+    # instead of relying on the Match block to undo it; the Allow* lines below
+    # still deny every forwarding type to non-root users.
+    local disfwd="DisableForwarding yes"
+    is_pve && disfwd="# DisableForwarding: unset on Proxmox VE (root migration tunnels); Allow*Forwarding no applies"
     local block
     block=$(cat <<EOF
 # BEGIN ${MARK} managed block - first match wins in sshd, keep this at the top
@@ -2830,7 +2838,7 @@ AllowAgentForwarding no
 AllowStreamLocalForwarding no
 PermitTunnel no
 GatewayPorts no
-DisableForwarding yes
+${disfwd}
 MaxAuthTries 4
 MaxSessions 10
 MaxStartups 10:30:60
@@ -3289,6 +3297,12 @@ enforcing = 1
 enforce_for_root
 retry = 3
 EOF
+    # Proxmox VE: root@pam is the web UI's administrator and root is the
+    # cluster's SSH account, so failed logins (anyone can send them to port
+    # 8006 or 22) must not lock root out. Other accounts are still locked.
+    local deny_root="even_deny_root
+root_unlock_time = ${FAILLOCK_UNLOCK_TIME}"
+    is_pve && deny_root="# even_deny_root: not set on Proxmox VE (root@pam web UI and cluster SSH)"
     write_file 0644 /etc/security/faillock.conf <<EOF
 # Managed by ${SCRIPT_NAME} - temporary lockout (auto-unlocks; never permanent).
 dir = /var/run/faillock
@@ -3297,8 +3311,7 @@ silent
 deny = ${FAILLOCK_DENY}
 fail_interval = 900
 unlock_time = ${FAILLOCK_UNLOCK_TIME}
-even_deny_root
-root_unlock_time = ${FAILLOCK_UNLOCK_TIME}
+${deny_root}
 EOF
     write_file 0644 /etc/security/pwhistory.conf <<'EOF'
 # Managed by harden-and-audit.sh
