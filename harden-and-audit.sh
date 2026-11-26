@@ -4498,6 +4498,7 @@ configure_selinux() {
     local cfg=/etc/selinux/config want=enforcing cur
     pkg_installed selinux-policy-targeted || dnf_install selinux-policy-targeted
     cur=$(getenforce 2>/dev/null || echo Disabled)
+    selinux_antivirus_scan
     # Kubernetes nodes: kubeadm/k3s/rke2 installs are often set up with SELinux
     # permissive; raising it can stop kubelet, CNI or hostPath workloads at the
     # next boot. Enforcing is kept where it already is, never raised here.
@@ -4523,6 +4524,23 @@ configure_selinux() {
         warn "container: SELinux is a host kernel feature; ${cfg} set to ${want}, it applies on a real host"
     fi
     log "SELinux: ${cur} now, ${want} (targeted) configured"
+}
+
+# ClamAV (EPEL clamd, installed here by other tooling) scans as antivirus_t.
+# With antivirus_can_scan_system off that domain may open almost nothing
+# outside its own files, so every scheduled clamdscan exits 2 with "Failed to
+# open file" (seen 2026-11 on hosts where an agent installed clamd and the
+# baseline's own install step - which sets the boolean - never ran). The
+# boolean still keeps shadow_t/auditd_etc_t/SELinux config out of reach.
+selinux_antivirus_scan() {
+    pkg_installed clamd || return 0
+    command -v setsebool >/dev/null 2>&1 && selinuxenabled 2>/dev/null || return 0
+    [[ $(getsebool antivirus_can_scan_system 2>/dev/null) == *"--> on" ]] && return 0
+    if setsebool -P antivirus_can_scan_system 1; then
+        log "SELinux: antivirus_can_scan_system on (ClamAV can read the files it scans)"
+    else
+        warn "SELinux: could not set antivirus_can_scan_system; ClamAV scans will fail to open most files"
+    fi
 }
 
 # Cluster peers never get banned: Proxmox corosync ring addresses and,
@@ -5247,7 +5265,17 @@ EOF
     systemctl start scap-audit.timer >/dev/null 2>&1 || true
 }
 
-readonly AIDE_INIT_LOG=/var/log/harden-and-audit-aideinit.log
+AIDE_INIT_LOG=/var/log/harden-and-audit-aideinit.log
+# EL: aide runs confined as aide_t, which may write aide_log_t (/var/log/aide/)
+# but not var_log_t: redirected into the file above its output was dropped
+# (AVC "aide_t var_log_t write", empty log). The aide package rotates
+# /var/log/aide/*.log itself.
+aide_init_log_path() {
+    if is_rhel && [[ -d /var/log/aide ]]; then
+        AIDE_INIT_LOG=/var/log/aide/harden-and-audit-aideinit.log
+    fi
+    return 0
+}
 
 # stdin from /dev/null: a prompt must fail, never wait invisibly.
 aide_init_quiet() {
@@ -5347,6 +5375,7 @@ aide_progress() {
 build_aide_database() {
     step "AIDE baseline database (final state)"
     aide_paths
+    aide_init_log_path
     if [[ $AIDE_INIT != 1 ]]; then
         warn "AIDE_INIT=0: AIDE database not built - run '$(is_rhel && echo "aide --init" || echo "aideinit -y -f")' later"
         return 0
