@@ -591,7 +591,16 @@ desktop || check "no X server present" bash -c "! rpm -qa --qf '%{NAME}\\n' | gr
 else
 HDR=linux-headers-amd64
 [[ $OS == ubuntu ]] && HDR=linux-headers-virtual     # the CI image boots linux-image-virtual
-for p in libc6 libc6-dev gcc make dkms "$HDR" build-essential; do check "package ${p} installed" installed "$p"; done
+for p in libc6 libc6-dev gcc make dkms build-essential; do check "package ${p} installed" installed "$p"; done
+if pve; then
+    # Proxmox VE: Proxmox kernel headers only; linux-headers-amd64 would pull in
+    # Debian's stock kernel. The CI stub has no Proxmox repository, so the
+    # script must warn instead of falling back to the Debian headers.
+    check "Proxmox VE: Debian linux-headers-amd64 NOT installed" not_installed linux-headers-amd64
+    check "Proxmox VE: Proxmox headers installed or their absence reported" bash -c "dpkg-query -W -f='\${db:Status-Status}' proxmox-default-headers 2>/dev/null | grep -qx installed || grep -q 'proxmox-default-headers is not available' /var/log/harden-and-audit.log"
+else
+    check "package ${HDR} installed" installed "$HDR"
+fi
 check "nouveau blacklisted" grep -q '^blacklist nouveau' /etc/modprobe.d/60-harden-nouveau.conf
 check "coturn itself NOT installed" not_installed coturn
 for p in libopus0 libsrtp2-1 libmariadb3 libpq5 libsqlite3-0 libsystemd0; do check "media/coturn lib ${p}" installed "$p"; done
