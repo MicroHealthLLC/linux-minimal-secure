@@ -2760,6 +2760,17 @@ configure_sysctl() {
     # kube-vip and MetalLB L2 virtual IPs. Dropping it leaves stale ARP entries.
     local garp="net.ipv4.conf.all.drop_gratuitous_arp = 1"
     if is_pve || is_k8s; then garp="# drop_gratuitous_arp not set: migrating VMs / floating virtual IPs announce themselves by gratuitous ARP"; fi
+    # arp_filter/arp_ignore: a new network namespace copies the host's conf/all
+    # values (net.core.devconf_inherit_init_net=0), so on a Kubernetes node every
+    # pod started afterwards gets arp_ignore=2. Pods hold a /32 address and the
+    # host ARPs them from its own LAN address, which arp_ignore=2 refuses to
+    # answer: the pod is unreachable (probes fail, traffic to it fails) while
+    # pods started before hardening keep working. Kubernetes nodes keep 0.
+    local arp="net.ipv4.conf.all.arp_filter = 1
+net.ipv4.conf.all.arp_ignore = 2"
+    if is_k8s; then arp="# arp_filter/arp_ignore 0 on a Kubernetes node: pods inherit conf/all and must answer the host's ARP (see harden-and-audit.sh)
+net.ipv4.conf.all.arp_filter = 0
+net.ipv4.conf.all.arp_ignore = 0"; fi
     write_file 0644 /etc/sysctl.d/60-harden.conf <<EOF
 # Managed by ${SCRIPT_NAME} - CIS Debian L2 / ANSSI BP-028 / DISA STIG aligned.
 
@@ -2781,8 +2792,7 @@ net.ipv4.conf.all.accept_local = 0
 net.ipv4.conf.all.route_localnet = 0
 net.ipv4.conf.all.shared_media = 0
 net.ipv4.conf.default.shared_media = 0
-net.ipv4.conf.all.arp_filter = 1
-net.ipv4.conf.all.arp_ignore = 2
+${arp}
 ${garp}
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
