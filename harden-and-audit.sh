@@ -82,6 +82,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${PVE_REPO:=auto}"               # auto|enterprise|no-subscription|keep - Proxmox repositories (auto: by subscription status)
 : "${PVE_FIREWALL_ENABLE:=0}"       # 1 = turn the Proxmox datacenter firewall on (SSH + web UI allowed first)
 : "${PVE_FIREWALL_MGMT_SOURCE:=}"   # source CIDR(s) allowed to SSH/8006 when enabling (empty = any)
+: "${PBS_FIREWALL_EXTRA_IN:=}"      # Proxmox Backup Server (UFW): extra inbound rules, e.g. "9100/tcp 8443/tcp"
 : "${PVE_KERNEL_FIPS:=0}"           # 1 = also boot a Proxmox VE kernel with fips=1 (not supported by Proxmox)
 : "${EPEL_ENABLE:=1}"                # RHEL family: EPEL provides fail2ban, dkms and some media libraries
 : "${FAIL2BAN_IGNOREIP:=}"           # space separated CIDRs never banned (jump hosts)
@@ -132,6 +133,7 @@ DEB_ARCH=""         # amd64 | arm64 ... (dpkg names, also used on the RHEL famil
 ADMIN_GROUP=sudo    # sudo (Debian family) | wheel (RHEL family)
 DESKTOP=0           # 1 = desktop mode (resolved from DESKTOP_MODE in preflight)
 PVE=0               # 1 = Proxmox VE node (resolved from PROXMOX_MODE in preflight)
+PBS=0               # 1 = Proxmox Backup Server (implies PVE=1 handling, see pbs_detected)
 PVE_VERSION=""      # e.g. 8.4.1
 ROOT_SSH=no         # effective PermitRootLogin (yes|prohibit-password on Proxmox VE)
 K8S=0               # 1 = Kubernetes node (resolved from KUBERNETES_MODE in preflight)
@@ -313,6 +315,7 @@ is_rhel()   { [[ $OS_FAMILY == rhel ]]; }
 is_fedora() { [[ $OS_ID == fedora ]]; }
 is_desktop() { [[ $DESKTOP == 1 ]]; }
 is_pve()     { [[ $PVE == 1 ]]; }
+is_pbs()     { [[ $PBS == 1 ]]; }
 is_k8s()     { [[ $K8S == 1 ]]; }
 containers_on() { [[ $ALLOW_CONTAINERS == 1 ]]; }
 
@@ -374,6 +377,27 @@ k8s_cluster_cidrs() {
         [[ -f /run/flannel/subnet.env ]] && sed -n 's/^FLANNEL_NETWORK=//p' /run/flannel/subnet.env
         ip -4 route show 2>/dev/null | awk '$1 ~ /^[0-9.]+\/[0-9]+$/ && $0 ~ / dev (cni0|flannel\.1|cali|vxlan\.calico|tunl0|cilium_|weave|kube-bridge)/ {print $1}'
     } | awk 'NF' | sort -u
+}
+
+# Proxmox Backup Server: proxmox-backup-server is installed (no pve-manager).
+# It runs in Proxmox mode (root SSH like a PVE node, root exempt from
+# faillock/expiry because root@pam logs into the web UI, Proxmox kernel) plus
+# PBS-specific care (repositories kept, NFS exports and datastores respected,
+# UFW as the host firewall unless pve-firewall is installed - pbs_uses_ufw).
+pbs_detected() {
+    pkg_installed proxmox-backup-server
+}
+
+# /etc/exports (or exports.d) defines at least one NFS export.
+pbs_nfs_exports() {
+    grep -qsvE '^[[:space:]]*(#|$)' /etc/exports /etc/exports.d/*.exports
+}
+
+# A Proxmox Backup Server without pve-firewall (the usual case: PBS ships no
+# host firewall and pve-firewall needs the PVE cluster stack) uses UFW, with
+# rules for what PBS serves. A PBS that has pve-firewall keeps the PVE path.
+pbs_uses_ufw() {
+    is_pbs && ! pkg_installed pve-firewall
 }
 
 # Proxmox VE: pve-manager (the node's management stack) is installed.
@@ -492,8 +516,15 @@ pkg_list_installed() {
     fi
 }
 
+# A mirror caught mid-sync can carry a package whose dependency is not there
+# yet (EL8: appstream gcc needing a newer baseos libgcc). Retry once with fresh
+# metadata, then accept the newest installable version (--nobest).
 dnf_install() {
-    dnf -y -q --setopt=install_weak_deps=False install "$@"
+    dnf -y -q --setopt=install_weak_deps=False install "$@" && return 0
+    warn "dnf install failed; retrying with refreshed metadata: $*"
+    dnf -y -q --refresh --setopt=install_weak_deps=False install "$@" && return 0
+    warn "dnf install failed again; retrying with --nobest (repository out of sync): $*"
+    dnf -y -q --nobest --setopt=install_weak_deps=False install "$@"
 }
 
 # pkg_install PKG... - install with the family's package manager.
@@ -771,10 +802,18 @@ preflight_os() {
             0) PVE=0 ;;
             *) if pve_detected; then PVE=1; fi ;;
         esac
+        if [[ $PROXMOX_MODE != 0 ]] && ! pve_detected && pbs_detected; then
+            PVE=1; PBS=1
+            # PBS ships its own repositories (pbs-enterprise/no-subscription);
+            # the PVE repository logic must not add pve/ceph sources here.
+            PVE_REPO=keep
+        fi
     elif [[ $PROXMOX_MODE == 1 ]]; then
         die "PROXMOX_MODE=1 but this is ${OS_ID}: Proxmox VE runs on Debian only"
     fi
-    if is_pve; then
+    if is_pbs; then
+        OS_NAME="Proxmox Backup Server $(dpkg-query -W -f='${Version}' proxmox-backup-server 2>/dev/null || true) on ${OS_NAME}"
+    elif is_pve; then
         PVE_VERSION=$(pveversion 2>/dev/null | sed -n -E 's#^pve-manager/([0-9][0-9.]*).*#\1#p' | head -n1)
         OS_NAME="Proxmox VE ${PVE_VERSION:-(version unknown)} on ${OS_NAME}"
     fi
@@ -1068,6 +1107,8 @@ purge_insecure_services() {
         # Proxmox VE: rpcbind serves NFSv3 storage (nfs-common), dnsmasq the
         # SDN DHCP; both are dependencies of the management stack.
         if is_pve && [[ $p =~ ^(rpcbind|dnsmasq)$ ]]; then continue; fi
+        # Proxmox Backup Server used as an NFS server: keep what /etc/exports serves.
+        if is_pbs && pbs_nfs_exports && [[ $p =~ ^(rpcbind|nfs-kernel-server)$ ]]; then continue; fi
         pkg_installed "$p" && present+=("$p")
     done
     if [[ ${#present[@]} -gt 0 ]]; then
@@ -1076,7 +1117,11 @@ purge_insecure_services() {
         log "no legacy network services installed"
     fi
     # rsync is a common admin tool: keep the client but never run the daemon.
-    if is_pve; then
+    if is_pbs && pbs_nfs_exports; then
+        log "Proxmox Backup Server: NFS server and rpcbind stay (exports in /etc/exports)"
+        disable_service rsync.service bluetooth.service avahi-daemon.service avahi-daemon.socket cups.service \
+            cups.socket snmpd.service
+    elif is_pve; then
         log "Proxmox VE: rpcbind stays available for NFS storage"
         disable_service rsync.service bluetooth.service avahi-daemon.service avahi-daemon.socket cups.service \
             cups.socket nfs-server.service snmpd.service
@@ -1456,7 +1501,8 @@ install_base_stack() {
     local opt
     opt=$(first_available libpam-apparmor) && pkgs+=("$opt")
     # Proxmox VE: pve-firewall owns netfilter; UFW would fight it.
-    if is_pve; then
+    # (A Proxmox Backup Server without pve-firewall keeps UFW - pbs_uses_ufw.)
+    if is_pve && ! pbs_uses_ufw; then
         local -a nf=()
         for opt in "${pkgs[@]}"; do [[ $opt == ufw ]] || nf+=("$opt"); done
         pkgs=("${nf[@]}")
@@ -2714,6 +2760,17 @@ configure_sysctl() {
     # kube-vip and MetalLB L2 virtual IPs. Dropping it leaves stale ARP entries.
     local garp="net.ipv4.conf.all.drop_gratuitous_arp = 1"
     if is_pve || is_k8s; then garp="# drop_gratuitous_arp not set: migrating VMs / floating virtual IPs announce themselves by gratuitous ARP"; fi
+    # arp_filter/arp_ignore: a new network namespace copies the host's conf/all
+    # values (net.core.devconf_inherit_init_net=0), so on a Kubernetes node every
+    # pod started afterwards gets arp_ignore=2. Pods hold a /32 address and the
+    # host ARPs them from its own LAN address, which arp_ignore=2 refuses to
+    # answer: the pod is unreachable (probes fail, traffic to it fails) while
+    # pods started before hardening keep working. Kubernetes nodes keep 0.
+    local arp="net.ipv4.conf.all.arp_filter = 1
+net.ipv4.conf.all.arp_ignore = 2"
+    if is_k8s; then arp="# arp_filter/arp_ignore 0 on a Kubernetes node: pods inherit conf/all and must answer the host's ARP (see harden-and-audit.sh)
+net.ipv4.conf.all.arp_filter = 0
+net.ipv4.conf.all.arp_ignore = 0"; fi
     write_file 0644 /etc/sysctl.d/60-harden.conf <<EOF
 # Managed by ${SCRIPT_NAME} - CIS Debian L2 / ANSSI BP-028 / DISA STIG aligned.
 
@@ -2735,8 +2792,7 @@ net.ipv4.conf.all.accept_local = 0
 net.ipv4.conf.all.route_localnet = 0
 net.ipv4.conf.all.shared_media = 0
 net.ipv4.conf.default.shared_media = 0
-net.ipv4.conf.all.arp_filter = 1
-net.ipv4.conf.all.arp_ignore = 2
+${arp}
 ${garp}
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
@@ -2978,9 +3034,13 @@ EOF
 
 configure_ufw() {
     step "5.4 host firewall: default deny inbound (UFW / firewalld / pve-firewall)"
-    if is_pve; then
+    if is_pve && ! pbs_uses_ufw; then
         configure_pve_firewall
         return 0
+    fi
+    if pbs_uses_ufw; then
+        log "Proxmox Backup Server: no pve-firewall - UFW is the host firewall"
+        pkg_installed ufw || apt_install ufw
     fi
     if is_rhel; then
         configure_firewalld
@@ -3003,6 +3063,8 @@ configure_ufw() {
     done
     # Desktops discover printers and shares over mDNS.
     is_desktop && ufw allow in 5353/udp comment 'mDNS (desktop, harden-and-audit)' >/dev/null
+    # Proxmox Backup Server: its own services are allowed before UFW is enabled too.
+    pbs_uses_ufw && ufw_pbs_rules
     ufw allow in on lo >/dev/null
     ufw allow out on lo >/dev/null
     ufw deny in from 127.0.0.0/8 >/dev/null
@@ -3034,6 +3096,62 @@ configure_ufw() {
 # controller-manager, scheduler, k3s/rke2 supervisor; every node: kubelet,
 # NodePorts; CNI overlays: VXLAN (flannel/Cilium/Calico), Geneve, WireGuard,
 # Calico BGP/Typha, Cilium health/Hubble).
+# Proxmox Backup Server (UFW): allow what PBS serves before UFW is enabled.
+# Web UI/API 8007 from anywhere (like a PVE node's 8006); NFS only from the
+# export clients, with mountd/statd/lockd pinned to fixed ports first (they are
+# random by default and UFW cannot follow them); Samba and a local web server
+# when installed; the Tueri Core agent; PBS_FIREWALL_EXTRA_IN.
+PBS_NFS_PORTS=(111 2049 20048 32765 32768)
+ufw_pbs_rules() {
+    local c='Proxmox Backup Server, harden-and-audit' r p src
+    ufw allow in 8007/tcp comment 'PBS web UI / API (harden-and-audit)' >/dev/null
+    if pbs_nfs_exports; then
+        pbs_pin_nfs_ports
+        local -a clients=()
+        while read -r src; do [[ -n $src ]] && clients+=("$src"); done < <(exportfs -s 2>/dev/null |
+            awk '{print $2}' | sed -E 's/\(.*//' | sort -u)
+        [[ ${#clients[@]} -eq 0 ]] && warn "Proxmox Backup Server: NFS exports found but exportfs lists no clients - NFS not opened"
+        for src in "${clients[@]}"; do
+            [[ $src == '*' ]] && src=any
+            for p in "${PBS_NFS_PORTS[@]}"; do
+                ufw allow in from "$src" to any port "$p" comment 'NFS export client (harden-and-audit)' >/dev/null
+            done
+        done
+        log "Proxmox Backup Server: NFS (${PBS_NFS_PORTS[*]}) open to ${#clients[@]} export client(s)"
+    fi
+    if pkg_installed samba; then
+        for r in 139/tcp 445/tcp 137/udp 138/udp; do ufw allow in "$r" comment "Samba ($c)" >/dev/null; done
+    fi
+    if pkg_installed nginx || pkg_installed apache2; then
+        for r in 80/tcp 443/tcp; do ufw allow in "$r" comment "web server ($c)" >/dev/null; done
+    fi
+    if pkg_installed tuericore-agent || command -v tuericore-agent >/dev/null 2>&1; then
+        ufw allow in 4422/tcp comment 'tuericore-access gateway' >/dev/null
+    fi
+    for r in $PBS_FIREWALL_EXTRA_IN; do ufw allow in "$r" comment "extra ($c)" >/dev/null; done
+    return 0
+}
+
+# NFSv3 helpers on fixed ports (mountd 20048, statd 32765/32766, lockd 32768)
+# so the firewall can allow them. Restarts the NFS services only when changed;
+# clients see a pause of a few seconds and carry on.
+pbs_pin_nfs_ports() {
+    local f=/etc/nfs.conf.d/60-harden-nfs-ports.conf
+    local want
+    want=$(printf '%s\n' '# Managed by harden-and-audit.sh - fixed NFSv3 helper ports for the host firewall' \
+        '[mountd]' 'port=20048' '[statd]' 'port=32765' 'outgoing-port=32766' '[lockd]' 'port=32768' 'udp-port=32768')
+    if [[ -f $f && "$(cat "$f")" == "$want" ]]; then
+        log "NFS helper ports already fixed (${f})"
+        return 0
+    fi
+    mkdir -p /etc/nfs.conf.d
+    printf '%s\n' "$want" | write_file 0644 "$f"
+    echo 'options lockd nlm_tcpport=32768 nlm_udpport=32768' | write_file 0644 /etc/modprobe.d/60-harden-lockd.conf
+    sysctl -q -w fs.nfs.nlm_tcpport=32768 fs.nfs.nlm_udpport=32768 2>/dev/null || true
+    host_only "restart NFS services" systemctl restart rpc-statd.service nfs-server.service
+    log "NFS helper ports fixed: mountd 20048, statd 32765, lockd 32768 (NFS services restarted)"
+}
+
 k8s_ports() {
     local -a p=(10250/tcp 30000:32767/tcp 30000:32767/udp 8472/udp 4789/udp 6081/udp 51820:51821/udp
         179/tcp 5473/tcp 4240/tcp 4244/tcp)
@@ -4515,6 +4633,20 @@ aide_bulk_excludes() {
 !/var/lib/flatpak/(repo|app|runtime)(/|$)
 !/snap/(?!bin(/|$))[^/]+(/|$)
 !/usr/share/ollama/\.ollama/models(/|$)
+# AI / LLM model stores (hundreds of GB; weights change by design and carry
+# their own content hashes). Without this the baseline on a GPU inference node
+# reads ~300 GB and runs for days. Covers the usual runtimes and caches:
+# vLLM, Ollama, LocalAI, LM Studio, GPT4All, llama.cpp, text-generation-webui,
+# TGI, Triton, NVIDIA NIM, KServe, Hugging Face, ModelScope, torch, whisper.
+# (Per-user caches under /root and /home are already excluded above/below.)
+!/var/lib/(vllm|ollama|localai|lmstudio|gpt4all|llama\.cpp|llamacpp|text-generation-webui|tgi|triton|nim|huggingface|modelscope|open-webui)(/|$)
+!/(opt|srv|data|mnt)/(vllm|ollama|localai|lmstudio|gpt4all|llama\.cpp|llamacpp|text-generation-webui|tgi|triton|nim|huggingface|modelscope)(/|$)
+!/opt/nim/\.cache(/|$)
+!/(models|data/models|mnt/models|srv/models|opt/models|var/lib/models)(/|$)
+!/(root|home/[^/]+)/\.(cache/(huggingface|modelscope|torch|whisper|lm-studio|nim)|ollama|lmstudio)(/|$)
+# Model weight files wherever they live (never system binaries: no .bin here,
+# which would also match firmware).
+!/.*\.(safetensors|gguf|ggml|ggjt|ckpt|pth|pt|onnx|tflite|mlmodel|engine)$
 # Caches and scratch space
 !/var/cache(/|$)
 !/var/tmp(/|$)
@@ -4537,6 +4669,14 @@ EOF
 !/var/log/(pods|containers)(/|$)
 !/run/(containerd|k3s|netns)(/|$)
 EOF
+    if is_pbs; then
+        echo "# Proxmox Backup Server: datastores (chunk stores) and NFS-exported paths"
+        local dsp
+        while read -r dsp; do [[ -n $dsp ]] && printf '!%s(/|$)\n' "$(sed 's/[.[\*^$()+?{|]/\\&/g' <<<"$dsp")"; done < <(
+            { awk '/^[[:space:]]*path[[:space:]]/{print $2}' /etc/proxmox-backup/datastore.cfg 2>/dev/null
+              grep -shvE '^[[:space:]]*(#|$)' /etc/exports /etc/exports.d/*.exports | awk '{print $1}'; } | sort -u)
+        echo '!/var/log/proxmox-backup(/|$)'
+    fi
     if is_pve; then
         cat <<'EOF'
 # Proxmox VE: guest storage (VM disks, container root filesystems, backups,
