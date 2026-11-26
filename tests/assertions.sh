@@ -591,7 +591,16 @@ desktop || check "no X server present" bash -c "! rpm -qa --qf '%{NAME}\\n' | gr
 else
 HDR=linux-headers-amd64
 [[ $OS == ubuntu ]] && HDR=linux-headers-virtual     # the CI image boots linux-image-virtual
-for p in libc6 libc6-dev gcc make dkms "$HDR" build-essential; do check "package ${p} installed" installed "$p"; done
+for p in libc6 libc6-dev gcc make dkms build-essential; do check "package ${p} installed" installed "$p"; done
+if pve; then
+    # Proxmox VE: Proxmox kernel headers only; linux-headers-amd64 would pull in
+    # Debian's stock kernel. The CI stub has no Proxmox repository, so the
+    # script must warn instead of falling back to the Debian headers.
+    check "Proxmox VE: Debian linux-headers-amd64 NOT installed" not_installed linux-headers-amd64
+    check "Proxmox VE: Proxmox headers installed or their absence reported" bash -c "dpkg-query -W -f='\${db:Status-Status}' proxmox-default-headers 2>/dev/null | grep -qx installed || grep -q 'proxmox-default-headers is not available' /var/log/harden-and-audit.log"
+else
+    check "package ${HDR} installed" installed "$HDR"
+fi
 check "nouveau blacklisted" grep -q '^blacklist nouveau' /etc/modprobe.d/60-harden-nouveau.conf
 check "coturn itself NOT installed" not_installed coturn
 for p in libopus0 libsrtp2-1 libmariadb3 libpq5 libsqlite3-0 libsystemd0; do check "media/coturn lib ${p}" installed "$p"; done
@@ -604,8 +613,17 @@ fi
 
 if ctr && [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
 echo "== 6a. containers still run after hardening"
-CIMG=public.ecr.aws/docker/library/busybox:1.36
 if command -v docker >/dev/null 2>&1; then CRT=docker; else CRT=podman; fi
+# Pull once, from the first registry that answers: public registries rate-limit
+# shared CI runners ("toomanyrequests"), which is not a hardening failure.
+CIMG=public.ecr.aws/docker/library/busybox:1.36
+for img in public.ecr.aws/docker/library/busybox:1.36 mirror.gcr.io/library/busybox:1.36 docker.io/library/busybox:1.36; do
+    for try in 1 2; do
+        if timeout 180 "$CRT" pull -q "$img" >/dev/null 2>&1; then CIMG=$img; break 2; fi
+        echo "  (pull of ${img} failed, attempt ${try})"; sleep 10
+    done
+done
+echo "  test image: ${CIMG}"
 check "${CRT}: a container starts" timeout 300 "$CRT" run --rm "$CIMG" true
 check "${CRT}: container reaches the network through the host (forwarding + NAT)" timeout 120 "$CRT" run --rm "$CIMG" wget -q -T 20 -O /dev/null http://deb.debian.org/debian/
 check "${CRT}: published port reachable from the host" bash -c "
