@@ -516,8 +516,15 @@ pkg_list_installed() {
     fi
 }
 
+# A mirror caught mid-sync can carry a package whose dependency is not there
+# yet (EL8: appstream gcc needing a newer baseos libgcc). Retry once with fresh
+# metadata, then accept the newest installable version (--nobest).
 dnf_install() {
-    dnf -y -q --setopt=install_weak_deps=False install "$@"
+    dnf -y -q --setopt=install_weak_deps=False install "$@" && return 0
+    warn "dnf install failed; retrying with refreshed metadata: $*"
+    dnf -y -q --refresh --setopt=install_weak_deps=False install "$@" && return 0
+    warn "dnf install failed again; retrying with --nobest (repository out of sync): $*"
+    dnf -y -q --nobest --setopt=install_weak_deps=False install "$@"
 }
 
 # pkg_install PKG... - install with the family's package manager.

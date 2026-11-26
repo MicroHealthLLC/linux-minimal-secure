@@ -225,9 +225,11 @@ if deb; then
 check "OpenSSL FIPS provider active"    bash -c "openssl list -providers | grep -A3 -E '^[[:space:]]*fips' | grep -q 'status: active'"
 check "OpenSSL default provider active" bash -c "openssl list -providers | grep -A3 -E '^[[:space:]]*default' | grep -q 'status: active'"
 check "FIPS provider is the validated ${FIPS_VER:=3.1.2}" bash -c "openssl list -providers | grep -A3 -E '^[[:space:]]*fips' | grep -q 'version: ${FIPS_VER}'"
-TLS_URL=https://deb.debian.org/debian/
-[[ $OS == ubuntu ]] && TLS_URL=https://changelogs.ubuntu.com/meta-release-lts
-check "TLS client works through system OpenSSL (curl https)" curl -fsS -o /dev/null --max-time 30 "$TLS_URL"
+# Any reachable HTTPS host proves the TLS stack; a second host and retries keep
+# one site's outage from failing the check.
+TLS_URLS="https://deb.debian.org/debian/ https://changelogs.ubuntu.com/meta-release-lts"
+[[ $OS == ubuntu ]] && TLS_URLS="https://changelogs.ubuntu.com/meta-release-lts https://deb.debian.org/debian/"
+check "TLS client works through system OpenSSL (curl https)" bash -c "for u in $TLS_URLS; do curl -fsS -o /dev/null --max-time 30 --retry 2 --retry-delay 5 \"\$u\" && exit 0; done; exit 1"
 check "SHA-256 served by FIPS provider" bash -c "echo x | openssl dgst -sha256 -propquery fips=yes"
 # FIPS-only context (fips + base providers, as the script's self-test): the
 # module itself must refuse MD5 and serve SHA-256. "dgst -propquery" is not
