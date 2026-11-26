@@ -613,8 +613,17 @@ fi
 
 if ctr && [[ ${CI_PRIVILEGED:-0} == 1 ]]; then
 echo "== 6a. containers still run after hardening"
-CIMG=public.ecr.aws/docker/library/busybox:1.36
 if command -v docker >/dev/null 2>&1; then CRT=docker; else CRT=podman; fi
+# Pull once, from the first registry that answers: public registries rate-limit
+# shared CI runners ("toomanyrequests"), which is not a hardening failure.
+CIMG=public.ecr.aws/docker/library/busybox:1.36
+for img in public.ecr.aws/docker/library/busybox:1.36 mirror.gcr.io/library/busybox:1.36 docker.io/library/busybox:1.36; do
+    for try in 1 2; do
+        if timeout 180 "$CRT" pull -q "$img" >/dev/null 2>&1; then CIMG=$img; break 2; fi
+        echo "  (pull of ${img} failed, attempt ${try})"; sleep 10
+    done
+done
+echo "  test image: ${CIMG}"
 check "${CRT}: a container starts" timeout 300 "$CRT" run --rm "$CIMG" true
 check "${CRT}: container reaches the network through the host (forwarding + NAT)" timeout 120 "$CRT" run --rm "$CIMG" wget -q -T 20 -O /dev/null http://deb.debian.org/debian/
 check "${CRT}: published port reachable from the host" bash -c "
