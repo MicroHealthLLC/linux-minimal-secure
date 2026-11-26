@@ -4616,11 +4616,20 @@ aide_bulk_excludes() {
 !/var/lib/flatpak/(repo|app|runtime)(/|$)
 !/snap/(?!bin(/|$))[^/]+(/|$)
 !/usr/share/ollama/\.ollama/models(/|$)
-# AI model weights (hundreds of GB; change by design and carry their own hashes):
-# vLLM / Ollama data dirs and Hugging Face caches. Without this the baseline on
-# a GPU inference node reads ~300 GB and runs for days.
-!/var/lib/(vllm|ollama)(/|$)
-!/(root|home/[^/]+)/\.cache/huggingface(/|$)
+# AI / LLM model stores (hundreds of GB; weights change by design and carry
+# their own content hashes). Without this the baseline on a GPU inference node
+# reads ~300 GB and runs for days. Covers the usual runtimes and caches:
+# vLLM, Ollama, LocalAI, LM Studio, GPT4All, llama.cpp, text-generation-webui,
+# TGI, Triton, NVIDIA NIM, KServe, Hugging Face, ModelScope, torch, whisper.
+# (Per-user caches under /root and /home are already excluded above/below.)
+!/var/lib/(vllm|ollama|localai|lmstudio|gpt4all|llama\.cpp|llamacpp|text-generation-webui|tgi|triton|nim|huggingface|modelscope|open-webui)(/|$)
+!/(opt|srv|data|mnt)/(vllm|ollama|localai|lmstudio|gpt4all|llama\.cpp|llamacpp|text-generation-webui|tgi|triton|nim|huggingface|modelscope)(/|$)
+!/opt/nim/\.cache(/|$)
+!/(models|data/models|mnt/models|srv/models|opt/models|var/lib/models)(/|$)
+!/(root|home/[^/]+)/\.(cache/(huggingface|modelscope|torch|whisper|lm-studio|nim)|ollama|lmstudio)(/|$)
+# Model weight files wherever they live (never system binaries: no .bin here,
+# which would also match firmware).
+!/.*\.(safetensors|gguf|ggml|ggjt|ckpt|pth|pt|onnx|tflite|mlmodel|engine)$
 # Caches and scratch space
 !/var/cache(/|$)
 !/var/tmp(/|$)
