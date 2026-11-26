@@ -1921,8 +1921,21 @@ EOF
     fi
     if auditctl -s 2>/dev/null | qgrep '^enabled 2'; then
         warn "audit rules are immutable (-e 2) from a previous run: new rules apply at next reboot"
-    else
+    elif ! is_pve; then
         augenrules --load
+    else
+        # Proxmox VE: nodes often carry rule files from an earlier CIS script
+        # (50-*.rules) that repeat these rules; auditctl then reports "Rule
+        # exists" and exits non-zero although every rule is loaded. Only
+        # other errors fail.
+        local aout
+        if ! aout=$(augenrules --load 2>&1); then
+            if grep -E 'Error|error' <<<"$aout" | grep -Ev 'Rule exists|There was an error in line' | qgrep .; then
+                printf '%s\n' "$aout" >&2
+                die "augenrules --load failed"
+            fi
+            warn "audit: $(grep -c 'Rule exists' <<<"$aout") duplicate rule(s) from other files in /etc/audit/rules.d were skipped (already loaded)"
+        fi
     fi
     if systemctl is-active --quiet auditd; then
         # auditd refuses manual stop (RefuseManualStop); SIGHUP reloads its config.
@@ -2470,7 +2483,9 @@ EOF
     local tmp
     tmp=$(mktemp /etc/ssl/openssl.cnf.XXXXXX)
     # Rewrite the provider-related sections, keep everything else verbatim.
-    awk -v block="$block" -v mark="$MARK" '
+    local pve=0
+    is_pve && pve=1
+    awk -v block="$block" -v mark="$MARK" -v pve="$pve" '
         BEGIN { managed["openssl_init"]=1; managed["provider_sect"]=1; managed["default_sect"]=1;
                 managed["fips_sect"]=1; managed["base_sect"]=1; managed["algorithm_sect"]=1;
                 managed["ssl_sect"]=1; managed["system_default_sect"]=1; skip=0; done=0; has_conf=0 }
@@ -2483,6 +2498,13 @@ EOF
             skip=0
         }
         skip { next }
+        # Proxmox VE: the managed [openssl_init] loads the providers, so
+        # openssl_conf must point at it even when the node used another name
+        # (default_conf): otherwise the FIPS provider is never loaded. The old
+        # section stays in the file, unreferenced. Lines inside replaced
+        # sections were dropped above (a stray one after the .include would
+        # land in [fips_sect]).
+        /^[[:space:]]*openssl_conf[[:space:]]*=/ && pve { print "openssl_conf = openssl_init"; next }
         { print }
         END { if (!done) { print ""; print block } }
     ' "$cnf" >"$tmp"
@@ -4658,6 +4680,15 @@ provision_cuda_prereqs() {
         done < <(dpkg-query -W -f='${db:Status-Status} ${Package}\n' 'linux-image-*' 2>/dev/null \
                  | awk '$1=="installed" && $2 !~ /^linux-image-(unsigned-)?[0-9]/ {print $2}')
         [[ ${#hdrs[@]} -gt 0 ]] || hdrs=(linux-headers-generic)
+    elif is_pve; then
+        # Proxmox VE: headers for the Proxmox kernels. linux-headers-amd64
+        # would pull in Debian's stock kernel (linux-image-amd64), whose DKMS
+        # builds can fail and leave dpkg broken on GPU/DKMS nodes.
+        if pkg_candidate proxmox-default-headers; then
+            hdrs=(proxmox-default-headers)
+        else
+            warn "Proxmox VE: proxmox-default-headers is not available (Proxmox repository missing?); DKMS builds need the Proxmox kernel headers"
+        fi
     else
         hdrs=(linux-headers-amd64)
         [[ $DEB_ARCH == arm64 ]] && hdrs=(linux-headers-arm64)
@@ -4666,6 +4697,7 @@ provision_cuda_prereqs() {
         apt_install libc6 libc6-dev gcc make build-essential pkg-config dkms "${hdrs[@]}"
         local running
         running="linux-headers-$(uname -r)"
+        is_pve && running="proxmox-headers-$(uname -r)"
         if pkg_candidate "$running"; then
             apt_install "$running"
         else
