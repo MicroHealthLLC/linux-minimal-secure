@@ -4616,6 +4616,11 @@ aide_bulk_excludes() {
 !/var/lib/flatpak/(repo|app|runtime)(/|$)
 !/snap/(?!bin(/|$))[^/]+(/|$)
 !/usr/share/ollama/\.ollama/models(/|$)
+# AI model weights (hundreds of GB; change by design and carry their own hashes):
+# vLLM / Ollama data dirs and Hugging Face caches. Without this the baseline on
+# a GPU inference node reads ~300 GB and runs for days.
+!/var/lib/(vllm|ollama)(/|$)
+!/(root|home/[^/]+)/\.cache/huggingface(/|$)
 # Caches and scratch space
 !/var/cache(/|$)
 !/var/tmp(/|$)
