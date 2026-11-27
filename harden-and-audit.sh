@@ -421,6 +421,26 @@ pve_storage_paths() {
 # filesystems (overlay mounts) belong to the workloads, never to the host.
 CONTAINER_PATH_RE='^(/var/lib/(docker|containerd|containers|kubelet|rancher|k0s|longhorn|etcd)|/run/(containerd|k3s|docker|netns)|/var/snap/microk8s|/var/openebs)(/|$)'
 
+# host_scan_prune_re - regex (posix-extended) of paths whole-filesystem find
+# sweeps (setuid audit, world-writable fix) never descend into: container
+# storage, Proxmox VE guest storage, and the contents of home directories.
+# Homes hold user data (repositories, toolchains, models, package caches):
+# hundreds of GB that made the sweeps run for hours. Each home is set to
+# 0750 and its dot files are fixed directly in harden_file_permissions, so
+# a world-writable file inside one is not reachable by other users.
+host_scan_prune_re() {
+    local re="$CONTAINER_PATH_RE|^/(root|home/[^/]+)/.+" u home
+    is_pve && re+="|$PVE_GUEST_PATH_RE"
+    while read -r u; do
+        home=$(getent passwd "$u" | cut -d: -f6)
+        [[ $home == /?* && $home != / ]] || continue
+        # Escape ERE metacharacters in the path.
+        home=$(sed 's/[][\.^$*+?(){}|/]/\\&/g' <<<"${home%/}")
+        re+="|^${home}/.+"
+    done < <(interactive_users)
+    printf '%s\n' "$re"
+}
+
 # host_fs_mounts FSTYPE_REGEX - local mount points to scan: never container
 # storage, and on Proxmox VE never guest storage.
 host_fs_mounts() {
@@ -1943,7 +1963,9 @@ EOF
     # Never container layers or guest storage: their setuid files are not the host's.
     mapfile -t mounts < <(host_fs_mounts '^(ext[234]|xfs|btrfs|overlay|zfs|f2fs|jfs|reiserfs)$')
     [[ ${#mounts[@]} -eq 0 ]] && mounts=(/)
-    mapfile -t files < <(for m in "${mounts[@]}"; do find "$m" -xdev \( -regextype posix-extended -regex "$CONTAINER_PATH_RE" -o -regex "$(is_pve && echo "$PVE_GUEST_PATH_RE" || echo '^$')" \) -prune -o -type f \( -perm -4000 -o -perm -2000 \) -print 2>/dev/null || true; done | sort -u)
+    local prune_re
+    prune_re=$(host_scan_prune_re)
+    mapfile -t files < <(for m in "${mounts[@]}"; do find "$m" -xdev -regextype posix-extended -regex "$prune_re" -prune -o -type f \( -perm -4000 -o -perm -2000 \) -print 2>/dev/null || true; done | sort -u)
     {
         echo "## Managed by ${SCRIPT_NAME} - generated $(ts): setuid/setgid binaries"
         local f
@@ -2648,11 +2670,13 @@ harden_file_permissions() {
     done
 
     # World-writable regular files on local filesystems lose o+w.
-    local m
+    # One walk per mount; home-directory contents and container/guest storage
+    # are pruned (see host_scan_prune_re).
+    local m prune_re
+    prune_re=$(host_scan_prune_re)
     while read -r m; do
-        find "$m" -xdev \( -regextype posix-extended -regex "$CONTAINER_PATH_RE" -o -regex "$(is_pve && echo "$PVE_GUEST_PATH_RE" || echo '^$')" \) -prune \
-            -o -type f -perm -0002 -exec chmod o-w {} + 2>/dev/null || true
-        find "$m" -xdev \( -regextype posix-extended -regex "$CONTAINER_PATH_RE" -o -regex "$(is_pve && echo "$PVE_GUEST_PATH_RE" || echo '^$')" \) -prune \
+        find "$m" -xdev -regextype posix-extended -regex "$prune_re" -prune \
+            -o -type f -perm -0002 -exec chmod o-w {} + \
             -o -type d -perm -0002 ! -perm -1000 -exec chmod +t {} + 2>/dev/null || true
     done < <(host_fs_mounts '^(ext[234]|xfs|btrfs|overlay|zfs|f2fs)$')
 
