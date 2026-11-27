@@ -15,7 +15,7 @@ This compares what was delivered against [PLAN-PROXMOX-CONTAINERS.md](PLAN-PROXM
 | P9–P10 | No kernel `fips=1`; systemd-boot cmdline; boot refresh | ✅ | No `fips=1` in GRUB or `/etc/kernel/cmdline`; `audit=1`/`apparmor=1` merged without duplicates; original `root=ZFS=` kept; refresh recorded |
 | P11 | overlay kept; SCTP when corosync uses it | ✅ (overlay asserted; the SCTP branch is a static check) | |
 | P12 | Guest storage excluded from sweeps, setuid discovery and AIDE | ✅ | AIDE path checks: VM disk, `subvol-*`, `/mnt/pve`, `dir` storage from `storage.cfg`, `/etc/pve` dot files and auth keys skipped; `storage.cfg` still watched |
-| P13–P15 | GARP, pvebanner, fail2ban | ✅ | `drop_gratuitous_arp` not set; pvebanner masked; `proxmox` jail active; corosync peers in `ignoreip` |
+| P13–P15 | GARP, pvebanner, fail2ban | ✅ | `drop_gratuitous_arp` not set; pvebanner masked; P15 superseded: fail2ban removed (TueriCore HIDS) |
 | C1 | `ALLOW_CONTAINERS=auto` | ✅ | Docker (Ubuntu) and rootful Podman (Rocky) detected; overlay kept; boot-time `ip_forward=1` |
 | C2 | Firewall for containers and Kubernetes | ✅ | UFW: routed ACCEPT, CNI/docker interfaces in `before.rules` and `before6.rules`, 6443/10250/8472/NodePorts and pod CIDR in `user.rules`, no duplicates. firewalld: ports in public, pod CIDR in trusted |
 | C3–C5 | rp_filter 2, GARP, SELinux not raised | ✅ | Boot-time rp_filter 2; SELinux stays permissive on the Kubernetes node |

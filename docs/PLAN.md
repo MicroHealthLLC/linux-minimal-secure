@@ -45,7 +45,7 @@ greenfield build. These findings from probing real Debian 12/13 images drive the
 | R1.1 | `APT::Install-Recommends "false"`, `APT::Install-Suggests "false"` | `/etc/apt/apt.conf.d/90-harden-no-recommends` |
 | R1.2 | Purge DMs, DEs, X servers, toolkits, X11/Wayland/Mesa libs (dependency-aware), then `autoremove --purge`. Remove legacy insecure daemons. | `purge_graphical`, `purge_insecure_services` |
 | R2.1 | Official repos: `<codename>`, `-updates`, `-security` (deb822), components `main contrib non-free non-free-firmware`, mirrors overridable | `configure_repositories` |
-| R2.2 | Install openssh-server tmux curl git ufw fail2ban libpam-pwquality auditd unattended-upgrades (+ sudo, rsyslog, aide, apparmor, timesync, audispd-plugins) | `install_base_stack` |
+| R2.2 | Install openssh-server tmux curl git ufw libpam-pwquality (fail2ban dropped 2026-11-27: the TueriCore agent's HIDS replaces it, and it is removed) auditd unattended-upgrades (+ sudo, rsyslog, aide, apparmor, timesync, audispd-plugins) | `install_base_stack` |
 | R2.3 | unattended-upgrades: daily, Debian-Security origins, conffile-safe, no surprise reboot | `configure_unattended_upgrades` |
 | R3 | auditd.conf: `max_log_file = 20`, `max_log_file_action = ROTATE`, `space_left_action`/`admin_space_left_action`/`disk_full_action`/`disk_error_action = SYSLOG`. **Never** SUSPEND/SINGLE/HALT. Audit failure flag `-f 1` (never panic). A post-write assertion refuses forbidden values. | `configure_auditd` |
 | R3.2 | Full CIS/STIG audit rule set (b64 + b32), privileged-command rules generated from on-disk setuid/setgid binaries, `-e 2` | `configure_audit_rules` |
@@ -55,7 +55,7 @@ greenfield build. These findings from probing real Debian 12/13 images drive the
 | R5.2 | sysctl network + kernel hardening in `/etc/sysctl.d/60-harden.conf` | `configure_sysctl` |
 | R5.3 | SSH: no root, no X11, `MaxAuthTries 4`, `ClientAliveInterval 300`/`CountMax 3`, FIPS ciphers/MACs/KEX, banner, etc. `sshd -t` before reload. | `configure_sshd` |
 | R5.4 | UFW: default deny incoming/routed, allow detected SSH port (rate-limited), loopback rules, `--force enable` | `configure_ufw` |
-| R5.5 | PAM (pwquality, pwhistory, faillock, yescrypt, su→sugroup), login.defs aging, umask 027, TMOUT 900, sudo (use_pty, logfile), banners (DoD), kernel module blacklist, `/tmp` + `/dev/shm` mount options, core dumps, journald/rsyslog/logrotate, timesync, AppArmor, AIDE, cron/at, fail2ban, GRUB password (`--unrestricted` boot) | `configure_*` functions |
+| R5.5 | PAM (pwquality, pwhistory, faillock, yescrypt, su→sugroup), login.defs aging, umask 027, TMOUT 900, sudo (use_pty, logfile), banners (DoD), kernel module blacklist, `/tmp` + `/dev/shm` mount options, core dumps, journald/rsyslog/logrotate, timesync, AppArmor, AIDE, cron/at, fail2ban removal (2026-11-27), GRUB password (`--unrestricted` boot) | `configure_*` functions |
 | R6.1 | CUDA prerequisites: libc6 libc6-dev gcc make linux-headers-amd64 (+ running-kernel headers) dkms build-essential pkg-config; nouveau blacklisted | `provision_cuda_prereqs` |
 | R6.2 | coturn and media **libraries only** (no coturn, no X11): libevent*, hiredis, mariadb, pq, sqlite, ssl, systemd, opus, vpx, srtp2, x264, x265, aom, dav1d, ogg, vorbis, speex, webp, theora, flac, lame, usrsctp, jansson, websockets, microhttpd; UDP buffer sysctls | `provision_media_coturn_libs` |
 | R7.1 | Install `libopenscap8` (if available), `openscap-utils`, `openscap-scanner`, `ssg-debian` | `install_openscap` |

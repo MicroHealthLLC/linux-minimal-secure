@@ -13,7 +13,7 @@ Debian/Ubuntu in these places:
 | Packages | `dpkg-query`, `apt-cache policy`, `apt-get`, `apt-mark` | `rpm -q`, `dnf repoquery`, `dnf`, `dnf mark` |
 | Dependency-aware purge | `apt-get -s purge` simulation | `rpm -e --test` (fails whenever an outside package depends on the target) |
 | Minimal installs | `APT::Install-Recommends "0"` | `dnf.conf`: `install_weak_deps=False`, `gpgcheck=1`, `localpkg_gpgcheck=1` |
-| Repositories | deb822 `*.sources`, official mirrors | Vendor BaseOS/AppStream + CRB/PowerTools + EPEL (fail2ban, dkms, some codecs). RHEL: subscription-managed (fatal if no repo is enabled) |
+| Repositories | deb822 `*.sources`, official mirrors | Vendor BaseOS/AppStream + CRB/PowerTools + EPEL (dkms, some codecs). RHEL: subscription-managed (fatal if no repo is enabled) |
 | **Mandatory updates** | unattended-upgrades + apt timers | `dnf-automatic` (`apply_updates = yes`, `upgrade_type = security`. CentOS Stream publishes no errata, so `default`). Timer unmasked, enabled and active (fatal on hosts) |
 | Admin group (anti-lockout) | `sudo` | `wheel` |
 | FIPS | Validated OpenSSL 3.1.2 provider built from source (cert #4985) | The distribution's own module: `fips-mode-setup --enable` (EL8/9). EL10 has no `fips-mode-setup`, so `update-crypto-policies --set FIPS` + `fips=1` (+ `boot=`) |
