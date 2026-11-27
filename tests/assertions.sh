@@ -111,7 +111,7 @@ check "CRB/PowerTools enabled"         bash -c "dnf -q repolist --enabled | awk 
 fi
 AUTO=dnf-automatic; AUTOT=dnf-automatic.timer
 if [[ $OS == fedora ]]; then AUTO=dnf5-plugin-automatic; AUTOT=dnf5-automatic.timer; fi
-for p in openssh-server tmux kbd git firewalld fail2ban-server libpwquality audit sudo rsyslog aide "$AUTO" chrony authselect; do
+for p in openssh-server tmux kbd git firewalld libpwquality audit sudo rsyslog aide "$AUTO" chrony authselect; do
     check "package ${p} installed" installed "$p"
 done
 check "curl available (curl or curl-minimal)" command -v curl
@@ -134,7 +134,7 @@ if [[ $OS == ubuntu ]]; then
     check "Ubuntu components main restricted universe multiverse" grep -q '^Components: main restricted universe multiverse$' "$SRC"
     check "no active duplicate official one-line entries" bash -c "! grep -Eq '^[[:space:]]*deb[[:space:]].*ubuntu\.com' /etc/apt/sources.list 2>/dev/null"
 fi
-BASE_PKGS=(openssh-server tmux curl git fail2ban libpam-pwquality auditd unattended-upgrades sudo rsyslog aide apparmor)
+BASE_PKGS=(openssh-server tmux curl git libpam-pwquality auditd unattended-upgrades sudo rsyslog aide apparmor)
 pve || BASE_PKGS+=(ufw)
 for p in "${BASE_PKGS[@]}"; do
     check "package ${p} installed" installed "$p"
@@ -410,8 +410,6 @@ check "Proxmox VE: enterprise repositories disabled without a subscription" bash
 check "Proxmox VE: pve-no-subscription repository configured" grep -q '^Components: pve-no-subscription' /etc/apt/sources.list.d/harden-proxmox.sources
 check "Proxmox VE: Ceph no-subscription repository configured" grep -q '^URIs: http://download.proxmox.com/debian/ceph-' /etc/apt/sources.list.d/harden-proxmox.sources
 check "Proxmox VE: apt-get update succeeds" apt-get update -qq
-check "Proxmox VE: fail2ban web UI jail" bash -c "fail2ban-client status proxmox"
-check "Proxmox VE: cluster peers never banned" bash -c "grep -E '^ignoreip' /etc/fail2ban/jail.d/60-harden.local | grep -q '10.0.0.12'"
 check "Proxmox VE: AppArmor step does not choke on the include-only lxc-containers file" bash -c "! grep -Eq 'lxc-containers doesn.t contain a valid profile|failed for.*lxc-containers' /var/log/harden-and-audit.log"
 check "Proxmox VE: overlay kept (Docker inside LXC)" bash -c "! grep -q 'install overlay ' /etc/modprobe.d/60-harden-blacklist.conf"
 else
@@ -482,7 +480,9 @@ if [[ $OS == ubuntu ]]; then
     check "whoopsie not installed" not_installed whoopsie
     check "motd-news disabled" bash -c "[[ ! -f /etc/default/motd-news ]] || grep -q '^ENABLED=0' /etc/default/motd-news"
 fi
-check "fail2ban sshd jail active" bash -c "fail2ban-client status sshd"
+# fail2ban is removed (2026-11-27): brute-force response is the TueriCore agent's HIDS.
+check "fail2ban not installed" bash -c "! command -v fail2ban-client"
+check "fail2ban jail files removed" bash -c "[[ ! -e /etc/fail2ban/jail.d/60-harden.local ]]"
 
 AC=/etc/aide/aide.conf; ADB=/var/lib/aide/aide.db
 rhel && { AC=/etc/aide.conf; ADB=/var/lib/aide/aide.db.gz; }

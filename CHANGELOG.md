@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **fail2ban is removed (all distributions).** It is no longer installed, and step 5.15 now stops, disables and purges it where an earlier version installed it (together with `60-harden.local`, `70-trusted-peers.local` and the Proxmox VE `harden-proxmox` filter). Brute-force response on managed hosts is the TueriCore agent's HIDS, which white-lists the internal networks and protects the admin accounts. Two responders banning on the same failed sign-ins locked administrators, the DSC controller and cluster peers out (2026-11-27). The step warns when `tuericore-agent` is not running, because such a host then has no brute-force response. `FAIL2BAN_IGNOREIP` is gone; the RHEL family no longer pulls fail2ban from EPEL (EPEL stays for dkms). The step number is unchanged.
+
 ## 2.2.2
 
 Proxmox VE fixes:

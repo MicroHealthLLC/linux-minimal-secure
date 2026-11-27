@@ -28,7 +28,7 @@ The container-host failure is confirmed in the field. A Docker workstation harde
 | P12 | World-writable sweep, setuid audit discovery and AIDE across every local mount | Would chmod files inside guest container filesystems (ZFS `subvol-*`), add audit rules for guest binaries, and checksum VM disks, backups and the constantly changing `/etc/pve` | Guest storage is excluded everywhere (`PVE_GUEST_PATH_RE` plus `dir`/NFS paths from `storage.cfg`); volatile `/etc/pve` entries are excluded from AIDE |
 | P13 | `drop_gratuitous_arp=1` | Stale ARP after VM live migration and HA IP moves | Not set on PVE |
 | P14 | `/etc/issue` banner | `pvebanner.service` rewrites it at every boot | `pvebanner` masked |
-| P15 | fail2ban | Cluster peers could be banned; the web UI (8006) had no brute-force protection | Corosync ring addresses go into `ignoreip`; a `proxmox` jail on pvedaemon authentication failures |
+| P15 | fail2ban | Cluster peers could be banned; the web UI (8006) had no brute-force protection | Superseded 2026-11-27: fail2ban is removed; the TueriCore agent's HIDS answers brute force and white-lists the internal networks |
 
 ### 1.2 Containers and Kubernetes (all distributions)
 
@@ -43,7 +43,7 @@ The container-host failure is confirmed in the field. A Docker workstation harde
 
 ## 2. Implementation
 
-* Single script, no new steps (the step counter is unchanged). New helpers: `is_pve`, `is_k8s`, `containers_on`, `host_fs_mounts`, `configure_repositories_pve`, `configure_pve_firewall`, `pve_firewall_enable`, `pve_kernel_cmdline`, `pve_boot_refresh`, `ufw_kubernetes_rules`, `ufw_container_ifaces`, `k8s_ports`, `k8s_cluster_cidrs`, `fail2ban_cluster_peers`.
+* Single script, no new steps (the step counter is unchanged). New helpers: `is_pve`, `is_k8s`, `containers_on`, `host_fs_mounts`, `configure_repositories_pve`, `configure_pve_firewall`, `pve_firewall_enable`, `pve_kernel_cmdline`, `pve_boot_refresh`, `ufw_kubernetes_rules`, `ufw_container_ifaces`, `k8s_ports`, `k8s_cluster_cidrs`. (`fail2ban_cluster_peers` was removed with fail2ban, 2026-11-27.)
 * New knobs: `PROXMOX_MODE`, `PVE_ROOT_SSH`, `PVE_REPO`, `PVE_FIREWALL_ENABLE`, `PVE_FIREWALL_MGMT_SOURCE`, `PVE_KERNEL_FIPS`, `KUBERNETES_MODE`, `K8S_TRUSTED_CIDRS`, `K8S_EXTRA_PORTS`. `ALLOW_CONTAINERS` defaults to `auto`.
 
 ## 3. Verification

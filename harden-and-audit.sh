@@ -84,8 +84,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 : "${PVE_FIREWALL_MGMT_SOURCE:=}"   # source CIDR(s) allowed to SSH/8006 when enabling (empty = any)
 : "${PBS_FIREWALL_EXTRA_IN:=}"      # Proxmox Backup Server (UFW): extra inbound rules, e.g. "9100/tcp 8443/tcp"
 : "${PVE_KERNEL_FIPS:=0}"           # 1 = also boot a Proxmox VE kernel with fips=1 (not supported by Proxmox)
-: "${EPEL_ENABLE:=1}"                # RHEL family: EPEL provides fail2ban, dkms and some media libraries
-: "${FAIL2BAN_IGNOREIP:=}"           # space separated CIDRs never banned (jump hosts)
+: "${EPEL_ENABLE:=1}"                # RHEL family: EPEL provides dkms and some media libraries
 : "${SSH_DISABLE_PASSWORD:=0}"       # 1 forces key-only SSH (only if every admin has a key)
 : "${ENABLE_GRUB_PASSWORD:=1}"
 : "${GRUB_SUPERUSER:=grubadmin}"
@@ -1458,13 +1457,13 @@ EOF
 
 # RHEL family: vendor BaseOS/AppStream stay as configured (often a regional
 # or private mirror). CRB/PowerTools and EPEL are enabled: EPEL provides
-# fail2ban, dkms and media libraries the vendor does not ship.
+# dkms and media libraries the vendor does not ship.
 configure_repositories_rhel() {
     step "2.1 official EL repositories (BaseOS, AppStream, CRB) + EPEL"
     if is_fedora; then
         [[ -n $(dnf -q repolist --enabled 2>/dev/null | awk 'NR > 1') ]] \
             || die "no package repository is enabled: configure the Fedora repositories; automatic security updates are mandatory"
-        log "Fedora: fedora + updates repositories (fail2ban, dkms and the media libraries are in Fedora itself)"
+        log "Fedora: fedora + updates repositories (dkms and the media libraries are in Fedora itself)"
         configure_dnf_minimal
         pkg_refresh
         return 0
@@ -1502,7 +1501,7 @@ configure_repositories_rhel() {
         fi
         log "EPEL enabled (set EPEL_ENABLE=0 to stay on vendor repositories only)"
     else
-        warn "EPEL_ENABLE=0: fail2ban, dkms and some media libraries are not available from vendor repositories"
+        warn "EPEL_ENABLE=0: dkms and some media libraries are not available from vendor repositories"
     fi
     configure_dnf_minimal
     pkg_refresh
@@ -1514,7 +1513,7 @@ install_base_stack() {
         install_base_stack_rhel
         return 0
     fi
-    local -a pkgs=(openssh-server openssh-client tmux curl git ufw iptables fail2ban python3-systemd
+    local -a pkgs=(openssh-server openssh-client tmux curl git ufw iptables python3-systemd
         libpam-pwquality libpam-modules libpam-runtime auditd audispd-plugins unattended-upgrades
         sudo rsyslog rsyslog-gnutls logrotate cron acl vlock apparmor apparmor-utils unzip perl
         procps iproute2 kmod e2fsprogs)
@@ -1557,11 +1556,6 @@ install_base_stack_rhel() {
     pkg_installed curl-minimal || pkg_installed curl || pkgs+=(curl)
     # audit 4 (EL10) splits augenrules' default rules into audit-rules.
     opt=$(first_available audit-rules) && pkgs+=("$opt")
-    if [[ $EPEL_ENABLE == 1 ]] || is_fedora; then
-        for opt in fail2ban-server fail2ban-firewalld fail2ban-systemd; do
-            pkg_candidate "$opt" && pkgs+=("$opt")
-        done
-    fi
     dnf_install "${pkgs[@]}"
     log "installing pending updates"
     dnf -y -q upgrade --refresh >/dev/null
@@ -4567,67 +4561,36 @@ selinux_antivirus_scan() {
     fi
 }
 
-# Cluster peers never get banned: Proxmox corosync ring addresses and,
-# when given, the Kubernetes trusted networks.
-fail2ban_cluster_peers() {
-    local -a peers=()
-    local f
-    for f in /etc/pve/corosync.conf /etc/corosync/corosync.conf; do
-        [[ -r $f ]] || continue
-        while read -r a; do peers+=("$a"); done < <(awk '$1 ~ /^ring[0-9]+_addr:$/ {print $2}' "$f")
-    done
-    if is_k8s && [[ -n $K8S_TRUSTED_CIDRS ]]; then
-        # shellcheck disable=SC2206
-        peers+=($K8S_TRUSTED_CIDRS)
+# fail2ban is not installed any more, and is removed where an earlier version
+# installed it (owner's decision 2026-11-27). Brute-force response on every
+# managed host is the TueriCore agent's HIDS, which white-lists the internal
+# networks and protects the admin accounts. Two responders banning on the
+# same failed sign-ins locked administrators, the DSC controller and cluster
+# peers out of the estate. The step keeps its number so the counter is stable.
+remove_fail2ban() {
+    step "5.15 fail2ban removed (brute-force response is the TueriCore agent's HIDS)"
+    if ! systemctl is-active --quiet tuericore-agent.service 2>/dev/null; then
+        warn "tuericore-agent is not running on this host: without fail2ban it has no brute-force response until the agent is installed"
     fi
-    [[ ${#peers[@]} -gt 0 ]] && printf ' %s' "$(printf '%s\n' "${peers[@]}" | sort -u | paste -sd' ')"
-    return 0
-}
-
-configure_fail2ban() {
-    step "5.15 fail2ban (SSH brute-force protection)"
-    if ! command -v fail2ban-client >/dev/null 2>&1; then
-        warn "fail2ban is not installed (RHEL family: it comes from EPEL; EPEL_ENABLE=${EPEL_ENABLE})"
+    local -a pkgs=()
+    local p
+    for p in fail2ban fail2ban-server fail2ban-firewalld fail2ban-systemd fail2ban-sendmail; do
+        pkg_installed "$p" && pkgs+=("$p")
+    done
+    if [[ ${#pkgs[@]} -eq 0 ]] && ! command -v fail2ban-client >/dev/null 2>&1; then
+        log "fail2ban is not installed"
         return 0
     fi
-    local ports
-    ports=$(IFS=,; echo "${SSH_PORTS[*]}")
-    write_file 0644 /etc/fail2ban/jail.d/60-harden.local <<EOF
-# Managed by ${SCRIPT_NAME}
-[DEFAULT]
-bantime  = 1h
-findtime = 10m
-maxretry = 5
-backend  = systemd
-ignoreip = 127.0.0.1/8 ::1 ${FAIL2BAN_IGNOREIP}$(fail2ban_cluster_peers)
-
-[sshd]
-enabled  = true
-port     = ${ports}
-mode     = aggressive
-EOF
-    # Proxmox VE: brute force against the web UI / API (root@pam lives there).
-    if is_pve; then
-        write_file 0644 /etc/fail2ban/filter.d/harden-proxmox.conf <<'EOF'
-# Managed by harden-and-audit.sh - failed Proxmox VE web UI / API logins.
-[Definition]
-failregex = pvedaemon\[[0-9]+\]: authentication (verification )?failure; rhost=(::ffff:)?<HOST> user=\S+ msg=.*
-ignoreregex =
-journalmatch = _SYSTEMD_UNIT=pvedaemon.service
-EOF
-        cat >>/etc/fail2ban/jail.d/60-harden.local <<'EOF'
-
-[proxmox]
-enabled  = true
-port     = https,http,8006
-filter   = harden-proxmox
-EOF
+    systemctl disable --now fail2ban.service >/dev/null 2>&1 || true
+    [[ ${#pkgs[@]} -gt 0 ]] && safe_purge "${pkgs[@]}"
+    # Our own jail and filter files (a purge leaves files it did not ship).
+    rm -f /etc/fail2ban/jail.d/60-harden.local /etc/fail2ban/jail.d/70-trusted-peers.local \
+        /etc/fail2ban/filter.d/harden-proxmox.conf
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        warn "fail2ban is still installed (not from a package, or removing it would remove other packages): stopped and disabled"
     else
-        rm -f /etc/fail2ban/filter.d/harden-proxmox.conf
+        log "fail2ban removed"
     fi
-    fail2ban-client -t >/dev/null || die "fail2ban configuration test failed"
-    systemctl enable fail2ban.service >/dev/null 2>&1 || true
-    systemctl restart fail2ban.service
 }
 
 configure_mta() {
@@ -5492,7 +5455,7 @@ main() {
     configure_logging
     configure_timesync
     configure_apparmor
-    configure_fail2ban
+    remove_fail2ban
     configure_mta
     configure_tmux
     configure_aide_config

@@ -36,7 +36,7 @@ Compared against [PLAN.md](PLAN.md) and the original requirement text. Each delt
 | R5.2 | sysctl network hardening | ✅ | file assertions; runtime values asserted in privileged CI |
 | R5.3 | SSH lockdown | ✅ | `sshd -T` assertions (root, X11, MaxAuthTries, ClientAlive, FIPS ciphers/MACs) |
 | R5.4 | UFW default deny inbound, SSH allowed, forced enable | ✅ | UFW assertions (active state asserted in privileged CI) |
-| R5.5 | PAM, aging, banners, modules, mounts, logging, AIDE, AppArmor, fail2ban … | ✅ | SCAP rule results + assertions |
+| R5.5 | PAM, aging, banners, modules, mounts, logging, AIDE, AppArmor, fail2ban removal … | ✅ | SCAP rule results + assertions |
 | R6.1 | CUDA build prerequisites | ✅ | libc6, libc6-dev, gcc, make, dkms, linux-headers-amd64, build-essential assertions |
 | R6.2 | coturn/media libraries, no coturn, no X11 | ✅ | library assertions, `coturn` absent, no X server |
 | R7.1 | libopenscap8 / openscap-utils / ssg-debian | ✅ (see Δ4) | package assertions |

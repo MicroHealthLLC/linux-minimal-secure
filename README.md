@@ -16,7 +16,7 @@
 * **Firewall.** pve-firewall stays the firewall and UFW is never installed. With `PVE_FIREWALL_ENABLE=1` the datacenter firewall is turned on, with SSH and port 8006 allowed first and existing rules kept.
 * **Repositories.** Without a subscription, the enterprise repositories (which return HTTP 401) are swapped for the no-subscription ones, so updates keep working.
 * **Kernel, boot and banner.** IP forwarding is left to the node's network setup. rpcbind (NFS storage), dnsmasq (SDN DHCP), postfix and overlayfs stay. No kernel `fips=1` (Proxmox doesn't support it; user-space FIPS stays). `/etc/kernel/cmdline` and `proxmox-boot-tool refresh` are handled. `pvebanner` no longer overwrites the login banner.
-* **Hands off guest data.** VM disks, container subvolumes, backup and NFS storage and the volatile parts of `/etc/pve` are never scanned, chmod-ed or checksummed. Failed web UI logins get a fail2ban jail, and cluster peers are never banned.
+* **Hands off guest data.** VM disks, container subvolumes, backup and NFS storage and the volatile parts of `/etc/pve` are never scanned, chmod-ed or checksummed. fail2ban is not used (removed where an earlier version installed it): brute-force response is the TueriCore agent's HIDS, which never blocks the internal networks or locks the admin accounts.
 
 **Container and Kubernetes hosts (every distribution).** Docker, containerd, rootful Podman and Kubernetes (kubeadm, k3s, RKE2, k0s, MicroK8s) are detected **before** anything changes, so hardening never breaks them:
 
@@ -83,7 +83,7 @@ The table describes the Debian family; the RHEL-family equivalents follow it.
 |---|---|
 | Minimalism | `APT::Install-Recommends/Suggests "false"`. Dependency-aware purge of display managers, desktops, X servers, toolkits, and X11/Wayland/Mesa libraries (never removes a non-graphical package that links to them). Removes telnet/rsh/tftp/NIS/inetd/avahi/cups/rpcbind/etc. |
 | Repositories | Debian: deb822 `debian.sources` → `<codename>`, `-updates`, `-security` (`main contrib non-free non-free-firmware`). Ubuntu: deb822 `ubuntu.sources` → `<codename>`, `-updates`, `-security` (`main restricted universe multiverse`); the configured (cloud/regional/private) mirror is kept. Third-party repositories are never touched |
-| Base stack | openssh-server, tmux, curl, git, ufw, fail2ban, libpam-pwquality, auditd, unattended-upgrades (+ sudo, rsyslog, AIDE, AppArmor, timesyncd, vlock) |
+| Base stack | openssh-server, tmux, curl, git, ufw, libpam-pwquality, auditd, unattended-upgrades (+ sudo, rsyslog, AIDE, AppArmor, timesyncd, vlock) |
 | Updates | **Mandatory, no opt-out.** unattended-upgrades applies Debian-Security / Ubuntu `-security` (+ ESM when Pro-attached) daily, keeps local conffiles, never auto-reboots. The apt timers are unmasked and enabled, a last-read `zz-harden-auto-upgrades` stops other `apt.conf.d` files from turning updates off, and the run fails on a host where the effective config or the timers are not active |
 | auditd | Owner policy above, plus the full CIS/STIG rule set (time, identity, network, MAC, logins, sessions, DAC, failed access, mounts, deletions, modules, setuid/setgid exec, sudoers, privileged commands generated from disk), immutable `-e 2` |
 | FIPS | `fips=1` in `GRUB_CMDLINE_LINUX` + `update-grub`. OpenSSL 3.1.2 FIPS provider built from the SHA-256-pinned source per its Security Policy into `/opt/openssl-fips-3.1.2`. `openssl.cnf` activates `fips` **and** `default` (strict `fips=yes` is opt-in with `FIPS_STRICT=1`). TLS ≥ 1.2. On Ubuntu with **Ubuntu Pro FIPS** enabled, Canonical's certified modules are kept and the 3.1.2 build is skipped |
@@ -104,7 +104,7 @@ The table describes the Debian family; the RHEL-family equivalents follow it.
 | Area | Implementation |
 |---|---|
 | Minimalism | `dnf.conf`: `install_weak_deps=False`, `gpgcheck=1`, `localpkg_gpgcheck=1`, and `gpgcheck=0` is turned on in every repository. Dependency-aware removal of X11/desktop/Mesa packages (`rpm -e --test`: a package another one requires is kept), legacy services, abrt, setroubleshoot, mcstrans |
-| Repositories | Vendor BaseOS/AppStream kept as configured, CRB/PowerTools + EPEL enabled (`EPEL_ENABLE=0` stays vendor-only; fail2ban and dkms then are skipped). Fatal if no repository is enabled |
+| Repositories | Vendor BaseOS/AppStream kept as configured, CRB/PowerTools + EPEL enabled (`EPEL_ENABLE=0` stays vendor-only; dkms is then skipped). Fatal if no repository is enabled |
 | Updates | **Mandatory, no opt-out.** `dnf-automatic` with `apply_updates = yes` and `upgrade_type = security` (CentOS Stream publishes no errata, so all updates there). `dnf-automatic.timer` is unmasked, enabled and must be active |
 | FIPS | The distribution's module: `fips-mode-setup --enable` (8/9), crypto policy `FIPS` + `fips=1` (10). No second, self-built provider |
 | Kernel cmdline | `grubby --update-kernel=ALL` + `GRUB_CMDLINE_LINUX`: the same hardening arguments **without** AppArmor (`security=apparmor` would disable SELinux), `selinux=0`/`enforcing=0` removed, `boot=UUID=` for FIPS with a separate `/boot`. GRUB 2 password in `/boot/grub2/user.cfg` |
@@ -149,9 +149,8 @@ The table describes the Debian family; the RHEL-family equivalents follow it.
 | `PVE_KERNEL_FIPS` | `0` | Proxmox: `1` also boots the node with `fips=1` (unsupported by Proxmox; may keep corosync out of quorum) |
 | `KEEP_IPV6_RA` | `auto` | `auto` keeps RA when SLAAC is in use |
 | `FIREWALL_OUTBOUND_POLICY` / `FIREWALL_EXTRA_OUT` | `allow` / *(empty)* | `deny` + allow-list for egress filtering (UFW or firewalld). The old names `UFW_OUTBOUND_POLICY` / `UFW_EXTRA_OUT` still work |
-| `EPEL_ENABLE` | `1` | RHEL family: enable CRB/PowerTools + EPEL (fail2ban, dkms, some media libraries). Not used on Fedora |
+| `EPEL_ENABLE` | `1` | RHEL family: enable CRB/PowerTools + EPEL (dkms, some media libraries). Not used on Fedora |
 | `DESKTOP_MODE` | `auto` | `auto` = desktop mode when a display manager is installed; `1` force; `0` harden as a server |
-| `FAIL2BAN_IGNOREIP` | *(empty)* | Jump hosts that must never be banned |
 | `SSH_DISABLE_PASSWORD` | `0` | `1` = key-only SSH (verified for every sudo admin first) |
 | `ENABLE_GRUB_PASSWORD` / `GRUB_PASSWORD_PBKDF2` | `1` / *(generated)* | Supply your own `grub.pbkdf2.sha512…` hash; otherwise one is generated into `/root/grub-superuser-password.txt` |
 | `AIDE_INIT` | `1` | Build the AIDE baseline at the end |
